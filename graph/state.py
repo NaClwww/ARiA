@@ -18,9 +18,12 @@ class TODOList(TypedDict):
 
 class LoopState(TypedDict):
     count: int
-    max_count: int
     user_input: str
+    allow_todo_list: bool
+    enable_todo_list: bool
     messages: Annotated[list, add_messages]
     todo_list: TODOList
+    todo_stall_count: int
     history: Annotated[list[str], operator.add]
     last_tool_called: bool
+    last_todo_update_called: bool

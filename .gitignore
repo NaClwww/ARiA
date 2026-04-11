@@ -19,3 +19,7 @@ env*
 
 # AI generation files
 .codex
+
+# Logs and temporary files
+*.log
+*.tmp

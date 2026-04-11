@@ -1,10 +1,12 @@
 import os
+import logging
 
 from langchain_openai import ChatOpenAI
 
 
 MODEL_NAME = "qwen/qwen3-next-80b-a3b-instruct"
 MAX_CONTEXT_MESSAGES = 12
+logger = logging.getLogger(__name__)
 
 
 class OpenAIClient:
@@ -22,10 +24,14 @@ class OpenAIClient:
         if base_url:
             client_kwargs["base_url"] = base_url
 
-        self.model = ChatOpenAI(**client_kwargs).bind_tools(tools)
+        self.raw_model = ChatOpenAI(**client_kwargs)
+        self.model = self.raw_model.bind_tools(tools)
 
     def __call__(self, messages: list):
         response = self.model.invoke(messages[-MAX_CONTEXT_MESSAGES:])
-        print("\n[debug] model content:", repr(response.content))
-        print("[debug] model tool_calls:", response.tool_calls)
+        logger.info("model content=%r", response.content)
+        logger.info("model tool_calls=%s", response.tool_calls)
         return response
+
+    def invoke_raw(self, messages: list):
+        return self.raw_model.invoke(messages[-MAX_CONTEXT_MESSAGES:])

@@ -14,8 +14,11 @@ def file_edit(
     old_text: str = "",
     new_text: str = "",
 ) -> str:
-    """本地文件操作，支持 read、write、edit。"""
+    """本地文件操作，支持 path、read、write、edit。"""
     file_path = Path(path).expanduser().resolve()
+
+    if action == "path":
+        return f"Path: {file_path} | Exists: {file_path.exists()} | Is file: {file_path.is_file()}"
 
     if action == "read":
         return file_path.read_text(encoding="utf-8")
