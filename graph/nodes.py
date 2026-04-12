@@ -14,6 +14,17 @@ import json
 
 logger = logging.getLogger(__name__)
 
+def attach_visual_context(messages: list, visual_message: dict) -> list:
+    visual_context_message = SystemMessage(
+        content=f"当前视觉输入: {json.dumps(visual_message, ensure_ascii=False)}",
+        id="visual-context",
+    )
+
+    insert_at = 0
+    while insert_at < len(messages) and isinstance(messages[insert_at], SystemMessage):
+        insert_at += 1
+    messages.insert(insert_at, visual_context_message)
+    return messages
 
 def attach_todo_context(messages: list, todo_list: dict) -> list:
     request_messages = [
@@ -90,7 +101,7 @@ def decide_todo_node(state: LoopState, client: OpenAIClient) -> LoopState:
     if use_todo_list:
         update["messages"] = [
             SystemMessage(
-                content="已启用 ToDo List。todo 只用于跟踪用户明确要求的工作；不要新增额外任务。当前上下文已包含最新 todo summary，通常不要调用 read_todo。完成任务时只使用 complete_todos，可一次传一个或多个 todo id；不要调用其他 todo 更新工具。",
+                content="已启用 ToDo List。todo 只用于跟踪用户明确要求的工作。当前上下文已包含最新 todo summary，通常不要调用 read_todo。完成任务时只使用 complete_todos，可一次传一个或多个 todo id；不要调用其他 todo 更新工具。",
                 id="todo-policy",
             )
         ]
@@ -176,25 +187,25 @@ def loop_step(state: LoopState, client: OpenAIClient) -> LoopState:
     if state["enable_todo_list"] and state["todo_list"]["items"]:
         request_messages = attach_todo_context(state["messages"], state["todo_list"])
 
+    # if state["enable_visual"]:
+    #     # 插入视觉信息到消息中
+    #     request_messages = attach_visual_context(request_messages, state["visual_info"])
+
     response = client(request_messages)
     text = response.text if hasattr(response, "text") else str(response.content)
     tool_calls = getattr(response, "tool_calls", []) or []
-    last_todo_update_called = any(
-        tool_call.get("name") == "complete_todos"
-        for tool_call in tool_calls
-    )
-    has_todos = state["enable_todo_list"] and bool(state["todo_list"]["items"])
-    next_stall_count = (
-        0
-        if last_todo_update_called
-        else state["todo_stall_count"] + 1 if has_todos else state["todo_stall_count"]
-    )
 
+
+    # logger.debug(
+    #     "loop_step response=%s, tool_calls=%s",
+    #     text,
+    #     [call.name for call in tool_calls],
+
+    # ) 
     return {
         "count": next_count,
         "messages": [response],
         "history": [text],
-        "todo_stall_count": next_stall_count,
         "last_tool_called": bool(tool_calls),
-        "last_todo_update_called": last_todo_update_called,
+        "last_todo_update_called": False,
     }

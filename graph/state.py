@@ -15,6 +15,9 @@ class TODOItem(TypedDict):
 class TODOList(TypedDict):
     items: list[TODOItem]
 
+class VisualInfo(TypedDict):
+    image: str
+    description: str
 
 class LoopState(TypedDict):
     count: int
@@ -27,3 +30,6 @@ class LoopState(TypedDict):
     history: Annotated[list[str], operator.add]
     last_tool_called: bool
     last_todo_update_called: bool
+
+    enable_visual : bool
+    visual_info: VisualInfo
