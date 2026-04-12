@@ -1,6 +1,6 @@
-# Aria
+# ARiA
 
-Aria = Autonomous Real-time Interactive Assistant。
+ARiA = Autonomous Real-time Interactive Assistant。
 
 我想做的不是一个只会等待指令的工具，而是一个能够感知、等待、靠近、再主动回应人的存在体。
 
