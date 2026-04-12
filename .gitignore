@@ -23,3 +23,6 @@ env*
 # Logs and temporary files
 *.log
 *.tmp
+
+# Test dir
+test
