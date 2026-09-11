@@ -2,42 +2,39 @@ package loop
 
 import (
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
-// 总线（docs/02 §3.2）：emit 在飞轮 goroutine 内 O(1) 非阻塞。
-// 每订阅者一个有界出站 channel + 一个投递协程。
-//   - volatile 满则丢弃（MessageEnd 永远带全文，丢增量无损）；
-//   - durable 满则暂存 overflow，由投递协程背压推送；订阅者停滞超过
-//     stallTimeout 判死断开——durable 的「不丢」以订阅者存活为界。
-//
-// 飞轮状态的零锁纪律不适用于本文件的同步原语——复杂度关死在 bus.go。
 const (
-	defaultBuffer = 256
-	stallTimeout  = 5 * time.Second
-	overflowCap   = 4096 // 防御上限：溢出即断开，不无界占内存
+	defaultBuffer       = 256
+	defaultStallTimeout = 5 * time.Second
+	overflowCap         = 4096
 )
 
+// A subscriber has one FIFO and one goroutine that alone writes and closes ch.
 type sub struct {
 	ch   chan Event
-	kick chan struct{} // emit 溢出写入 overflow 后的唤醒信号
+	kick chan struct{}
 	quit chan struct{}
-	dead atomic.Bool
+	once sync.Once
 
-	mu       sync.Mutex
-	overflow []Event
+	mu      sync.Mutex
+	queue   []Event
+	closing bool
 }
 
 type bus struct {
-	mu   sync.Mutex
-	subs map[*sub]struct{}
+	mu           sync.Mutex
+	subs         map[*sub]struct{}
+	stallTimeout time.Duration
 }
 
-func newBus() *bus { return &bus{subs: make(map[*sub]struct{})} }
+func newBus() *bus { return newBusWithTimeout(defaultStallTimeout) }
 
-// add 注册订阅者并启动投递协程。取消函数只解除订阅，不 close 出站
-// channel（避免与 emit 竞态；dead 之后 emit 跳过该订阅者）。
+func newBusWithTimeout(timeout time.Duration) *bus {
+	return &bus{subs: make(map[*sub]struct{}), stallTimeout: timeout}
+}
+
 func (b *bus) add(buf int) (<-chan Event, func()) {
 	if buf <= 0 {
 		buf = defaultBuffer
@@ -47,91 +44,89 @@ func (b *bus) add(buf int) (<-chan Event, func()) {
 	b.subs[s] = struct{}{}
 	b.mu.Unlock()
 	go b.deliver(s)
-	return s.ch, func() { b.disconnect(s) }
+	return s.ch, func() { b.close(s) }
 }
 
 func (b *bus) emit(ev Event) {
 	b.mu.Lock()
-	subs := make([]*sub, 0, len(b.subs))
 	for s := range b.subs {
-		subs = append(subs, s)
-	}
-	b.mu.Unlock()
-
-	for _, s := range subs {
-		if s.dead.Load() {
+		s.mu.Lock()
+		if s.closing {
+			s.mu.Unlock()
 			continue
 		}
+		if !ev.Kind.Durable() && len(s.queue) >= cap(s.ch) {
+			s.mu.Unlock()
+			continue
+		}
+		if len(s.queue) >= overflowCap {
+			s.mu.Unlock()
+			go b.disconnect(s)
+			continue
+		}
+		s.queue = append(s.queue, cloneEvent(ev))
+		s.mu.Unlock()
 		select {
-		case s.ch <- ev:
+		case s.kick <- struct{}{}:
 		default:
-			if !ev.Kind.Durable() {
-				continue // volatile：丢增量无损
-			}
-			s.mu.Lock()
-			if len(s.overflow) < overflowCap {
-				s.overflow = append(s.overflow, ev)
-				s.mu.Unlock()
-				select {
-				case s.kick <- struct{}{}:
-				default:
-				}
-			} else {
-				s.mu.Unlock()
-				b.disconnect(s)
-			}
 		}
 	}
+	b.mu.Unlock()
 }
 
-// deliver 先倾倒 overflow，再等下一次溢出信号。
 func (b *bus) deliver(s *sub) {
+	defer close(s.ch)
 	for {
-		for {
-			s.mu.Lock()
-			if len(s.overflow) == 0 {
-				s.mu.Unlock()
-				break
-			}
-			ev := s.overflow[0]
-			s.overflow = s.overflow[1:]
+		s.mu.Lock()
+		if len(s.queue) == 0 {
+			closing := s.closing
 			s.mu.Unlock()
-			if !b.push(s, ev) {
+			if closing {
+				return
+			}
+			select {
+			case <-s.kick:
+				continue
+			case <-s.quit:
 				return
 			}
 		}
+		ev := s.queue[0]
+		s.queue[0] = Event{}
+		s.queue = s.queue[1:]
+		s.mu.Unlock()
+
+		timer := time.NewTimer(b.stallTimeout)
 		select {
-		case <-s.kick:
+		case s.ch <- ev:
+			if !timer.Stop() {
+				<-timer.C
+			}
 		case <-s.quit:
+			timer.Stop()
+			return
+		case <-timer.C:
+			b.disconnect(s)
 			return
 		}
 	}
 }
 
-// push 带背压地投递一条：满则等待，停滞超阈值判死断开。
-func (b *bus) push(s *sub, ev Event) bool {
+func (b *bus) close(s *sub) {
+	b.mu.Lock()
+	delete(b.subs, s)
+	s.mu.Lock()
+	s.closing = true
+	s.mu.Unlock()
+	b.mu.Unlock()
 	select {
-	case s.ch <- ev:
-		return true
+	case s.kick <- struct{}{}:
 	default:
-	}
-	timer := time.NewTimer(stallTimeout)
-	defer timer.Stop()
-	select {
-	case s.ch <- ev:
-		return true
-	case <-s.quit:
-		return false
-	case <-timer.C:
-		b.disconnect(s)
-		return false
 	}
 }
 
 func (b *bus) disconnect(s *sub) {
-	if s.dead.CompareAndSwap(false, true) {
-		close(s.quit)
-	}
+	s.once.Do(func() { close(s.quit) })
 	b.mu.Lock()
 	delete(b.subs, s)
 	b.mu.Unlock()

@@ -43,6 +43,25 @@
 
 Unit 分级、打分公式、内存层级、pull 工具、可观测与评测——**未定稿**：草稿见 [notes/context-planning-draft.md](notes/context-planning-draft.md)，M3 前重论（05 G2）。
 
+## 4. 预测输入（speculate/）——「两个队列」的最终形态
+
+场景：语音/输入预测用户内容，提前开始生成；猜错则立即打断、用真实输入替换。**定稿结论：core 不参与预测**——预测轮没有工具、没有 Guard、没有 durable 事实，Loop 的价值都不在场，因此 `runtime/speculate` 直接持 Provider 调 `Stream`：
+
+- **单槽**：同时只有一个活动预测（`Input.ID + Revision` 拒绝迟到控制命令）；新 `Speculate` 顶掉旧的 = Replace 语义；
+- **确认前无事实**：预测不写 durable 事件、不进 transcript、不执行工具；输出带 tool calls 时剥除（不可复用）；
+- **确认后复用 tokens**：`Confirm` 返回预生成的 `{Input, Msg, Usage}`，宿主把 `[..., 确认输入, 预生成答案]` 作为下一次 `Run` 的 input 传入——飞轮把预生成答案当作已有历史继续（利用了 `Run` 无状态、每次传完整历史的既有语义，core 零改动）；
+- **猜错**：`Cancel`/新 `Speculate` 直接取消旧流——预测无副作用，取消即回滚，不存在需要恢复的状态。
+
+```
+Host(语音识别中) → Speculate(base=transcript快照, 猜测输入)
+识别完成, 猜对  → Confirm → Run([...base, 确认输入, 预生成答案])
+识别完成, 猜错  → Speculate(rev+1, 真实输入)  // 旧流被取消，立即重跑
+用户放弃        → Cancel                      // 无 durable 痕迹
+```
+
+实现：`runtime/speculate/speculate.go`（~180 行，零 core 依赖、仅 Provider + pkg）。
+
+
 ## 3. 扩展机制：读与改（hook 语义，无 hook 抽象）
 
 **问题定义**：core 是单线程飞轮，进入 core 的数据运行中不可变。扩展需要读/改/控——都经 core 已有的少数缝 + 事件 + steering 完成，**无 hook 注册抽象，扩展就是 Setup 时的普通 Go 组合**。

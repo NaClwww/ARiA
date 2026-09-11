@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,14 +27,10 @@ func testCtx() context.Context {
 func drain(ch <-chan Event, cancel func()) []Event {
 	cancel()
 	var out []Event
-	for {
-		select {
-		case ev := <-ch:
-			out = append(out, ev)
-		default:
-			return out
-		}
+	for ev := range ch {
+		out = append(out, ev)
 	}
+	return out
 }
 
 // rebuild 按 02 §3.1 的事件溯源规则 1:1 还原 transcript。
@@ -437,5 +434,214 @@ func (rewriteGuard) Check(_ context.Context, tc message.ToolCall) Decision {
 	return Decision{
 		Action:    GuardRewrite,
 		Rewritten: message.ToolCall{ID: tc.ID, Name: tc.Name, Args: mustJSON(nil, map[string]string{"q": "公开"})},
+	}
+}
+
+func TestBusDurableFIFOCloneAndClose(t *testing.T) {
+	b := newBusWithTimeout(time.Second)
+	ch, unsubscribe := b.add(1)
+	payload := &MessageEndData{Message: message.Message{
+		Role:   message.RoleAssistant,
+		Blocks: []message.Block{message.ImageBlock{Data: []byte{1}}},
+	}}
+	for i := 0; i < 8; i++ {
+		b.emit(Event{Kind: KindMessageEnd, Turn: i, Data: payload})
+	}
+	payload.Message.Blocks[0].(message.ImageBlock).Data[0] = 9
+	unsubscribe()
+
+	var events []Event
+	for ev := range ch {
+		events = append(events, ev)
+	}
+	if len(events) != 8 {
+		t.Fatalf("durable events: want 8 got %d", len(events))
+	}
+	for i, ev := range events {
+		if ev.Turn != i {
+			t.Fatalf("FIFO order at %d: turn=%d", i, ev.Turn)
+		}
+		d, ok := ev.Data.(*MessageEndData)
+		if !ok || d.Message.Blocks[0].(message.ImageBlock).Data[0] != 1 {
+			t.Fatalf("event %d did not clone Data: %#v", i, ev.Data)
+		}
+	}
+}
+
+func TestPreflightCancellationReportsZeroTurns(t *testing.T) {
+	fake := provider.NewFake(provider.FakeStep{Text: []string{"unused"}})
+	l, _ := New(Config{Provider: fake})
+	ctx, cancel := context.WithCancel(testCtx())
+	cancel()
+	res, err := l.Run(ctx, []message.Message{message.NewUser("hi")})
+	assertEnd(t, res, err, EndCancelled)
+	if res.Turns != 0 || fake.Left() != 1 {
+		t.Fatalf("preflight must use zero provider turns: result=%+v left=%d", res, fake.Left())
+	}
+}
+
+type blockingGuard struct{ started chan struct{} }
+
+func (g blockingGuard) Check(ctx context.Context, _ message.ToolCall) Decision {
+	close(g.started)
+	<-ctx.Done()
+	return Decision{Action: GuardAllow}
+}
+
+func TestInterruptCancelsGuard(t *testing.T) {
+	started := make(chan struct{})
+	fake := provider.NewFake(provider.FakeStep{Calls: []message.ToolCall{{ID: "c1", Name: "slow"}}})
+	slow := tool.NewFake("slow", message.ToolResult{}, 0)
+	l, _ := New(Config{Provider: fake, Tools: []tool.Tool{slow}, Guard: blockingGuard{started: started}})
+	go func() {
+		<-started
+		l.Interrupt()
+	}()
+	res, err := l.Run(testCtx(), []message.Message{message.NewUser("run")})
+	assertEnd(t, res, err, EndInterrupted)
+	if n, _, _ := slow.Calls(); n != 0 {
+		t.Fatalf("tool executed after guard interruption: %d", n)
+	}
+}
+
+type requestProbe struct {
+	requests []provider.Request
+	contexts []context.Context
+	calls    int
+}
+
+func (p *requestProbe) Stream(ctx context.Context, req provider.Request) (<-chan provider.StreamEvent, error) {
+	p.contexts = append(p.contexts, ctx)
+	p.requests = append(p.requests, req)
+	ch := make(chan provider.StreamEvent, 1)
+	if p.calls == 0 {
+		ch <- provider.ErrorEvent{Err: errors.New("retry"), Retryable: true}
+	} else {
+		ch <- provider.MessageComplete{Message: message.NewAssistant("done")}
+	}
+	p.calls++
+	close(ch)
+	return ch, nil
+}
+
+func TestRetryContextsTerminateAndToolsKeepConfigOrder(t *testing.T) {
+	probe := &requestProbe{}
+	first := tool.NewFake("first", message.ToolResult{}, 0)
+	second := tool.NewFake("second", message.ToolResult{}, 0)
+	l, _ := New(Config{Provider: probe, Tools: []tool.Tool{first, second}})
+	res, err := l.Run(testCtx(), []message.Message{message.NewUser("hi")})
+	assertEnd(t, res, err, EndDone)
+	if len(probe.requests) != 2 || len(probe.requests[0].Tools) != 2 ||
+		probe.requests[0].Tools[0].Name != "first" || probe.requests[0].Tools[1].Name != "second" {
+		t.Fatalf("tool definition order changed: %+v", probe.requests)
+	}
+	for i, ctx := range probe.contexts {
+		select {
+		case <-ctx.Done():
+		default:
+			t.Fatalf("attempt context %d remains live", i)
+		}
+	}
+}
+
+func TestRewriteAuditPreservesOriginalID(t *testing.T) {
+	fake := provider.NewFake(
+		provider.FakeStep{Calls: []message.ToolCall{{ID: "original", Name: "search"}}},
+		provider.FakeStep{Text: []string{"done"}},
+	)
+	search := tool.NewFake("search", message.ToolResult{}, 0)
+	l, _ := New(Config{Provider: fake, Tools: []tool.Tool{search}, Guard: rewriteGuard{}})
+	ch, unsubscribe := l.Subscribe(32)
+	_, err := l.Run(testCtx(), []message.Message{message.NewUser("search")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range drain(ch, unsubscribe) {
+		if d, ok := ev.Data.(ToolGuardDecisionData); ok {
+			if d.Call.ID != "original" || d.Rewritten == nil || d.Rewritten.ID != "original" {
+				t.Fatalf("rewrite audit IDs: %+v", d)
+			}
+			return
+		}
+	}
+	t.Fatal("missing rewrite audit event")
+}
+
+// Interrupt 落在重试退避间隙：必须立刻抢占，不得让下一个 attempt
+// 带着已置位的 interrupt 标志继续跑完整个流。
+func TestInterruptDuringRetryBackoff(t *testing.T) {
+	fake := provider.NewFake(
+		provider.FakeStep{Err: errors.New("503"), Retryable: true},
+		provider.FakeStep{Text: []string{"很长的回答"}, ChunkDelay: 300 * time.Millisecond},
+	)
+	l, _ := New(Config{Provider: fake})
+	go func() {
+		time.Sleep(20 * time.Millisecond) // 落在 50ms 退避窗口内
+		l.Interrupt()
+	}()
+	start := time.Now()
+	res, err := l.Run(testCtx(), []message.Message{message.NewUser("hi")})
+	assertEnd(t, res, err, EndInterrupted)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("interrupt during backoff did not preempt: %v", elapsed)
+	}
+	if fake.Left() != 1 {
+		t.Fatalf("next attempt must not consume a step after backoff interrupt: left=%d", fake.Left())
+	}
+}
+
+// 重试 attempt 之间 Temperature 指针必须隔离：首个 attempt 收到的请求
+// 被恶意修改后，重试请求不得看到变化。
+func TestRetryRequestTemperatureIsolation(t *testing.T) {
+	var first atomic.Bool
+	var retryTemp atomic.Pointer[float64]
+	probe := probeFunc(func(ctx context.Context, req provider.Request) (<-chan provider.StreamEvent, error) {
+		ch := make(chan provider.StreamEvent, 1)
+		if !first.CompareAndSwap(false, true) {
+			v := *req.Options.Temperature
+			retryTemp.Store(&v)
+			ch <- provider.MessageComplete{Message: message.NewAssistant("ok")}
+			close(ch)
+			return ch, nil
+		}
+		*req.Options.Temperature = 99.0 // 恶意修改本 attempt 收到的请求
+		ch <- provider.ErrorEvent{Err: errors.New("503"), Retryable: true}
+		close(ch)
+		return ch, nil
+	})
+	l, _ := New(Config{Provider: probe})
+	ctx := ctxx.WithOptions(testCtx(), ctxx.Options{Temperature: ptr(0.7)})
+	res, err := l.Run(ctx, []message.Message{message.NewUser("hi")})
+	assertEnd(t, res, err, EndDone)
+	if retryTemp.Load() == nil || *retryTemp.Load() != 0.7 {
+		t.Fatalf("retry attempt saw mutated temperature: %v", retryTemp.Load())
+	}
+}
+
+func probeFunc(fn func(context.Context, provider.Request) (<-chan provider.StreamEvent, error)) provider.Provider {
+	return probeFuncT(fn)
+}
+
+type probeFuncT func(context.Context, provider.Request) (<-chan provider.StreamEvent, error)
+
+func (f probeFuncT) Stream(ctx context.Context, req provider.Request) (<-chan provider.StreamEvent, error) {
+	return f(ctx, req)
+}
+
+func ptr(v float64) *float64 { return &v }
+
+// GuardDeny 分支退出前必须清理 opCancel：不得残留指向已完成调用 ctx 的
+// cancel（否则后续 Interrupt 会调用陈旧 cancel，掩盖真实操作靶点）。
+func TestGuardDenyCleansOpCancel(t *testing.T) {
+	fake := provider.NewFake(
+		provider.FakeStep{Calls: []message.ToolCall{{ID: "c1", Name: "rm_rf"}}},
+		provider.FakeStep{Text: []string{"好吧。"}},
+	)
+	danger := tool.NewFake("rm_rf", message.ToolResult{}, 0)
+	l, _ := New(Config{Provider: fake, Tools: []tool.Tool{danger}, Guard: denyGuard{}})
+	res, err := l.Run(testCtx(), []message.Message{message.NewUser("删库")})
+	assertEnd(t, res, err, EndDone)
+	if box := l.opCancel.Load(); box != nil && box.fn != nil {
+		t.Fatal("opCancel retains stale cancel after GuardDeny branch")
 	}
 }

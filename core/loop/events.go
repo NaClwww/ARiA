@@ -101,3 +101,43 @@ type AgentEndData struct {
 	Result RunResult
 	Err    error
 }
+
+// cloneEvent 给每订阅者一份独立快照，防止任一消费者篡改共享底层
+// （Blocks / RawMessage / 音视频字节）影响其他订阅者或持久化真值。
+func cloneEvent(ev Event) Event {
+	switch d := ev.Data.(type) {
+	case AgentStartData:
+		d.InitialInput = cloneMessages(d.InitialInput)
+		ev.Data = d
+	case UserMessageInjectedData:
+		d.Message = d.Message.Clone()
+		ev.Data = d
+	case MessageEndData:
+		d.Message = d.Message.Clone()
+		ev.Data = d
+	case ToolGuardDecisionData:
+		d.Call = d.Call.Clone()
+		if d.Rewritten != nil {
+			r := d.Rewritten.Clone()
+			d.Rewritten = &r
+		}
+		ev.Data = d
+	case ToolExecStartData:
+		d.Call = d.Call.Clone()
+		ev.Data = d
+	case ToolExecEndData:
+		d.Call = d.Call.Clone()
+		d.Result = d.Result.Clone()
+		ev.Data = d
+	case *MessageEndData:
+		c := *d
+		c.Message = c.Message.Clone()
+		ev.Data = &c
+	case *ToolExecEndData:
+		c := *d
+		c.Call = c.Call.Clone()
+		c.Result = c.Result.Clone()
+		ev.Data = &c
+	}
+	return ev
+}

@@ -106,9 +106,10 @@ type RunResult struct {
 // ---------- Loop ----------
 
 type Loop struct {
-	cfg   Config
-	tools map[string]tool.Tool
-	bus   *bus
+	cfg      Config
+	tools    map[string]tool.Tool
+	toolDefs []tool.Def
+	bus      *bus
 
 	mu      sync.Mutex // 只守入口边界（队列、运行标志），不守飞轮状态
 	queue   []message.Message
@@ -139,6 +140,7 @@ func New(cfg Config) (*Loop, error) {
 			return nil, fmt.Errorf("loop: duplicate tool name %q", d.Name)
 		}
 		l.tools[d.Name] = t
+		l.toolDefs = append(l.toolDefs, cloneToolDef(d))
 	}
 	if cfg.MaxTurns == 0 {
 		cfg.MaxTurns = DefaultMaxTurns
@@ -174,21 +176,23 @@ func (l *Loop) Run(parent context.Context, input []message.Message) (RunResult, 
 	defer cancel()
 	l.interrupt.Store(false)
 	l.runID = newID()
-	l.messages = slices.Clone(input)
+	l.messages = cloneMessages(input)
 
 	scope, _ := ctxx.ScopeFrom(parent)
-	l.emit(KindAgentStart, AgentStartData{Scope: scope, InitialInput: input})
+	l.emit(KindAgentStart, AgentStartData{Scope: scope, InitialInput: cloneMessages(input)})
 
 	var total message.Usage
+	turns := 0
 	for l.turn = 0; ; l.turn++ {
 		if end, err := l.preFlight(parent); end != "" {
-			return l.finish(end, total, err)
+			return l.finish(end, turns, total, err)
 		}
 		l.drainQueue() // Run 前积压 / 轮间竞态到达的 steering 输入并入本轮
 		// 轮间 Interrupt 且无新输入：直接收敛为 EndInterrupted
 		if l.interrupt.Load() && l.queueLen() == 0 {
-			return l.finish(EndInterrupted, total, nil)
+			return l.finish(EndInterrupted, turns, total, nil)
 		}
+		turns++
 		l.emit(KindTurnStart, TurnStartData{Turn: l.turn})
 
 		msgs := l.assemble(runCtx)
@@ -196,9 +200,9 @@ func (l *Loop) Run(parent context.Context, input []message.Message) (RunResult, 
 		total = total.Add(usage)
 		if err != nil {
 			if parent.Err() != nil {
-				return l.finish(EndCancelled, total, parent.Err())
+				return l.finish(EndCancelled, turns, total, parent.Err())
 			}
-			return l.finish(EndError, total, err)
+			return l.finish(EndError, turns, total, err)
 		}
 		if b := ctxx.BudgetFrom(parent); b != nil {
 			b.Consume(usage)
@@ -214,14 +218,14 @@ func (l *Loop) Run(parent context.Context, input []message.Message) (RunResult, 
 
 		// 恢复点先查 parent（02 §6）：Interrupt（转向）≠ parent 取消（关机）
 		if perr := parent.Err(); perr != nil {
-			return l.finish(EndCancelled, total, perr)
+			return l.finish(EndCancelled, turns, total, perr)
 		}
 		if l.interrupt.Load() && l.queueLen() == 0 {
-			return l.finish(EndInterrupted, total, nil)
+			return l.finish(EndInterrupted, turns, total, nil)
 		}
 		// 本轮无工具调用、也没有新注入的输入 → 自然收敛
 		if len(msg.ToolCalls) == 0 && injected == 0 && l.queueLen() == 0 {
-			return l.finish(EndDone, total, nil)
+			return l.finish(EndDone, turns, total, nil)
 		}
 		// 其余情况续轮：有工具结果待续 / 有新注入的输入待回答
 	}
@@ -230,7 +234,7 @@ func (l *Loop) Run(parent context.Context, input []message.Message) (RunResult, 
 // Queue 任意时刻入队，轮间注入为 user 消息。
 func (l *Loop) Queue(msg message.Message) {
 	l.mu.Lock()
-	l.queue = append(l.queue, msg)
+	l.queue = append(l.queue, msg.Clone())
 	l.mu.Unlock()
 }
 
@@ -268,52 +272,63 @@ func (l *Loop) preFlight(parent context.Context) (EndReason, error) {
 // assemble 调槽 1；默认恒等透传 transcript。
 func (l *Loop) assemble(ctx context.Context) []message.Message {
 	if l.cfg.Assembler == nil {
-		return l.messages
+		return cloneMessages(l.messages)
 	}
-	st := State{Messages: slices.Clone(l.messages), Turn: l.turn, QueueLen: l.queueLen()}
+	st := State{Messages: cloneMessages(l.messages), Turn: l.turn, QueueLen: l.queueLen()}
+
 	out := l.cfg.Assembler.Assemble(ctx, st)
 	if out == nil {
-		return l.messages
+		return cloneMessages(l.messages)
 	}
-	return out
+	return cloneMessages(out)
 }
 
 // streamLLM 消费 provider 流：翻译 Start/Update 事件；未产出任何内容前的
 // Retryable 错误退避重试（02 §7）；取消时合成部分输出（provider 违约兜底）。
 func (l *Loop) streamLLM(ctx context.Context, msgs []message.Message) (message.Message, message.Usage, error) {
-	tools := make([]tool.Def, 0, len(l.tools))
-	for _, t := range l.tools {
-		tools = append(tools, t.Def())
-	}
 	opts, _ := ctxx.OptionsFrom(ctx)
-	req := provider.Request{Messages: msgs, Tools: tools, Options: opts}
+	req := provider.Request{Messages: cloneMessages(msgs), Tools: cloneToolDefs(l.toolDefs), Options: opts}
 
 	msgID := newID()
 	l.emit(KindMessageStart, MessageStartData{Role: message.RoleAssistant, MessageID: msgID})
-
-	opCtx, opCancel := context.WithCancel(ctx)
-	l.opCancel.Store(&cancelBox{fn: opCancel})
-	defer func() {
-		l.opCancel.Store(&cancelBox{})
-		opCancel()
-	}()
 
 	var text, thought strings.Builder
 	received := false // 已产出任何内容——有内容则不重试（避免重复计费/内容）
 
 attemptLoop:
 	for attempt := 0; ; attempt++ {
-		evCh, err := l.cfg.Provider.Stream(opCtx, req)
+		attemptCtx, attemptCancel := context.WithCancel(ctx)
+		l.opCancel.Store(&cancelBox{fn: attemptCancel})
+		// 注册后再复查：Interrupt 落在「检查通过→注册 cancel」之间的空档时，
+		// 标志已置位而 cancel 未注册；先注册再检查可保证该窗口内的 Interrupt
+		// 必被此处捕获（此后到达的 Interrupt 则命中已注册的 cancel）。
+		if l.interrupt.Load() {
+			attemptCancel()
+			l.opCancel.Store(&cancelBox{})
+			return l.partialAssistant(msgID, &text, &thought), message.Usage{}, nil
+		}
+		evCh, err := l.cfg.Provider.Stream(attemptCtx, cloneRequest(req))
 		if err != nil {
-			if opCtx.Err() != nil {
+			cancelled := attemptCtx.Err() != nil
+			attemptCancel()
+			l.opCancel.Store(&cancelBox{})
+			if cancelled {
 				return l.partialAssistant(msgID, &text, &thought), message.Usage{}, nil
 			}
-			if provider.IsRetryable(err) && attempt < l.cfg.MaxStreamRetries && backoff(opCtx, attempt) == nil {
+			if provider.IsRetryable(err) && attempt < l.cfg.MaxStreamRetries && l.waitRetry(ctx, attempt) {
 				continue
+			}
+			if l.interrupt.Load() {
+				return l.partialAssistant(msgID, &text, &thought), message.Usage{}, nil
 			}
 			return message.Message{}, message.Usage{}, fmt.Errorf("provider stream: %w", err)
 		}
 		for ev := range evCh {
+			if l.interrupt.Load() && attemptCtx.Err() == nil {
+				// 流中到达的 Interrupt：立即取消 attempt，provider 按义务回
+				// Interrupted complete；若违约，随后的 channel 关闭路径兜底
+				attemptCancel()
+			}
 			switch e := ev.(type) {
 			case provider.PartDelta:
 				received = true
@@ -324,18 +339,32 @@ attemptLoop:
 				thought.WriteString(e.Text)
 				l.emit(KindMessageUpdate, MessageUpdateData{MessageID: msgID, ThoughtDelta: e.Text})
 			case provider.MessageComplete:
-				m := e.Message
+				attemptCancel()
+				l.opCancel.Store(&cancelBox{})
+				m := e.Message.Clone()
 				m.ID = msgID // loop 持有 canonical ID，事件与历史一致
 				m.Interrupted = e.Interrupted
 				return m, e.Usage, nil
 			case provider.ErrorEvent:
-				if e.Retryable && !received && attempt < l.cfg.MaxStreamRetries && backoff(opCtx, attempt) == nil {
+				cancelled := attemptCtx.Err() != nil
+				attemptCancel()
+				l.opCancel.Store(&cancelBox{})
+				if cancelled {
+					return l.partialAssistant(msgID, &text, &thought), message.Usage{}, nil
+				}
+				if e.Retryable && !received && attempt < l.cfg.MaxStreamRetries && l.waitRetry(ctx, attempt) {
 					continue attemptLoop
+				}
+				if l.interrupt.Load() {
+					return l.partialAssistant(msgID, &text, &thought), message.Usage{}, nil
 				}
 				return message.Message{}, message.Usage{}, fmt.Errorf("provider: %w", e.Err)
 			}
 		}
-		if opCtx.Err() != nil {
+		cancelled := attemptCtx.Err() != nil
+		attemptCancel()
+		l.opCancel.Store(&cancelBox{})
+		if cancelled {
 			return l.partialAssistant(msgID, &text, &thought), message.Usage{}, nil
 		}
 		return message.Message{}, message.Usage{},
@@ -343,10 +372,16 @@ attemptLoop:
 	}
 }
 
-// execCalls 顺序执行工具调用（02 §2）。
+// execCalls 顺序执行工具调用（02 §2）。每个调用的操作 cancel 在入口
+// 注册、随后复查 interrupt——与 streamLLM 同一纪律，保证「检查通过→
+// 注册 cancel」空档内到达的 Interrupt 必被捕获。
 func (l *Loop) execCalls(ctx context.Context, calls []message.ToolCall) {
 	for _, tc := range calls {
+		callCtx, callCancel := context.WithCancel(ctx)
+		l.opCancel.Store(&cancelBox{fn: callCancel})
 		if l.interrupt.Load() {
+			callCancel()
+			l.opCancel.Store(&cancelBox{})
 			res := aborted(tc.ID)
 			l.messages = append(l.messages, res.ToMessage())
 			l.emit(KindToolExecEnd, ToolExecEndData{Call: tc, Result: res})
@@ -355,30 +390,56 @@ func (l *Loop) execCalls(ctx context.Context, calls []message.ToolCall) {
 
 		d := Decision{Action: GuardAllow}
 		if l.cfg.Guard != nil {
-			d = l.cfg.Guard.Check(ctx, tc)
-			l.emit(KindToolGuardDecision, ToolGuardDecisionData{Call: tc, Action: d.Action, Reason: d.Reason})
+			d = l.cfg.Guard.Check(callCtx, tc.Clone())
+			if callCtx.Err() != nil {
+				callCancel()
+				l.opCancel.Store(&cancelBox{})
+				res := aborted(tc.ID)
+				l.messages = append(l.messages, res.ToMessage())
+				l.emit(KindToolExecEnd, ToolExecEndData{Call: tc, Result: res})
+				continue
+			}
 		}
+
+		effective := tc.Clone()
+		if d.Action == GuardRewrite {
+			effective = d.Rewritten.Clone()
+			effective.ID = tc.ID
+			d.Rewritten = effective
+		}
+		if l.cfg.Guard != nil {
+			var rewritten *tool.Call
+			if d.Action == GuardRewrite {
+				r := effective.Clone()
+				rewritten = &r
+			}
+			l.emit(KindToolGuardDecision, ToolGuardDecisionData{Call: tc, Action: d.Action, Reason: d.Reason, Rewritten: rewritten})
+		}
+
 		switch d.Action {
 		case GuardDeny:
+			callCancel()
+			l.opCancel.Store(&cancelBox{})
 			res := message.ToolResult{CallID: tc.ID, IsError: true,
 				Blocks: []message.Block{message.TextBlock{Text: "denied: " + d.Reason}}}
 			l.messages = append(l.messages, res.ToMessage())
 			l.emit(KindToolExecEnd, ToolExecEndData{Call: tc, Result: res, Denied: true})
 			continue
 		case GuardRewrite:
-			if d.Rewritten.ID == "" {
-				d.Rewritten.ID = tc.ID
-			}
-			tc = d.Rewritten
+			tc = effective
 		}
 
 		l.emit(KindToolExecStart, ToolExecStartData{Call: tc})
-		res := l.execTool(ctx, tc)
+		res := l.execTool(callCtx, tc)
+		callCancel()
+		l.opCancel.Store(&cancelBox{})
 		l.messages = append(l.messages, res.ToMessage())
 		l.emit(KindToolExecEnd, ToolExecEndData{Call: tc, Result: res})
 	}
 }
 
+// execTool 执行单个工具。cancel 已由 execCalls 入口注册（覆盖 Guard+Exec
+// 全程），这里只叠加可选的单工具超时，不再自装 opCancel。
 func (l *Loop) execTool(ctx context.Context, tc message.ToolCall) message.ToolResult {
 	t, ok := l.tools[tc.Name]
 	if !ok {
@@ -391,18 +452,12 @@ func (l *Loop) execTool(ctx context.Context, tc message.ToolCall) message.ToolRe
 		tctx, cancel = context.WithTimeout(ctx, l.cfg.ToolTimeout)
 		defer cancel()
 	}
-	opCtx, opCancel := context.WithCancel(tctx)
-	l.opCancel.Store(&cancelBox{fn: opCancel})
-	defer func() {
-		l.opCancel.Store(&cancelBox{})
-		opCancel()
-	}()
 
-	res := t.Exec(opCtx, tc)
+	res := t.Exec(tctx, tc.Clone()).Clone()
 	if res.CallID == "" {
 		res.CallID = tc.ID
 	}
-	if opCtx.Err() != nil && !res.IsError {
+	if tctx.Err() != nil && !res.IsError {
 		res.IsError = true
 		res.Blocks = append(res.Blocks, message.TextBlock{Text: "[tool interrupted]"})
 	}
@@ -456,8 +511,8 @@ func (l *Loop) partialAssistant(msgID string, text, thought *strings.Builder) me
 	return m
 }
 
-func (l *Loop) finish(end EndReason, total message.Usage, err error) (RunResult, error) {
-	res := RunResult{RunID: l.runID, EndReason: end, Turns: l.turn + 1, Usage: total}
+func (l *Loop) finish(end EndReason, turns int, total message.Usage, err error) (RunResult, error) {
+	res := RunResult{RunID: l.runID, EndReason: end, Turns: turns, Usage: total}
 	l.emit(KindAgentEnd, AgentEndData{Result: res, Err: err})
 	if err != nil {
 		return res, err
@@ -471,24 +526,70 @@ func (l *Loop) emit(kind Kind, data any) {
 
 // ---------- 杂项 ----------
 
-func backoff(ctx context.Context, attempt int) error {
+// waitRetry 等待重试退避；期间 parent 取消或 Interrupt 到达则提前放弃
+// （false）。轮询 25ms：Interrupt 可能在两个 attempt 之间的空槽到达，
+// 此时不持有 opCancel，只能靠标志位唤醒。
+func (l *Loop) waitRetry(ctx context.Context, attempt int) bool {
 	d := time.Duration(50<<min(attempt, 4)) * time.Millisecond
 	if d > time.Second {
 		d = time.Second
 	}
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-t.C:
-		return nil
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	tick := time.NewTicker(25 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			return !l.interrupt.Load()
+		case <-tick.C:
+			if l.interrupt.Load() {
+				return false
+			}
+		}
 	}
 }
 
 func aborted(callID string) message.ToolResult {
 	return message.ToolResult{CallID: callID, IsError: true,
 		Blocks: []message.Block{message.TextBlock{Text: "[interrupted]"}}}
+}
+
+func cloneMessages(in []message.Message) []message.Message {
+	if in == nil {
+		return nil
+	}
+	out := make([]message.Message, len(in))
+	for i := range in {
+		out[i] = in[i].Clone()
+	}
+	return out
+}
+
+func cloneToolDef(d tool.Def) tool.Def {
+	d.Parameters = append([]byte(nil), d.Parameters...)
+	return d
+}
+
+func cloneToolDefs(in []tool.Def) []tool.Def {
+	out := make([]tool.Def, len(in))
+	for i := range in {
+		out[i] = cloneToolDef(in[i])
+	}
+	return out
+}
+
+func cloneRequest(req provider.Request) provider.Request {
+	req.Messages = cloneMessages(req.Messages)
+	req.Tools = cloneToolDefs(req.Tools)
+	req.Options.Stop = slices.Clone(req.Options.Stop)
+	if req.Options.Temperature != nil {
+		v := *req.Options.Temperature
+		req.Options.Temperature = &v
+	}
+	return req
 }
 
 func newID() string {

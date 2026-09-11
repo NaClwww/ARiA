@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"math"
 	"sync/atomic"
 
 	"aria/pkg/message"
@@ -97,13 +98,25 @@ type Budget struct {
 }
 
 func NewBudget(maxTokens int64, maxCost float64) *Budget {
-	return &Budget{MaxTokens: maxTokens, MaxCostMicro: int64(maxCost * 1e6)}
+	if maxTokens < 0 {
+		maxTokens = 0
+	}
+	return &Budget{MaxTokens: maxTokens, MaxCostMicro: costToMicro(maxCost, true)}
 }
 
 // Consume 在 MessageComplete 后调用（02 §7）。
 func (b *Budget) Consume(u message.Usage) {
-	b.usedTokens.Add(int64(u.In + u.Out))
-	b.usedCost.Add(int64(u.Cost * 1e6))
+	var tokens int64
+	if u.In > 0 {
+		tokens = int64(u.In)
+	}
+	if u.Out > 0 && tokens <= math.MaxInt64-int64(u.Out) {
+		tokens += int64(u.Out)
+	} else if u.Out > 0 {
+		tokens = math.MaxInt64
+	}
+	addClamped(&b.usedTokens, tokens)
+	addClamped(&b.usedCost, costToMicro(u.Cost, false))
 }
 
 func (b *Budget) Exceeded() bool {
@@ -145,12 +158,61 @@ type Options struct {
 type optionsKey struct{}
 
 func WithOptions(ctx context.Context, o Options) context.Context {
+	o.Stop = cloneStrings(o.Stop)
+	o.Temperature = cloneFloatPtr(o.Temperature)
 	return context.WithValue(ctx, optionsKey{}, o)
 }
 
 func OptionsFrom(ctx context.Context) (Options, bool) {
 	o, ok := ctx.Value(optionsKey{}).(Options)
+	o.Stop = cloneStrings(o.Stop)
+	o.Temperature = cloneFloatPtr(o.Temperature)
 	return o, ok
+}
+
+func cloneStrings(s []string) []string {
+	if s == nil {
+		return nil
+	}
+	return append([]string(nil), s...)
+}
+
+func cloneFloatPtr(p *float64) *float64 {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
+func costToMicro(cost float64, positiveMinimum bool) int64 {
+	if math.IsNaN(cost) || math.IsInf(cost, 0) || cost <= 0 {
+		return 0
+	}
+	micro := math.Round(cost * 1e6)
+	if micro >= math.MaxInt64 {
+		return math.MaxInt64
+	}
+	if positiveMinimum && micro < 1 {
+		return 1
+	}
+	return int64(micro)
+}
+
+func addClamped(dst *atomic.Int64, delta int64) {
+	if delta <= 0 {
+		return
+	}
+	for {
+		old := dst.Load()
+		next := old + delta
+		if delta > math.MaxInt64-old {
+			next = math.MaxInt64
+		}
+		if dst.CompareAndSwap(old, next) {
+			return
+		}
+	}
 }
 
 // ---------- 分离任务 ----------

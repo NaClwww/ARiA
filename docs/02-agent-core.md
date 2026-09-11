@@ -12,8 +12,10 @@
 |---|---|
 | `Run(parent, input)` | 阻塞执行一次完整运行；同实例禁止并发 Run |
 | `Queue(msg)` | steering 输入，**轮间**注入 |
-| `Interrupt(reason)` | 取消当前 LLM 调用，保留部分输出，可续 |
-| `Subscribe()` | 事件订阅（channel + 分级丢弃） |
+| `Interrupt()` | 取消当前 LLM 调用/工具执行/Guard 等待，保留部分输出，可续 |
+| `Subscribe(buf)` | 事件订阅（channel + 分级丢弃；退订/停滞断开时关闭 channel） |
+
+**core 没有也不需要投机/预测入口**：`Run` 无状态（每次由调用方传完整历史），「用预测输入提前生成、确认后复用」整体归 runtime（`runtime/speculate`，见 03 §4）——core 不为预测增加任何 API。
 
 **三方纪律**：runtime 不得直接读写 loop 状态，只经入口；loop 不做磁盘 I/O（持久化 = runtime 订阅 durable 事件，事件溯源）；工具/Provider 的 I/O 阻塞飞轮 goroutine 允许，但必须尊重 ctx 取消。多 session = 多飞轮并行（actor 模型）。
 
@@ -40,7 +42,7 @@ func (l *Loop) Run(parent context.Context, input []Message) (RunResult, error) {
 }
 ```
 
-轮（turn）= 恰好一次 LLM 调用 + 其后顺序执行的全部工具。`MaxTurns` 默认宽松（100），`0` = 无限制（pi「loop until done」哲学 + 默认有闸）。
+轮（turn）= 恰好一次 LLM 调用 + 其后顺序执行的全部工具；`RunResult.Turns` 按实际发起的 LLM 调用计（重试不增加；preflight 终止为 0）。`MaxTurns`：`0` = 未设置走默认 100，负数 = 无限制（「loop until done」+ 默认有闸）。
 
 ## 3. 事件体系
 
@@ -65,7 +67,7 @@ func (l *Loop) Run(parent context.Context, input []Message) (RunResult, error) {
 
 ### 3.2 总线纪律
 
-emit 在飞轮 goroutine 内同步入队但绝不阻塞飞轮：每订阅者一个有界 channel + 投递协程。volatile 满则合并/替换；durable 满则投递协程背压等待，订阅者停滞超阈值（默认 5s）判定故障——断开该订阅者并告警，其后事件不再为其保留（durable 的「不丢」以订阅者存活为界）。复杂度关死在 `bus.go`。
+emit 在飞轮 goroutine 内同步入队但绝不阻塞飞轮：每订阅者**一条内部 FIFO + 唯一投递协程**（唯一写者，也是唯一关闭者——退订/停滞断开时关闭 channel，消费者可 `range` 收尾）。volatile 满则丢（MessageEnd 永远带全文）；durable 严格按 emit 顺序投递、满则积压（防御上限后断开），订阅者停滞超阈值（默认 5s）判定故障断开（durable 的「不丢」以订阅者存活为界）。事件载荷按订阅者深拷贝，消费者无法篡改共享底层。复杂度关死在 `bus.go`。
 
 ## 4. 两个钩子槽（core 仅有的扩展点）
 
@@ -76,7 +78,7 @@ type Assembler interface{ Assemble(ctx context.Context, s State) []Message } // 
 type ToolGuard interface{ Check(ctx context.Context, tc ToolCall) Decision } // Allow/Deny/Rewrite
 ```
 
-Guard 阻塞飞轮等人类审批是**正确**语义（批准前什么都不该跑），但等待必须挂 runCtx：Ctrl-C = Deny + Interrupt。记忆体系（ContextSource 契约）在 runtime/plugins，core 无感知。runtime 在这两个槽上如何组织扩展（链折叠、装饰器、读通道）见 03 §3。
+Guard 阻塞飞轮等人类审批是**正确**语义（批准前什么都不该跑），但等待挂可取消 ctx：`Interrupt()` 能解除 Guard 等待（按拒绝收场，剩余调用补结果）。Rewrite 只允许改 name/args，**ToolCall ID 由 core 强制保留**（否则 assistant 调用与 tool 结果失配，provider 重放会拒收）；决议事件记录 original 与 effective 双份。记忆体系（ContextSource 契约）在 runtime/plugins，core 无感知。runtime 在这两个槽上如何组织扩展（链折叠、装饰器、读通道）见 03 §3。
 
 ## 5. Provider / Tool 接口
 
@@ -121,5 +123,5 @@ Interrupt（转向）≠ parent 取消（关机）：loop 内部持有 runCtx ca
 
 ## 10. M1 范围与验收
 
-`pkg/ctxx` + `pkg/message` + `core/provider`（接口+fake+OpenAI 兼容适配）+ `core/tool` + `core/loop`（bus/steering/全套测试）。
-验收：§8 场景全绿；集成测试（无 API key 自动 skip）驱动真实 OpenAI 兼容 provider 跑通多轮工具调用；日志全带 trace_id；`-race` 干净。
+`pkg/ctxx` + `pkg/message` + `core/provider`（接口+fake）+ `core/tool` + `core/loop`（bus/steering/全套测试）；OpenAI 兼容适配器在 `plugins/provider/openai`（live 测试无 key 自动 skip）。
+验收：§8 场景全绿；集成测试驱动真实 OpenAI 兼容 provider 跑通多轮工具调用；日志全带 trace_id；`-race` 干净。

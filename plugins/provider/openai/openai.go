@@ -111,6 +111,7 @@ func (a *Adapter) read(ctx context.Context, resp *http.Response, ch chan<- provi
 	var order []int
 	var usage message.Usage
 	finish := ""
+	done := false
 
 	r := bufio.NewReader(resp.Body)
 	for {
@@ -134,6 +135,7 @@ func (a *Adapter) read(ctx context.Context, resp *http.Response, ch chan<- provi
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
+			done = true
 			break
 		}
 		var c wireChunk
@@ -177,6 +179,10 @@ func (a *Adapter) read(ctx context.Context, resp *http.Response, ch chan<- provi
 	if ctx.Err() != nil {
 		// 部分结果义务：已收文本原样返回，残缺 tool calls 丢弃（A3 默认）
 		ch <- provider.MessageComplete{Message: partial(text, thought), Interrupted: true}
+		return
+	}
+	if !done && finish == "" {
+		ch <- provider.ErrorEvent{Err: errors.New("openai: unexpected EOF before [DONE] or finish_reason"), Retryable: true}
 		return
 	}
 

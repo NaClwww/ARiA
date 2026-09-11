@@ -21,7 +21,7 @@ type Fake struct {
 }
 
 func NewFake(name string, res message.ToolResult, delay time.Duration) *Fake {
-	return &Fake{name: name, res: res, delay: delay}
+	return &Fake{name: name, res: res.Clone(), delay: delay}
 }
 
 func (f *Fake) Def() Def { return Def{Name: f.name, Description: "fake tool"} }
@@ -41,7 +41,7 @@ func (f *Fake) Exec(ctx context.Context, call Call) Result {
 	f.lastID = call.ID
 	f.mu.Unlock()
 
-	res := f.res
+	res := f.res.Clone()
 	if res.CallID == "" {
 		res.CallID = call.ID
 	}
@@ -52,5 +52,5 @@ func (f *Fake) Exec(ctx context.Context, call Call) Result {
 func (f *Fake) Calls() (n int, args []byte, id string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.execN, f.lastArgs, f.lastID
+	return f.execN, append([]byte(nil), f.lastArgs...), f.lastID
 }

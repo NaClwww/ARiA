@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"aria/core/loop"
+	"aria/core/provider"
 	"aria/core/tool"
 	"aria/pkg/ctxx"
 	"aria/pkg/message"
@@ -126,14 +127,10 @@ func testCtx() context.Context {
 func drainEvents(ch <-chan loop.Event, cancel func()) []loop.Event {
 	cancel()
 	var out []loop.Event
-	for {
-		select {
-		case ev := <-ch:
-			out = append(out, ev)
-		default:
-			return out
-		}
+	for ev := range ch {
+		out = append(out, ev)
 	}
+	return out
 }
 
 // ---------- 确定性测试 ----------
@@ -254,6 +251,29 @@ func TestAdapterInterruptPartial(t *testing.T) {
 		if d, ok := ev.Data.(loop.MessageEndData); ok && d.Message.Interrupted && d.Message.Text() == "" {
 			t.Fatal("interrupted message must carry partial text")
 		}
+	}
+}
+
+func TestAdapterUnexpectedEOF(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: " + textChunk("partial") + "\n\n"))
+	}))
+	defer ts.Close()
+
+	adapter := New(Config{BaseURL: ts.URL, APIKey: "k", Model: "m"})
+	ch, err := adapter.Stream(testCtx(), provider.Request{Messages: []message.Message{message.NewUser("hi")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawError bool
+	for ev := range ch {
+		if e, ok := ev.(provider.ErrorEvent); ok {
+			sawError = strings.Contains(e.Err.Error(), "unexpected EOF")
+		}
+	}
+	if !sawError {
+		t.Fatal("truncated stream must end with unexpected EOF ErrorEvent")
 	}
 }
 

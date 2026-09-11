@@ -33,7 +33,14 @@ type FakeStep struct {
 }
 
 func NewFake(steps ...FakeStep) *Fake {
-	return &Fake{steps: steps}
+	cloned := make([]FakeStep, len(steps))
+	for i, step := range steps {
+		step.Text = append([]string(nil), step.Text...)
+		step.Thought = append([]string(nil), step.Thought...)
+		step.Calls = cloneCalls(step.Calls)
+		cloned[i] = step
+	}
+	return &Fake{steps: cloned}
 }
 
 // Left 返回剩余脚本步数（测试断言用）。
@@ -60,9 +67,12 @@ func (f *Fake) Stream(ctx context.Context, _ Request) (<-chan StreamEvent, error
 			ch <- ErrorEvent{Err: s.Err, Retryable: s.Retryable}
 			return
 		}
-		var text strings.Builder
+		var text, thought strings.Builder
 		partial := func() {
 			var blocks []message.Block
+			if thought.Len() > 0 {
+				blocks = append(blocks, message.ThoughtBlock{Text: thought.String()})
+			}
 			if text.Len() > 0 {
 				blocks = append(blocks, message.TextBlock{Text: text.String()})
 			}
@@ -75,6 +85,7 @@ func (f *Fake) Stream(ctx context.Context, _ Request) (<-chan StreamEvent, error
 			if !f.wait(ctx, s.ChunkDelay, partial) {
 				return
 			}
+			thought.WriteString(c)
 			ch <- ThoughtDelta{Text: c}
 		}
 		for _, c := range s.Text {
@@ -85,11 +96,14 @@ func (f *Fake) Stream(ctx context.Context, _ Request) (<-chan StreamEvent, error
 			ch <- PartDelta{Text: c}
 		}
 		msg := message.Message{Role: message.RoleAssistant}
+		if thought.Len() > 0 {
+			msg.Blocks = append(msg.Blocks, message.ThoughtBlock{Text: thought.String()})
+		}
 		if text.Len() > 0 {
 			msg.Blocks = append(msg.Blocks, message.TextBlock{Text: text.String()})
 		}
-		msg.ToolCalls = s.Calls // 只在流完整走完才挂上（残缺即丢弃，A3 默认）
-		ch <- MessageComplete{Message: msg, Usage: s.Usage}
+		msg.ToolCalls = cloneCalls(s.Calls) // 只在流完整走完才挂上（残缺即丢弃，A3 默认）
+		ch <- MessageComplete{Message: msg.Clone(), Usage: s.Usage}
 	}()
 	return ch, nil
 }
@@ -112,6 +126,17 @@ func (f *Fake) wait(ctx context.Context, d time.Duration, partial func()) bool {
 	case <-time.After(d):
 		return true
 	}
+}
+
+func cloneCalls(in []message.ToolCall) []message.ToolCall {
+	if in == nil {
+		return nil
+	}
+	out := make([]message.ToolCall, len(in))
+	for i := range in {
+		out[i] = in[i].Clone()
+	}
+	return out
 }
 
 // FatalError 是不可重试的 provider 故障（02 §7 错误三分法的 Fatal 一侧）。

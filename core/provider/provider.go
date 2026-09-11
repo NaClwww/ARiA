@@ -46,10 +46,15 @@ type RetryableError struct{ Err error }
 func (e RetryableError) Error() string { return e.Err.Error() }
 func (e RetryableError) Unwrap() error { return e.Err }
 
-// IsRetryable 报告 err 是否值得退避重试。
+// IsRetryable 报告 err 是否值得退避重试。值与指针形态的 RetryableError
+// 都识别（插件适配器可能返回 &RetryableError{}）。
 func IsRetryable(err error) bool {
 	var re RetryableError
-	return errors.As(err, &re)
+	if errors.As(err, &re) {
+		return true
+	}
+	var pe *RetryableError
+	return errors.As(err, &pe)
 }
 
 func (PartDelta) isStreamEvent()       {}
