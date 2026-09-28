@@ -18,12 +18,13 @@ const DefaultSummaryInstruction = "把下面的对话压缩成简洁的摘要，
 // ProviderCompressor 用一次 Provider 调用把「记忆 + 本轮」压成一段摘要（03 §5）。
 // 它是 Compressor 的默认 LLM 实现；换压缩策略只需换 Compressor，窗口不动。
 //
-// ctx 若带 ctxx.Options（model 等）会作为兜底；本结构体字段优先。
+// ctx 若带 ctxx.Options（model、temperature…）会作为兜底；本结构体字段优先。
+// MaxTokens 例外——不继承 ctx（见 Compress），仅本字段显式设置才生效。
 type ProviderCompressor struct {
 	Provider provider.Provider
 
 	Model       string // 空 = 用 ctx 里 ctxx.Options 的模型
-	MaxTokens   int    // 0 = 不限制
+	MaxTokens   int    // 摘要输出上限；0 = 不限，也不继承主对话的配置
 	Instruction string // 空 = DefaultSummaryInstruction
 }
 
@@ -53,13 +54,14 @@ func (p *ProviderCompressor) Compress(ctx context.Context, memory, turn []messag
 		instruction = DefaultSummaryInstruction
 	}
 	// 本结构体字段优先，其次是调用方 ctx 里的 Options（模型覆盖等）。
+	// MaxTokens 不继承：主对话的输出上限套在摘要上，思考型模型会把
+	// 限额全烧在推理里、正文一字未出即被截断——落进窗口的就是
+	// 「空摘要」失败（2026-09-28 真机实测）。上限只有显式给才生效。
 	opts, _ := ctxx.OptionsFrom(ctx)
 	if p.Model != "" {
 		opts.Model = p.Model
 	}
-	if p.MaxTokens > 0 {
-		opts.MaxTokens = p.MaxTokens
-	}
+	opts.MaxTokens = p.MaxTokens
 	req := provider.Request{
 		Messages: []message.Message{
 			message.NewSystem(instruction),

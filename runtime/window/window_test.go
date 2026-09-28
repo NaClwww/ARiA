@@ -322,6 +322,47 @@ func TestProviderCompressorPropagatesError(t *testing.T) {
 	}
 }
 
+// ProviderCompressor：摘要不继承主对话的 max_tokens（思考型模型会把
+// 继承来的限额烧光在推理上，正文为零 → 空摘要失败）；显式字段仍生效。
+func TestProviderCompressorMaxTokensNotInherited(t *testing.T) {
+	ctx := ctxx.WithOptions(context.Background(), ctxx.Options{Model: "chat-m", MaxTokens: 2048})
+
+	rec := &recordingProvider{}
+	if _, err := (&ProviderCompressor{Provider: rec}).Compress(ctx,
+		[]message.Message{message.NewUser("早")}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.req.Options.MaxTokens; got != 0 {
+		t.Fatalf("摘要不继承 MaxTokens，got %d", got)
+	}
+	if got := rec.req.Options.Model; got != "chat-m" {
+		t.Fatalf("Model 仍随 ctx 兜底，got %q", got)
+	}
+
+	explicit := &recordingProvider{}
+	if _, err := (&ProviderCompressor{Provider: explicit, MaxTokens: 512}).Compress(ctx,
+		[]message.Message{message.NewUser("早")}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := explicit.req.Options.MaxTokens; got != 512 {
+		t.Fatalf("显式 MaxTokens 必须生效，got %d", got)
+	}
+}
+
+// recordingProvider 记下一次请求并回一条定稿摘要（单 goroutine 用，无锁）。
+type recordingProvider struct {
+	req provider.Request
+}
+
+func (p *recordingProvider) Stream(_ context.Context, req provider.Request) (<-chan provider.StreamEvent, error) {
+	p.req = req
+	ch := make(chan provider.StreamEvent, 2)
+	ch <- provider.PartDelta{Text: "摘要"}
+	ch <- provider.MessageComplete{Message: message.NewAssistant("摘要")}
+	close(ch)
+	return ch, nil
+}
+
 // ---------- 测试替身 ----------
 
 type recordingCompressor struct {
