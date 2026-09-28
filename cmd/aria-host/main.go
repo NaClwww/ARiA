@@ -2,18 +2,18 @@
 // Scope 制造者」的第一块真实插头）：
 //
 //	音箱 mic → backend :8800 /asr/events SSE（type=final，服务端已做端点
-//	检测）→ Session.Input → 应答增量打 stdout、工具轨迹打 stderr
-//	终端 stdin（开发插头，与 ASR 并存：谁先来谁先进）
+//	检测）→ Session.Input → LLM → 事件流 → TTS 流式合成（/tts/stream_input）
+//	→ 本机 paplay 播放；终端 stdin 为并存开发插头
 //
-// 尚未接入：TTS 驱动（事件流订阅 → 句子缓冲 → backend /tts/ws → 设备/本机
-// 播放）、设备控制工具（:8900 /api/control/*，决策型 Tool）、抢话策略。
-// 接入缝都在本壳内，引擎不动。
+// 尚未接入：设备端播放（launcher /api/voice/play* 建成后从 paplay 切换）、
+// 设备控制工具（:8900 /api/control/*，决策型 Tool）、完整抢话策略（当前仅
+// 新一轮开始时掐掉上一条没放完的音频尾巴）。接入缝都在本壳内，引擎不动。
 //
 // 用法：
 //
-//	aria-host --fake --no-asr          # 纯 stdin 冒烟（无网络、不花钱）
-//	aria-host --fake                   # stdin + ASR 插头（验证 SSE 链路）
-//	aria-host                          # 按 aria.toml 连真实模型
+//	aria-host --fake --no-asr --no-tts   # 纯 stdin 冒烟（无网络、不花钱）
+//	aria-host --fake                     # stdin + ASR + TTS（echo 冒烟）
+//	aria-host                            # 按 aria.toml 连真实模型
 //
 // 交互：[名字] 开头切换说话人；/quit 优雅退出；Ctrl+C 打断当前回答，
 // 连按两次强制退出。stdin EOF 在 ASR 模式下不退出（常驻语音形态）。
@@ -31,6 +31,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"time"
@@ -58,6 +59,7 @@ func main() {
 		backend      = flag.String("backend", defaultBackend, "ASR/TTS 后端地址（Gowild-HE-Backend :8800）")
 		noASR        = flag.Bool("no-asr", false, "停用 ASR 插头（纯终端开发）")
 		noStdin      = flag.Bool("no-stdin", false, "停用 stdin 插头（纯语音）")
+		noTTS        = flag.Bool("no-tts", false, "停用 TTS 播放（只看文字）")
 		apiKey       = flag.String("api-key", "", "API key；空则按配置的 api_key_env 读环境变量")
 	)
 	flag.Parse()
@@ -145,6 +147,21 @@ func main() {
 		printEvents(ch, os.Stdout, os.Stderr)
 	}()
 
+	// TTS 驱动：事件流的第二个消费者（一切服务都是事件订阅者）。
+	var ttsDone <-chan struct{}
+	var ttsUnsub func()
+	if !*noTTS {
+		ttsCh, u := sess.Subscribe(0)
+		ttsUnsub = u
+		d := newTTSDriver(*backend, log)
+		done := make(chan struct{})
+		ttsDone = done
+		go func() {
+			defer close(done)
+			d.run(ttsCh)
+		}()
+	}
+
 	// Ctrl+C：第一次打断当前回答（steering），第二次强制退出（与 aria-demo 一致）。
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt)
@@ -184,10 +201,16 @@ func main() {
 
 	<-quit
 	unsub()
+	if ttsUnsub != nil {
+		ttsUnsub()
+	}
 	if err := sess.Close(); err != nil {
 		log.Error("session close", "err", err)
 	}
 	<-printerDone
+	if ttsDone != nil {
+		<-ttsDone
+	}
 	if jsonlStore != nil {
 		_ = jsonlStore.Close()
 	}
@@ -349,6 +372,169 @@ func (p *asrPlug) consume(ctx context.Context) (connected bool, err error) {
 		return true, serr
 	}
 	return true, errors.New("sse stream closed by server")
+}
+
+// ---------- TTS 驱动：事件流 → /tts/stream_input → paplay ----------
+
+// wavHeaderLen 是 backend 流式响应开头的 WAV 头长度（PCM16 单声道，RIFF
+// 占位长度）；剥掉后喂 paplay --raw。
+const wavHeaderLen = 44
+
+// ttsDriver 是事件流的第二个消费者（06：一切服务都是事件订阅者）：assistant
+// 的文本增量直接透传给 backend 的流式 TTS——其 StreamingSession.feed 内部
+// 自带切句，Go 侧不缓冲，首响延迟最低。每条 assistant 消息一次 HTTP 分块
+// 请求；新一轮开始或新消息开始时掐掉上一条没放完的音频尾巴（粗粒度抢话
+// 的第一步，同时缓解「音箱听到自己的 TTS」的自回声）。
+//
+// 尚未做：人设标签（[happy] 之类）剥离——人设还没训标签约定，训好后在
+// feed 前剥除并映射到 launcher 表情。
+type ttsDriver struct {
+	base    string
+	log     *slog.Logger
+	hc      *http.Client
+	current *ttsPlayback
+}
+
+func newTTSDriver(base string, log *slog.Logger) *ttsDriver {
+	return &ttsDriver{
+		base: strings.TrimSuffix(base, "/"),
+		log:  log,
+		hc: &http.Client{Transport: &http.Transport{
+			DialContext: (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
+		}},
+	}
+}
+
+// run 是单消费者事件循环：全部状态 confinement 在本 goroutine，无锁。
+func (d *ttsDriver) run(ch <-chan loop.Event) {
+	for ev := range ch {
+		switch data := ev.Data.(type) {
+		case loop.MessageStartData:
+			if data.Role == message.RoleAssistant {
+				d.stop() // 新消息开新会话：掐上一条尾巴
+			}
+		case loop.MessageUpdateData:
+			if data.TextDelta == "" {
+				continue // ThoughtDelta 不上嘴：只念正文
+			}
+			if d.current == nil {
+				d.start()
+			}
+			if d.current != nil {
+				d.current.feed(data.TextDelta)
+			}
+		case loop.MessageEndData:
+			if data.Message.Role == message.RoleAssistant {
+				d.finishInput() // 输入收口，音频自然排空
+			}
+		case loop.AgentStartData:
+			d.stop() // 新一轮开始：上一轮没放完的不放
+		}
+	}
+	d.stop()
+}
+
+func (d *ttsDriver) start() {
+	d.stop()
+	if _, err := exec.LookPath("paplay"); err != nil {
+		d.log.Error("tts: 找不到 paplay，本轮起静音（--no-tts 可关掉本告警）", "err", err)
+		return
+	}
+	p, err := startPlayback(d.base, d.hc, d.log)
+	if err != nil {
+		d.log.Error("tts: 启动失败（本条静音，文字照常）", "err", err)
+		return
+	}
+	d.current = p
+}
+
+func (d *ttsDriver) finishInput() {
+	if d.current != nil {
+		d.current.finishInput()
+	}
+}
+
+func (d *ttsDriver) stop() {
+	if d.current != nil {
+		d.current.stop()
+		d.current = nil
+	}
+}
+
+// ttsPlayback 是一条 assistant 消息的 TTS 会话：文本增量写入请求体管道，
+// 音频从响应体剥掉 WAV 头后喂 paplay。
+type ttsPlayback struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	pw     *io.PipeWriter // 请求体：文本增量
+	fin    bool           // 输入已收口/会话已死：后续增量丢弃
+}
+
+func startPlayback(base string, hc *http.Client, log *slog.Logger) (*ttsPlayback, error) {
+	pr, pw := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/tts/stream_input", pr)
+	if err != nil {
+		cancel()
+		pw.Close()
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
+
+	// PCM16 单声道 16k（backend tts_rvc 的输出规格）。
+	cmd := exec.CommandContext(ctx, "paplay", "--raw",
+		"--format=s16le", "--rate=16000", "--channels=1")
+	audioPr, audioPw := io.Pipe()
+	cmd.Stdin = audioPr
+	if err := cmd.Start(); err != nil {
+		cancel()
+		pw.Close()
+		audioPw.Close()
+		return nil, err
+	}
+
+	go func() {
+		resp, err := hc.Do(req)
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Error("tts: 请求失败", "err", err)
+			}
+			_ = pw.CloseWithError(err) // feed 侧随即 fin
+			audioPw.Close()
+			return
+		}
+		go func() { defer resp.Body.Close() }()
+		// 响应体 = WAV 头 + PCM16 流；剥头直喂 paplay，排空即自然收尾。
+		if _, err := io.CopyN(io.Discard, resp.Body, wavHeaderLen); err == nil {
+			_, _ = io.Copy(audioPw, resp.Body)
+		}
+		audioPw.Close()
+		_ = cmd.Wait()
+	}()
+
+	return &ttsPlayback{ctx: ctx, cancel: cancel, pw: pw}, nil
+}
+
+func (p *ttsPlayback) feed(delta string) {
+	if p.fin {
+		return
+	}
+	if _, err := p.pw.Write([]byte(delta)); err != nil {
+		p.fin = true // 请求已死：本条静音，等下一条消息
+	}
+}
+
+// finishInput 结束请求体（backend finish() 把缓冲切完并放完音频）。
+// 播放对象留在 driver 手里：排空期间新一轮到来仍可 stop() 掐断。
+func (p *ttsPlayback) finishInput() {
+	p.fin = true
+	_ = p.pw.Close()
+}
+
+func (p *ttsPlayback) stop() {
+	p.fin = true
+	p.cancel() // 掐 HTTP 请求与 paplay（exec.CommandContext）
+	_ = p.pw.Close()
 }
 
 // ---------- 事件渲染（stdout = 回答增量，stderr = 工具轨迹） ----------

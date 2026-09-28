@@ -232,6 +232,19 @@ func TestRunRejectsEmptyInput(t *testing.T) {
 	}
 }
 
+// 工具名违反 OpenAI 名字规范（如带点号）在装配期拒绝——部分网关严格校验，
+// 违规请求会换回一条含糊的 400。
+func TestInvalidToolNameRejected(t *testing.T) {
+	fake := provider.NewFake()
+	for _, name := range []string{"", "artifact.open", "带中文", "with space"} {
+		if _, err := New(Config{Provider: fake, Tools: []tool.Tool{
+			tool.NewFake(name, message.ToolResult{}, 0),
+		}}); err == nil {
+			t.Fatalf("tool name %q should be rejected", name)
+		}
+	}
+}
+
 // Interrupt 中途打断：保留部分输出，队列空 → EndInterrupted。
 func TestInterruptPartial(t *testing.T) {
 	fake := provider.NewFake(provider.FakeStep{

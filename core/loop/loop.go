@@ -140,8 +140,8 @@ func New(cfg Config) (*Loop, error) {
 	l := &Loop{cfg: cfg, bus: newBus(), tools: make(map[string]tool.Tool, len(cfg.Tools))}
 	for _, t := range cfg.Tools {
 		d := t.Def()
-		if d.Name == "" {
-			return nil, errors.New("loop: tool with empty name")
+		if !validToolName(d.Name) {
+			return nil, fmt.Errorf("loop: invalid tool name %q（OpenAI 工具名规范：1-64 个 ASCII 字母/数字/_/-，部分网关严格校验）", d.Name)
 		}
 		if _, dup := l.tools[d.Name]; dup {
 			return nil, fmt.Errorf("loop: duplicate tool name %q", d.Name)
@@ -525,6 +525,23 @@ func (l *Loop) queueLen() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return len(l.queue)
+}
+
+// validToolName 校验工具名符合 OpenAI 工具名规范（1-64 个 ASCII 字母/
+// 数字/下划线/连字符）。规范是 wire 协议的一部分，部分网关严格校验、
+// 违规直接 400——在装配期响亮失败，好过发出去吃一条含糊的服务端报错。
+func validToolName(name string) bool {
+	if len(name) == 0 || len(name) > 64 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
+			c >= '0' && c <= '9' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // sealQuiet 在队列无积压时原子地封箱本轮入队口，返回 false 表示有积压。

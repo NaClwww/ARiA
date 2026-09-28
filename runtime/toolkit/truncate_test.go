@@ -76,7 +76,7 @@ func TestTruncateStoresFullTextAndPointsToRef(t *testing.T) {
 	if !strings.Contains(got, "输出过长已截断") || !strings.Contains(got, "共 1500 字符") {
 		t.Fatalf("notice: %q", got)
 	}
-	if !strings.Contains(got, `artifact.open(ref="`) || !strings.Contains(got, "offset=20") {
+	if !strings.Contains(got, `artifact_open(ref="`) || !strings.Contains(got, "offset=20") {
 		t.Fatalf("hint must include a usable call: %q", got)
 	}
 	if strings.Count(got, "数据块") > 8 {

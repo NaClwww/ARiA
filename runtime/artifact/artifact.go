@@ -94,7 +94,7 @@ func newRef() string {
 // ---------- 读取工具 ----------
 
 // OpenToolName 是读取 artifact 的工具名（截断提示里引用它）。
-const OpenToolName = "artifact.open"
+const OpenToolName = "artifact_open"
 
 // DefaultOpenLimit 是单次读取的默认字符数（rune）。
 const DefaultOpenLimit = 8000
@@ -134,11 +134,11 @@ func (t *openTool) Exec(ctx context.Context, call tool.Call) tool.Result {
 	}
 	if len(call.Args) > 0 {
 		if err := json.Unmarshal(call.Args, &args); err != nil {
-			return errResult(call, "artifact.open: 参数无法解析: "+err.Error())
+			return errResult(call, "artifact_open: 参数无法解析: "+err.Error())
 		}
 	}
 	if args.Ref == "" {
-		return errResult(call, "artifact.open: 缺少 ref")
+		return errResult(call, "artifact_open: 缺少 ref")
 	}
 	if args.Offset < 0 {
 		args.Offset = 0
@@ -153,9 +153,9 @@ func (t *openTool) Exec(ctx context.Context, call tool.Call) tool.Result {
 	buf, err := t.store.Get(ctx, Ref(args.Ref))
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
-			return errResult(call, "artifact.open: 引用不存在或已过期（ref="+args.Ref+"）")
+			return errResult(call, "artifact_open: 引用不存在或已过期（ref="+args.Ref+"）")
 		}
-		return errResult(call, "artifact.open: 读取失败: "+err.Error())
+		return errResult(call, "artifact_open: 读取失败: "+err.Error())
 	}
 
 	runes := []rune(string(buf))

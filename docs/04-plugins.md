@@ -34,7 +34,7 @@ type ToolSource interface {
 }
 ```
 
-- **builtin 源**（M2）：`web_search`、`web_fetch`、`shell`（超时+输出截断）、`fs_read/write`；**memory 源**（M4）：`memory.recall` / `history.load`——pull 路工具，属未定稿草稿（notes/context-planning-draft.md，M4 前定）。`artifact.open` 已由 runtime 提供（03 §5 工具结果截断），不再属于 memory 源。
+- **builtin 源**（M2）：`web_search`、`web_fetch`、`shell`（超时+输出截断）、`fs_read/write`；**memory 源**（M4）：`memory.recall` / `history.load`——pull 路工具，属未定稿草稿（notes/context-planning-draft.md，M4 前定）。`artifact_open` 已由 runtime 提供（03 §5 工具结果截断），不再属于 memory 源。
 - Registry：接受多个 ToolSource，工具名命名空间化防冲突，支持运行中 refresh（invalidation 后重 list）；
 - 工具实现义务：尊重 ctx 取消（长任务返回部分结果）；结果走 content blocks（可带 image 等）；错误返回 `ToolResult{IsError:true}`（是内容不是故障）；经 ToolGuard 审批后执行（core 保证）。
 - **超长结果由 runtime 统一处理**：Agent 装配时对工具套上 `toolkit.Truncate`（03 §5），全文进 artifact、只把预览+引用喂回模型——插件只需如实返回结果，不必自己截断（`shell` 之类的内部截断仍可保留，属工具自身语义）。

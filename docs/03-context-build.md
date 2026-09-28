@@ -137,7 +137,7 @@ Host(语音识别中) → Speculate(base=transcript快照, 猜测输入)
 |---|---|---|
 | `runtime/window` | 每轮组装 + 间隙压缩 | `Window.Assemble/Settle`、`Compressor`、`KeepLast`（兜底）、`ProviderCompressor`（LLM 摘要） |
 | `runtime/persist` | durable 事件 → Store 写路（只写不恢复） | `Store`（窄接口，实现注入）、`Recorder.Consume` |
-| `runtime/artifact` | 大中间产物存放与读回（artifact+ref） | `Store`（窄接口）、`Memory`（默认实现）、`OpenTool`（`artifact.open`） |
+| `runtime/artifact` | 大中间产物存放与读回（artifact+ref） | `Store`（窄接口）、`Memory`（默认实现）、`OpenTool`（`artifact_open`） |
 | `runtime/toolkit` | 工具装饰器（挂点 4/5） | `Truncate`（超长结果 → 预览+引用） |
 | `runtime/agent` | 总装：零件盒 + 长寿命 Session | `Agent.New/NewSession`、`Session.Input/Queue/Interrupt/Subscribe/History` |
 
@@ -165,14 +165,14 @@ Host(语音识别中) → Speculate(base=transcript快照, 猜测输入)
 
 实现：`runtime/window/present.go`（`Tagged` / `EscapeContent` / `MemoryMessage` / `ContextMessage`）、`Window.SetSystem`、`agent.Config.SystemPrompt`。
 
-**工具结果截断（03 §1 artifact+ref 的落地，2026-09-11）**：工具结果文本超过上限（`Config.ToolResultLimit`，默认 4000 字符）时，**全文存入 `artifact.Store`，只把「预览 + 引用」喂回模型**；模型按提示调用 `artifact.open(ref, offset, limit)` 分段读回（字符/rune 计，UTF-8 安全）。纪律：
+**工具结果截断（03 §1 artifact+ref 的落地，2026-09-11）**：工具结果文本超过上限（`Config.ToolResultLimit`，默认 4000 字符）时，**全文存入 `artifact.Store`，只把「预览 + 引用」喂回模型**；模型按提示调用 `artifact_open(ref, offset, limit)` 分段读回（字符/rune 计，UTF-8 安全）。纪律：
 
 - 截断只在文本负载上做，非文本块（图片等）原样保留；`IsError`/`CallID` 语义不变；
 - **存档失败即不截断**（宁可长，不可丢）；
 - 读取工具自身不截断（否则大块永远读不完）；`ToolResultLimit` 为负则整体关闭（不注册读取工具、不包装）；
-- 装配在 Agent（registry 全局包装，§3 挂点 5）；`artifact.open` 由 Agent 自动注册，宿主已有同名工具时跳过并告警；
+- 装配在 Agent（registry 全局包装，§3 挂点 5）；`artifact_open` 由 Agent 自动注册，宿主已有同名工具时跳过并告警；
 - 默认存放处是内存实现（`NewMemory(64)`，FIFO 淘汰）——跨重启/跨进程持久化换 Store 实现即可，契约不变；
-- `artifact.open` 的原始归属从 04 的「M4 memory 源 pull 工具」前移到位（读取是 runtime 的职责，不是记忆源的）。
+- `artifact_open` 的原始归属从 04 的「M4 memory 源 pull 工具」前移到位（读取是 runtime 的职责，不是记忆源的）。
 
 **主线实现语义（两轮审查后定稿，2026-09-11）**：
 
