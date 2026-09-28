@@ -18,7 +18,9 @@ import (
 type ASRConfig struct {
 	// Base 是 backend 根地址（订阅 <Base>/asr/events）。必填。
 	Base string
-	// Speaker 是 final 交付时的说话人名（插头不做认主，恒为此值）。必填。
+	// Speaker 是默认说话人（backend 未认主时的回落值）。必填——认主信
+	// final 的 speaker_status/speaker_id 字段：matched 且带 id 用之，
+	// 未匹配/旧版 backend 缺字段即回落本值。
 	Speaker string
 	// OnFinal 收「一句说完整的话」。必填——收不到交付的插头没有意义。
 	OnFinal func(text, speaker string)
@@ -108,10 +110,7 @@ func (a *ASR) consume(ctx context.Context) (connected bool, err error) {
 			continue
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		var ev struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		}
+		var ev asrEvent
 		if json.Unmarshal([]byte(payload), &ev) != nil {
 			continue // 解析失败的行按噪音丢弃，不断流
 		}
@@ -125,11 +124,32 @@ func (a *ASR) consume(ctx context.Context) (connected bool, err error) {
 			continue
 		}
 		if text := strings.TrimSpace(ev.Text); text != "" {
-			a.cfg.OnFinal(text, a.cfg.Speaker) // 空白判废已 trim，交付也 trim——「一句完整的话」不带边缘空白
+			a.cfg.OnFinal(text, a.speaker(ev)) // 空白判废已 trim，交付也 trim——「一句完整的话」不带边缘空白
 		}
 	}
 	if serr := sc.Err(); serr != nil {
 		return true, serr
 	}
 	return true, errors.New("sse stream closed by server")
+}
+
+// asrEvent 是 /asr/events 的载荷。final 可带 backend 认主字段
+// （speaker_id/speaker_status）；旧版缺字段为零值，自然走回落。
+type asrEvent struct {
+	Type          string `json:"type"`
+	Text          string `json:"text"`
+	SpeakerID     string `json:"speaker_id"`
+	SpeakerStatus string `json:"speaker_status"`
+}
+
+// speaker 解析「谁说的」：backend 判 matched 且带 id → 信 backend；否则
+// （未匹配 / 空 id / 旧版无字段）回落装配时的默认说话人。阈值策略在
+// backend（matched 就是它判过的），客户端不二次设阈。
+func (a *ASR) speaker(ev asrEvent) string {
+	if ev.SpeakerStatus == "matched" {
+		if id := strings.TrimSpace(ev.SpeakerID); id != "" {
+			return id
+		}
+	}
+	return a.cfg.Speaker
 }

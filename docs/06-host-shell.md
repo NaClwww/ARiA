@@ -22,7 +22,7 @@
 | 插头 | 说完判定 | 状态 |
 |---|---|---|
 | 终端手打 | 按下回车 | ✅ 已在 `cmd/aria-demo` |
-| ASR（SSE） | 对方静音 ~1s（**服务端已做好端点检测**，只收 `type=final`） | ✅ `plugins/voice/gowild`（partial 另作「mic 听到人声」信号交付宿主，驱状态灯） |
+| ASR（SSE） | 对方静音 ~1s（**服务端已做好端点检测**，只收 `type=final`；final 另带 `speaker_id`/`speaker_status` 认主——matched 用之，未匹配/旧版缺字段回落默认说话人） | ✅ `plugins/voice/gowild`（partial 另作「mic 听到人声」信号交付宿主，驱状态灯） |
 | 网页聊天框 | 点发送 | 随 `cmd/aria-web` |
 | 定时/传感器 | 到点/触发 | 将来 |
 

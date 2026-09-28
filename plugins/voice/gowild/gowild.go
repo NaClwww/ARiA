@@ -8,7 +8,8 @@
 //	         由宿主以 InputSink 窄接口实现
 //	ASR  —— backend :8800 /asr/events SSE：partial 报「mic 听到人声」
 //	        （宿主转投 Light.Heartbeat），type=final 交付「一句完整的话 +
-//	        谁说的」（成轮判定在服务端 VAD，插头只收 final）
+//	        谁说的」——成轮判定在服务端 VAD，认主信 final 的 speaker 字段
+//	        （matched+id 用之，未匹配/旧版缺字段回落默认说话人）
 //	TTS  —— 事件流 → backend /tts/stream_input 流式合成 → 设备扬声器
 //	        （launcher /api/voice/play* 三段式）或本机 paplay
 //	Light —— 机身 RGB 指示灯（launcher /api/light 三色通道）：订阅闸门

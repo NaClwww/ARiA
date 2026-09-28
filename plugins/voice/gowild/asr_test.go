@@ -84,6 +84,64 @@ func TestASRDeliversFinalsAndPartials(t *testing.T) {
 	}
 }
 
+// 认主解析：matched 用 backend 的 id；未匹配/空 id/旧版缺字段回落默认。
+func TestASRSpeakerResolution(t *testing.T) {
+	var mu sync.Mutex
+	var finals []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fl := w.(http.Flusher)
+		fmt.Fprint(w, "data: {\"type\":\"final\",\"text\":\"你好\",\"speaker_id\":\"nacl\",\"speaker_status\":\"matched\",\"speaker_score\":0.78}\n\n")
+		fl.Flush()
+		fmt.Fprint(w, "data: {\"type\":\"final\",\"text\":\"那算了\",\"speaker_id\":\"someone\",\"speaker_status\":\"unmatched\"}\n\n")
+		fl.Flush()
+		fmt.Fprint(w, "data: {\"type\":\"final\",\"text\":\" matched 空 id 也回落 \",\"speaker_id\":\" \",\"speaker_status\":\"matched\"}\n\n")
+		fl.Flush()
+		fmt.Fprint(w, "data: {\"type\":\"final\",\"text\":\"旧版没有认主字段\"}\n\n")
+		fl.Flush()
+	}))
+	t.Cleanup(srv.Close)
+
+	asr, err := NewASR(ASRConfig{
+		Base:    srv.URL,
+		Speaker: "user",
+		OnFinal: func(text, speaker string) {
+			mu.Lock()
+			finals = append(finals, speaker+":"+text)
+			mu.Unlock()
+		},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		asr.Run(ctx)
+	}()
+	defer cancel()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := len(finals)
+		mu.Unlock()
+		if got == 4 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"nacl:你好", "user:那算了", "user:matched 空 id 也回落", "user:旧版没有认主字段"}
+	if len(finals) != 4 || finals[0] != want[0] || finals[1] != want[1] || finals[2] != want[2] || finals[3] != want[3] {
+		t.Fatalf("认主解析不符：\n got %v\nwant %v", finals, want)
+	}
+}
+
 func TestASRConfigValidation(t *testing.T) {
 	for _, cfg := range []ASRConfig{
 		{},
