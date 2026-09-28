@@ -137,9 +137,9 @@ func TestCompressFailureKeepsMessages(t *testing.T) {
 	}
 }
 
-// KeepLast 裁剪不拆散工具调用组：切点落在 tool 结果上时，失去配对
-// assistant 工具调用的开头 tool 消息一并丢弃——孤立的 tool 消息开头的请求
-// 会被 OpenAI 兼容服务端拒收（tool 消息找不到前面的 tool_calls）。
+// KeepLast 裁剪不拆散工具调用组：切点落在 tool 结果上时，向后扩到配对的
+// assistant 整组保留——n 是预算不是硬上限，孤儿 tool 消息开头的请求会被
+// OpenAI 兼容服务端拒收（tool 消息找不到前面的 tool_calls）。
 func TestKeepLastKeepsToolGroupsIntact(t *testing.T) {
 	toolMsg := func(id string) message.Message {
 		return message.Message{Role: message.RoleTool, ToolCallID: id,
@@ -154,12 +154,13 @@ func TestKeepLastKeepsToolGroupsIntact(t *testing.T) {
 		message.NewUser("q2"),
 		message.NewAssistant("a2"),
 	}
-	// 末 3 条 = [tool(c2), q2, a2]：开头 tool(c2) 的配对调用已被裁掉，应一并丢弃。
+	// 末 3 条 = [tool(c2), q2, a2]：切点落在组内，向后扩到配对 assistant，
+	// 整组保留（5 条）。
 	got, err := KeepLast(3).Compress(context.Background(), nil, all)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !equal(texts(got), []string{"user:q2", "assistant:a2"}) {
+	if !equal(texts(got), []string{"assistant:", "tool:r-c1", "tool:r-c2", "user:q2", "assistant:a2"}) {
 		t.Fatalf("keep-last split tool group: %v", texts(got))
 	}
 }
@@ -182,10 +183,43 @@ func TestFallbackTrimKeepsToolGroupsIntact(t *testing.T) {
 	w.Settle(context.Background(), []message.Message{message.NewUser("q2"), message.NewAssistant("a2")})
 	w.Wait()
 
-	// memory+turn 共 6 条 > cap 3：末 3 条开头是孤儿 tool(c2)，裁掉后剩 [q2, a2]。
+	// memory+turn 共 6 条 > cap 3：切点落在组内，向后扩到配对 assistant，
+	// 整组保留 5 条。
 	mem, _ := w.Snapshot()
-	if !equal(texts(mem), []string{"user:q2", "assistant:a2"}) {
+	if !equal(texts(mem), []string{"assistant:", "tool:r1", "tool:r2", "user:q2", "assistant:a2"}) {
 		t.Fatalf("fallback trim split tool group: %v", texts(mem))
+	}
+}
+
+// 回归（2026-09-28 追问）：保留的整个尾部全是 tool 结果（组比 n 长）时，
+// 切点向后扩到配对 assistant，整组保留——不再留 1 条孤立 tool 消息。
+func TestKeepLastExtendsBackToPairingAssistant(t *testing.T) {
+	all := []message.Message{
+		message.NewUser("q1"),
+		{Role: message.RoleAssistant, ToolCalls: []message.ToolCall{{ID: "c1", Name: "t"}}},
+		{Role: message.RoleTool, ToolCallID: "c1", Blocks: []message.Block{message.TextBlock{Text: "r1"}}},
+	}
+	// n=1：末 1 条就是 tool——扩回 assistant，组完整保留。
+	got, err := KeepLast(1).Compress(context.Background(), nil, all)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equal(texts(got), []string{"assistant:", "tool:r1"}) {
+		t.Fatalf("want whole group [asst, tool], got %v", texts(got))
+	}
+}
+
+// 病态输入兜底：整个切片以 tool 消息开头（配对 assistant 不在切片内，
+// 正常构造不会出现）——向前丢孤儿但至少保留 1 条，绝不返回空
+// （空输出按压缩失败处理，兜底裁剪路径更会整段清空记忆）。
+func TestTrimKeepLastPathologicalAllTools(t *testing.T) {
+	in := []message.Message{
+		{Role: message.RoleTool, ToolCallID: "x", Blocks: []message.Block{message.TextBlock{Text: "rx"}}},
+		{Role: message.RoleTool, ToolCallID: "y", Blocks: []message.Block{message.TextBlock{Text: "ry"}}},
+	}
+	got := trimKeepLast(in, 1)
+	if len(got) != 1 || got[0].Role != message.RoleTool {
+		t.Fatalf("病态输入应恰好保留 1 条 tool 消息，got %v", texts(got))
 	}
 }
 

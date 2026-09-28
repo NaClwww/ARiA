@@ -243,9 +243,10 @@ func (w *Window) Close() {
 
 // ---------- 兜底压缩器 ----------
 
-// KeepLast 是不调 LLM 的压缩：只保留最近 n 条消息，更早的丢弃（静默）。
-// 它保证窗口有界，是测试与无 Provider 场景的确定性默认；需要「记住更早内容」
-// 的宿主应显式接 ProviderCompressor 之类的摘要实现。
+// KeepLast 是不调 LLM 的压缩：只保留最近 n 条消息（工具调用组不拆散时
+// 可能略多），更早的丢弃（静默）。它保证窗口有界，是测试与无 Provider
+// 场景的确定性默认；需要「记住更早内容」的宿主应显式接 ProviderCompressor
+// 之类的摘要实现。
 type KeepLast int
 
 func (k KeepLast) Compress(_ context.Context, memory, turn []message.Message) ([]message.Message, error) {
@@ -253,19 +254,28 @@ func (k KeepLast) Compress(_ context.Context, memory, turn []message.Message) ([
 	return trimKeepLast(all, int(k)), nil
 }
 
-// trimKeepLast 取 all 的末尾 n 条，且起点不落在工具调用组中间：切点若落在
-// tool 结果上，其配对的 assistant 工具调用已被裁掉——孤立的 tool 消息开头
-// 的历史会被 OpenAI 兼容服务端拒收（tool 消息找不到前面的 tool_calls），
-// 这些孤儿一并丢弃。至少保留 1 条（不返回空：空输出按压缩失败处理）。
+// trimKeepLast 取 all 的末尾约 n 条，且不拆散工具调用组：切点若落在
+// tool 结果上，向后扩到配对的 assistant（整组保留）。n 是预算不是硬上限，
+// 超出一组无伤有界性，而拆散的组（孤儿 tool 消息）会被 OpenAI 兼容服务端
+// 拒收整批请求。病态输入（整个切片以 tool 消息开头、无配对可回退）才向前
+// 丢弃孤儿，且至少保留 1 条——空输出按压缩失败处理，兜底路径更会整段清空
+// 记忆。
 func trimKeepLast(all []message.Message, n int) []message.Message {
 	if n <= 0 || len(all) <= n {
 		return all
 	}
-	out := all[len(all)-n:]
-	for len(out) > 1 && out[0].Role == message.RoleTool {
-		out = out[1:]
+	start := len(all) - n
+	for start > 0 && all[start].Role == message.RoleTool {
+		start--
 	}
-	return out
+	if start == 0 && all[0].Role == message.RoleTool {
+		out := all[len(all)-n:]
+		for len(out) > 1 && out[0].Role == message.RoleTool {
+			out = out[1:]
+		}
+		return out
+	}
+	return all[start:]
 }
 
 func cloneAll(in []message.Message) []message.Message {
