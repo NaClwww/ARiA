@@ -83,6 +83,7 @@
 | `internal/assemble` | 宿主侧「名字 → 零件」装配表（压缩策略等）：引擎只认接口，不认识配置里的名字 |
 | `internal/aria-host` | aria-host 的定制组件集：`Engine`（配置→provider→agent→会话组装/收尾）、`Sink`（多插头投递纪律，本表 §2）、`StdinPlug`/`SplitSpeaker`、`ConsumeTerminal` 终端渲染、`ResolvePersona`、echo provider——main 只做接线 |
 | `runtime/app` | 宿主外设挂载与生命周期容器：`Mount`（事件流消费者：订阅+goroutine，收尾=退订+排干）、`Service`（后台服务：独立 ctx，收尾=取消+等待）、`OnShutdown`（链底钩子）。顺序纪律：挂载即订阅（消费者先挂、输入插头最后——事件不重放），收尾严格逆序 LIFO（输入先停→消费者排干→资产回收→会话/引擎关闭）；只依赖 core/loop，main 退化成一份挂载清单 |
+| `plugins/vision/gowild` | 视觉注入（discussions 2026-09-11 §1 拍板 B 形态，2026-09-28 落地）：`Vision` 实现 core 槽 1 的额外变换——每次 LLM 调用现拉 `GET /api/camera/frame`（2s 硬顶）追加在组装结果最底部（user 消息：说明 + `ImageBlock(Data)`）；不进窗口历史、不落盘、失败安静跳过。每请求恰好一张「此刻」帧，旧帧永不重发 |
 | `cmd/aria-demo` | 终端薄壳：**吃配置文件**（flag 只作进程内覆盖 = local 层）、stdin 行 = 成轮话语、`[名字]` 前缀切换说话人、流式打印、Ctrl+C 打断、`--record` JSONL、`/reload` 重读文件、`--print-config` 打印生效配置 |
 | `cmd/aria-web` | 浏览器薄壳（待做） |
 | `plugins/persist/jsonl` | durable 事件的 JSONL 落盘（格式 v1 带版本号，写路完整、读路随恢复需求） |

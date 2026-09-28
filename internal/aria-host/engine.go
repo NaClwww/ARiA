@@ -17,12 +17,14 @@ import (
 	"os"
 	"time"
 
+	"aria/core/loop"
 	"aria/core/provider"
 	"aria/internal/assemble"
 	"aria/internal/config"
 	"aria/pkg/ctxx"
 	"aria/plugins/persist/jsonl"
 	openai "aria/plugins/provider/openai"
+	gowildvision "aria/plugins/vision/gowild"
 	"aria/runtime/agent"
 	"aria/runtime/persist"
 )
@@ -32,8 +34,11 @@ type Options struct {
 	ConfigPath   string // 配置文件路径（人写基准）
 	OverridePath string // 覆盖文件路径（机器写）
 	Fake         bool   // 使用内置 echo provider（无网络冒烟）
-	APIKey       string // API key；空则按配置 api_key_env 读环境变量
-	Logger       *slog.Logger
+	APIKey       string // API key；空则按配置的 api_key_env 读环境变量
+	// VisionBase 是 launcher 根地址；非空 = 启用视觉注入（摄像头当前帧
+	// 每轮进组装链底部，plugins/vision/gowild）。空 = 无视觉。
+	VisionBase string
+	Logger     *slog.Logger
 }
 
 // Engine 是组装完成的宿主引擎面：配置快照 + 就绪会话。
@@ -86,6 +91,17 @@ func NewEngine(opts Options) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("压缩策略装配失败: %w", err)
 	}
+	// 视觉注入（可空）：槽 1 的额外变换位，作用在窗口组装结果之上——
+	// 摄像头当前帧追加在组装结果最底部，不进历史不落盘。
+	var vision loop.Assembler
+	if opts.VisionBase != "" {
+		v, verr := gowildvision.New(gowildvision.Config{Base: opts.VisionBase}, log)
+		if verr != nil {
+			return nil, fmt.Errorf("视觉装配失败: %w", verr)
+		}
+		vision = v
+		log.Info("vision: 摄像头当前帧注入组装链（每轮现拉，底部追加）", "device", opts.VisionBase)
+	}
 	systemPrompt, err := ResolvePersona(cfg.Persona)
 	if err != nil {
 		return nil, fmt.Errorf("人设加载失败: %w", err)
@@ -105,6 +121,7 @@ func NewEngine(opts Options) (*Engine, error) {
 	ag, err := agent.New(agent.Config{
 		Provider:     prov,
 		Compressor:   compressor,
+		Assembler:    vision,
 		Store:        store,
 		SystemPrompt: systemPrompt,
 		MaxTurns:     cfg.Limits.MaxTurns,

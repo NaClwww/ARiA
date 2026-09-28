@@ -2,7 +2,8 @@
 // Scope 制造者」）：main 只是一份挂载清单（runtime/app 收编订阅/goroutine/
 // 退订/等待/退出钩子），组件在 internal/aria-host（引擎组装/投递纪律/终端
 // 插头/渲染/人设），语音栈在 plugins/voice/gowild（闸门/输入纪律/ASR/TTS/
-// 状态灯/闭耳）：
+// 状态灯/闭耳），视觉在 plugins/vision/gowild（摄像头当前帧每轮进组装链
+// 底部，--device 模式）：
 //
 //	mic → gowild.ASR ──final──→ gowild.Input ──→ ARiA 会话（ariahost.Engine）
 //	  │partial                     │轮次份额        │事件流
@@ -59,15 +60,20 @@ func main() {
 		apiKey       = flag.String("api-key", "", "API key；空则按配置的 api_key_env 读环境变量")
 		noLight      = flag.Bool("no-light", false, "停用状态灯（会话状态 → 设备 RGB 指示灯，仅 --device 模式）")
 		lightColors  = flag.String("light-colors", "202020,00a000,2050ff", "状态灯颜色 idle,listening,thinking（hex，# 可选；暗白/绿/蓝）")
-		noMicMute    = flag.Bool("no-mic-mute", false, "不在回合中闭耳（默认开：agent 生成/放音期间 backend 源头丢 mic 流，防自回声+省解码）")
+		noMicMute    = flag.Bool("no-mic-mute", false, "停用回合内闭耳（默认开：agent 生成/放音期间 backend 源头丢 mic 流，防自回声+省解码）")
+		noVision     = flag.Bool("no-vision", false, "停用视觉注入（默认开：摄像头当前帧每轮进上下文底部，仅 --device 模式）")
 	)
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
+	visionBase := *device
+	if *noVision {
+		visionBase = ""
+	}
 	eng, err := ariahost.NewEngine(ariahost.Options{
 		ConfigPath: *configPath, OverridePath: *overridePath,
-		Fake: *fake, APIKey: *apiKey, Logger: log,
+		Fake: *fake, APIKey: *apiKey, VisionBase: visionBase, Logger: log,
 	})
 	if err != nil {
 		log.Error("engine 装配失败", "err", err)
