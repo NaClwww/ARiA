@@ -685,6 +685,10 @@ type ttsDriver struct {
 func newTTSDriver(backend, device string, gate *speakingGate, log *slog.Logger) *ttsDriver {
 	hc := &http.Client{Transport: &http.Transport{
 		DialContext: (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
+		// 播放闸门份额从请求发出即持有（见 startPlayback），一个挂死的
+		// TTS 请求会把闸门占死、堵住输入。响应头由 backend 生成器首个
+		// yield（WAV 头）即刻送出，只约束到头的时间不影响流式体。
+		ResponseHeaderTimeout: 15 * time.Second,
 	}}
 	d := &ttsDriver{base: strings.TrimSuffix(backend, "/"), log: log, hc: hc, gate: gate}
 	if device != "" {
@@ -765,7 +769,10 @@ type ttsPlayback struct {
 	pw     *io.PipeWriter // 请求体：文本增量
 	mu     sync.Mutex
 	sink   audioSink // 头解析后创建；stop 可能先到
-	fin    bool      // 输入已收口/会话已死：后续增量丢弃
+	fin    bool      // 输入已收口（或请求已死）：后续增量丢弃
+	killed bool      // stop() 已到：整条掐断。与 fin 分开——收口是正常生命
+	// 周期（音频还要继续放完），死亡才要掐；共用一个标志会让「先收口、
+	// 后建好 sink」（合成排队慢时必现）被误判成掐断，整条静音。
 }
 
 func startPlayback(base string, hc *http.Client, log *slog.Logger,
@@ -783,6 +790,12 @@ func startPlayback(base string, hc *http.Client, log *slog.Logger,
 
 	p := &ttsPlayback{cancel: cancel, pw: pw}
 	go func() {
+		// 播放份额从「TTS 请求发出」就持有（而非首个音频到达后）：
+		// 正文生成完到音频开始之间可能隔着整个合成排队（RVC 忙时以十秒
+		// 计），这段空窗里轮次份额已还、闸门清空——灯提前掉回待机、
+		// 半双工放行，等音频来了再跳回去。份额现在覆盖 请求→排空 全程。
+		gate.acquire()
+		defer gate.release()
 		resp, err := hc.Do(req)
 		if err != nil {
 			if ctx.Err() == nil {
@@ -812,10 +825,8 @@ func startPlayback(base string, hc *http.Client, log *slog.Logger,
 			sink.stop()
 			return
 		}
-		gate.acquire() // 播放持有闸门份额：到声音真正放完才放行输入
-		defer gate.release()
 		p.mu.Lock()
-		if p.fin { // stop() 已先到：刚建好的 sink 直接掐
+		if p.killed { // stop() 已先到：刚建好的 sink 直接掐（收口不算）
 			p.mu.Unlock()
 			sink.stop()
 			return
@@ -861,6 +872,7 @@ func (p *ttsPlayback) finishInput() {
 func (p *ttsPlayback) stop() {
 	p.mu.Lock()
 	p.fin = true
+	p.killed = true
 	s := p.sink
 	p.mu.Unlock()
 	p.cancel() // 掐 HTTP 请求
@@ -1034,10 +1046,12 @@ func (d *deviceSink) end() error {
 }
 
 // waitDrain 轮询设备直到会话排空关闭（open:false）——设备侧 EOF 后还要
-// 把已入队音频放完才收口，这里等的就是那段尾巴。查询失败/超时/会话已死
-// 一律放行：闸门宁可早开也不能卡死输入。
+// 把已入队音频放完才收口，这里等的就是那段尾巴。闸门（灯）跟着这个函数
+// 走：提前放行=灯提前灭+输入提前开。查询失败容忍连续 3 次（偶发抖动不该
+// 提前收口），超时/会话已死仍一律放行：闸门宁可早开也不能卡死输入。
 func (d *deviceSink) waitDrain() {
 	deadline := time.Now().Add(20 * time.Second)
+	fails := 0
 	for time.Now().Before(deadline) {
 		d.mu.Lock()
 		dead := d.dead
@@ -1047,13 +1061,18 @@ func (d *deviceSink) waitDrain() {
 		}
 		body, err := d.cl.call(d.ctx, http.MethodGet, "/api/voice/play", nil, "")
 		if err != nil {
-			return
-		}
-		var st struct {
-			Open bool `json:"open"`
-		}
-		if json.Unmarshal(body, &st) != nil || !st.Open {
-			return
+			fails++
+			if fails >= 3 {
+				return // 连续失败：设备/隧道真不可用，别死等
+			}
+		} else {
+			fails = 0
+			var st struct {
+				Open bool `json:"open"`
+			}
+			if json.Unmarshal(body, &st) != nil || !st.Open {
+				return
+			}
 		}
 		select {
 		case <-d.ctx.Done():
