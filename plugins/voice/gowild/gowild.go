@@ -13,10 +13,12 @@
 //	        （launcher /api/voice/play* 三段式）或本机 paplay
 //	Light —— 机身 RGB 指示灯（launcher /api/light 三色通道）：订阅闸门
 //	        迁移与 partial 心跳，事件驱动求值 待机/收听/思考
+//	MicMute — backend /asr/mute 闭耳（FollowGate 订阅闸门迁移）：回合中
+//	        在源头丢 mic 流——自回声 final 不产生，兼省流式解码
 //
 // 装配纪律（docs/03 §1）：宿主在 Setup 处把零件接到一起（OnFinal →
-// Input.Deliver、OnPartial → Light.Heartbeat、事件流 → TTS.Run），插件之间
-// 互不调用；引擎（core/runtime）不认识本包。
+// Input.Deliver、OnPartial → Light.Heartbeat、事件流 → TTS.Run、Gate 迁移 →
+// MicMute），插件之间互不调用；引擎（core/runtime）不认识本包。
 package gowild
 
 // Gate 是「正在说话」闸门的份额能力：TTS 从请求发出到设备放完按份额

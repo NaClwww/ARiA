@@ -7,6 +7,7 @@
 //	  │partial                     │轮次份额        │事件流
 //	  ↓                            ↓               ├──→ 终端渲染（ariahost）
 //	gowild.Light ←──迁移订阅── gowild.Gate ←─生成/播放份额
+//	gowild.MicMute ←─迁移订阅──┘（闭耳：回合中 backend 源头丢 mic 流，防自回声）
 //	                                 ↑               └──→ gowild.TTS → 设备扬声器/paplay
 //
 // 尚未接入：口型同步、真·抢话（现在是半双工闸门：说话/生成期间不收新
@@ -30,6 +31,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"time"
 
 	ariahost "aria/internal/aria-host"
 	gowild "aria/plugins/voice/gowild"
@@ -51,6 +53,7 @@ func main() {
 		apiKey       = flag.String("api-key", "", "API key；空则按配置的 api_key_env 读环境变量")
 		noLight      = flag.Bool("no-light", false, "停用状态灯（会话状态 → 设备 RGB 指示灯，仅 --device 模式）")
 		lightColors  = flag.String("light-colors", "202020,00a000,2050ff", "状态灯颜色 idle,listening,thinking（hex，# 可选；暗白/绿/蓝）")
+		noMicMute    = flag.Bool("no-mic-mute", false, "不在回合中闭耳（默认开：agent 生成/放音期间 backend 源头丢 mic 流，防自回声+省解码）")
 	)
 	flag.Parse()
 
@@ -78,6 +81,15 @@ func main() {
 	// 半双工闸门（引用计数 + 迁移订阅）：输入纪律、TTS、状态灯共用的
 	// 信号源——「她正忙着说」这条总线在插件里，宿主只接线。
 	gate := gowild.NewGate()
+
+	// 闭耳（订阅闸门迁移，同一条总线的第二个消费者）：回合中让 backend
+	// 在源头丢 mic 流——自回声 final 不产生、省流式解码。仅语音形态有意义。
+	var micMute *gowild.MicMute
+	var cancelMicMute func()
+	if !*noASR && !*noMicMute {
+		micMute = gowild.NewMicMute(*backend, log)
+		cancelMicMute = gowild.FollowGate(gate, micMute, 300*time.Millisecond)
+	}
 
 	// TTS：事件流的第二个消费者（一切服务都是事件订阅者）。
 	var ttsDone <-chan struct{}
@@ -177,6 +189,12 @@ func main() {
 	<-quit
 	if light != nil {
 		light.SettleIdle() // 灯是音箱的资产：退出前收回待机，别留在一半的状态上
+	}
+	if cancelMicMute != nil {
+		cancelMicMute()
+	}
+	if micMute != nil {
+		micMute.Set(false) // 耳朵是音箱的资产：退出前确保开耳，别把 backend 留在闭耳态
 	}
 	unsub()
 	if ttsUnsub != nil {
