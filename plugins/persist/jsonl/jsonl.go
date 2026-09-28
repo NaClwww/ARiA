@@ -133,16 +133,24 @@ type wireRunResult struct {
 func marshalData(ev loop.Event) (json.RawMessage, error) {
 	switch d := ev.Data.(type) {
 	case loop.AgentStartData:
+		inputs, err := messagesOf(d.InitialInput)
+		if err != nil {
+			return nil, err
+		}
 		return marshal(struct {
 			Scope        wireScope     `json:"scope"`
 			InitialInput []wireMessage `json:"initial_input,omitempty"`
-		}{wireScopeOf(d.Scope), messagesOf(d.InitialInput)})
+		}{wireScopeOf(d.Scope), inputs})
 	case *loop.AgentStartData:
 		return marshalData(loop.Event{Kind: ev.Kind, Data: *d})
 	case loop.UserMessageInjectedData:
+		w, err := messageOf(d.Message)
+		if err != nil {
+			return nil, err
+		}
 		return marshal(struct {
 			Message wireMessage `json:"message"`
-		}{messageOf(d.Message)})
+		}{w})
 	case loop.TurnStartData:
 		return marshal(struct {
 			Turn          int    `json:"turn"`
@@ -159,10 +167,14 @@ func marshalData(ev loop.Event) (json.RawMessage, error) {
 			MessageID string `json:"message_id,omitempty"`
 		}{string(d.Role), d.MessageID})
 	case loop.MessageEndData:
+		w, err := messageOf(d.Message)
+		if err != nil {
+			return nil, err
+		}
 		return marshal(struct {
 			Message wireMessage `json:"message"`
 			Usage   wireUsage   `json:"usage"`
-		}{messageOf(d.Message), usageOf(d.Usage)})
+		}{w, usageOf(d.Usage)})
 	case *loop.MessageEndData:
 		return marshalData(loop.Event{Kind: ev.Kind, Data: *d})
 	case loop.ToolGuardDecisionData:
@@ -182,11 +194,15 @@ func marshalData(ev loop.Event) (json.RawMessage, error) {
 			Call message.ToolCall `json:"call"`
 		}{d.Call})
 	case loop.ToolExecEndData:
+		tr, err := toolResultOf(d.Result)
+		if err != nil {
+			return nil, err
+		}
 		return marshal(struct {
 			Call   message.ToolCall `json:"call"`
-			Result wireToolResult   `json:"result"`
-			Denied bool             `json:"denied,omitempty"`
-		}{d.Call, toolResultOf(d.Result), d.Denied})
+			Result wireToolResult  `json:"result"`
+			Denied bool            `json:"denied,omitempty"`
+		}{d.Call, tr, d.Denied})
 	case *loop.ToolExecEndData:
 		return marshalData(loop.Event{Kind: ev.Kind, Data: *d})
 	case loop.AgentEndData:
@@ -222,43 +238,54 @@ func usageOf(u message.Usage) wireUsage {
 	return wireUsage{In: u.In, Out: u.Out, Cached: u.Cached, Cost: u.Cost}
 }
 
-func messageOf(m message.Message) wireMessage {
+func messageOf(m message.Message) (wireMessage, error) {
 	w := wireMessage{
 		ID: m.ID, Role: string(m.Role),
 		ToolCalls: m.ToolCalls, ToolCallID: m.ToolCallID,
 		IsError: m.IsError, Interrupted: m.Interrupted,
 	}
 	for _, b := range m.Blocks {
-		if raw, err := marshalBlock(b); err == nil {
-			w.Blocks = append(w.Blocks, raw)
+		raw, err := marshalBlock(b)
+		if err != nil {
+			return wireMessage{}, err
 		}
+		w.Blocks = append(w.Blocks, raw)
 	}
-	return w
+	return w, nil
 }
 
-func messagesOf(ms []message.Message) []wireMessage {
+func messagesOf(ms []message.Message) ([]wireMessage, error) {
 	if len(ms) == 0 {
-		return nil
+		return nil, nil
 	}
 	out := make([]wireMessage, len(ms))
 	for i, m := range ms {
-		out[i] = messageOf(m)
+		w, err := messageOf(m)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = w
 	}
-	return out
+	return out, nil
 }
 
-func toolResultOf(r message.ToolResult) wireToolResult {
+func toolResultOf(r message.ToolResult) (wireToolResult, error) {
 	w := wireToolResult{CallID: r.CallID, IsError: r.IsError}
 	for _, b := range r.Blocks {
-		if raw, err := marshalBlock(b); err == nil {
-			w.Blocks = append(w.Blocks, raw)
+		raw, err := marshalBlock(b)
+		if err != nil {
+			return wireToolResult{}, err
 		}
+		w.Blocks = append(w.Blocks, raw)
 	}
-	return w
+	return w, nil
 }
 
 // marshalBlock 把内建 Block 定形为带 type 标签的对象（值/指针形态都收，
 // 与 message.CloneBlock 契约一致；nil 指针产出空对象占位，不丢位次）。
+// 不支持的块返回错误并沿 Append 上抛：持久化链响亮中断——将来给
+// pkg/message 新增 Block 类型而忘了配 wire 格式时立刻暴露，绝不静默把块
+// 从 durable 历史里丢掉（durable 的价值就在载荷完整）。
 func marshalBlock(b message.Block) (json.RawMessage, error) {
 	switch b := b.(type) {
 	case message.TextBlock:

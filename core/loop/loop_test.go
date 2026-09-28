@@ -220,6 +220,18 @@ func TestInvalidTranscriptFailsLoud(t *testing.T) {
 	}
 }
 
+// 空输入直接拒绝：一次 Run 至少从一条消息起步——发空 messages 给 provider
+// 只会得到一条含糊的 400，不如在前置检查就响亮失败（与 ErrNoScope 同类）。
+func TestRunRejectsEmptyInput(t *testing.T) {
+	l, _ := New(Config{Provider: provider.NewFake()})
+	if _, err := l.Run(testCtx(), nil); err == nil {
+		t.Fatal("empty input should be rejected")
+	}
+	if _, err := l.Run(testCtx(), []message.Message{}); err == nil {
+		t.Fatal("empty (non-nil) input should be rejected")
+	}
+}
+
 // Interrupt 中途打断：保留部分输出，队列空 → EndInterrupted。
 func TestInterruptPartial(t *testing.T) {
 	fake := provider.NewFake(provider.FakeStep{

@@ -166,6 +166,9 @@ func (l *Loop) Run(parent context.Context, input []message.Message) (RunResult, 
 	if _, ok := ctxx.ScopeFrom(parent); !ok {
 		return RunResult{}, ErrNoScope
 	}
+	if len(input) == 0 {
+		return RunResult{}, errors.New("loop: empty input (a run starts from at least one message)")
+	}
 	l.mu.Lock()
 	if l.running {
 		l.mu.Unlock()
