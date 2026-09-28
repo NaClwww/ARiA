@@ -3,6 +3,8 @@ package message
 
 import (
 	"encoding/json"
+	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -146,6 +148,49 @@ func ToolResultFromMessage(m Message) (ToolResult, bool) {
 		return ToolResult{}, false
 	}
 	return ToolResult{CallID: m.ToolCallID, Blocks: cloneBlocks(m.Blocks), IsError: m.IsError}, true
+}
+
+// ValidateToolPairing 校验消息序列的工具调用配对完整性——chat 协议的硬
+// 要求（OpenAI 兼容服务端会拒收违规请求，且报错比这里模糊得多）：
+//
+//   - tool 消息必须应答最近一条 assistant 的某个未应答调用（孤立 tool
+//     结果 = 配对调用不在序列里）；
+//   - assistant 的每个 tool_call 都必须在序列推进到下一条非 tool 消息前
+//     得到应答（无应答的调用同样非法）。
+//
+// 供发送边界调用（core 每轮组装后、provider 请求前）：坏数据在此响亮
+// 失败并带位置与 ID，替代各层（裁剪/适配器）对形状的悄悄缝补。
+func ValidateToolPairing(msgs []Message) error {
+	var pending []string // 当前 assistant 组未应答的调用 ID（按发起顺序）
+	unanswered := func(at int, role Role) error {
+		if len(pending) > 0 {
+			return fmt.Errorf("message[%d]（%s）：tool_call %q 未获应答", at, role, pending[0])
+		}
+		return nil
+	}
+	for i, m := range msgs {
+		switch m.Role {
+		case RoleTool:
+			if !slices.Contains(pending, m.ToolCallID) {
+				return fmt.Errorf("message[%d]（tool）：孤立工具结果，无配对的 tool_call %q", i, m.ToolCallID)
+			}
+			pending = slices.DeleteFunc(pending, func(id string) bool { return id == m.ToolCallID })
+		case RoleAssistant:
+			if err := unanswered(i, m.Role); err != nil {
+				return err
+			}
+			pending = nil
+			for _, c := range m.ToolCalls {
+				pending = append(pending, c.ID)
+			}
+		default:
+			if err := unanswered(i, m.Role); err != nil {
+				return err
+			}
+			pending = nil
+		}
+	}
+	return unanswered(len(msgs), "EOF")
 }
 
 type Message struct {

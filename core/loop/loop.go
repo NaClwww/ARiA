@@ -305,7 +305,12 @@ func (l *Loop) assemble(ctx context.Context) []message.Message {
 
 // streamLLM 消费 provider 流：翻译 Start/Update 事件；未产出任何内容前的
 // Retryable 错误退避重试（02 §7）；取消时合成部分输出（provider 违约兜底）。
+// 发送前经 message.ValidateToolPairing 校验 transcript——配对完整性是协议
+// 硬要求，坏数据在这里响亮失败（EndError），不留给服务端报模糊的 400。
 func (l *Loop) streamLLM(ctx context.Context, msgs []message.Message) (message.Message, message.Usage, error) {
+	if err := message.ValidateToolPairing(msgs); err != nil {
+		return message.Message{}, message.Usage{}, fmt.Errorf("invalid transcript: %w", err)
+	}
 	opts, _ := ctxx.OptionsFrom(ctx)
 	req := provider.Request{Messages: cloneMessages(msgs), Tools: cloneToolDefs(l.toolDefs), Options: opts}
 

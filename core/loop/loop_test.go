@@ -199,6 +199,27 @@ func TestQueueMidRun(t *testing.T) {
 	}
 }
 
+// 坏 transcript（孤立 tool 结果）在发送边界被拒：EndError、错误带 ID、
+// provider 未被调用——配对完整性由 message.ValidateToolPairing 把关，
+// runtime 各层不再对形状悄悄缝补。
+func TestInvalidTranscriptFailsLoud(t *testing.T) {
+	fake := provider.NewFake(provider.FakeStep{Text: []string{"不该被调用"}})
+	l, _ := New(Config{Provider: fake})
+	ch, cancel := l.Subscribe(1024)
+	res, err := l.Run(testCtx(), []message.Message{
+		message.NewUser("hi"),
+		{Role: message.RoleTool, ToolCallID: "ghost", Blocks: []message.Block{message.TextBlock{Text: "孤儿"}}},
+	})
+	assertEnd(t, res, err, EndError)
+	if !strings.Contains(err.Error(), "ghost") {
+		t.Fatalf("error should name the orphan call ID: %v", err)
+	}
+	drain(ch, cancel)
+	if fake.Left() != 1 {
+		t.Fatalf("provider must not be called, %d steps left", fake.Left())
+	}
+}
+
 // Interrupt 中途打断：保留部分输出，队列空 → EndInterrupted。
 func TestInterruptPartial(t *testing.T) {
 	fake := provider.NewFake(provider.FakeStep{

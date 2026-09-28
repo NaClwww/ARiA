@@ -256,10 +256,8 @@ func (k KeepLast) Compress(_ context.Context, memory, turn []message.Message) ([
 
 // trimKeepLast 取 all 的末尾约 n 条，且不拆散工具调用组：切点若落在
 // tool 结果上，向后扩到配对的 assistant（整组保留）。n 是预算不是硬上限，
-// 超出一组无伤有界性，而拆散的组（孤儿 tool 消息）会被 OpenAI 兼容服务端
-// 拒收整批请求。病态输入（整个切片以 tool 消息开头、无配对可回退）才向前
-// 丢弃孤儿，且至少保留 1 条——空输出按压缩失败处理，兜底路径更会整段清空
-// 记忆。
+// 超出一组无伤有界性。序列自身的合法性不在此处修补——坏数据原样通过，
+// 由发送边界的 message.ValidateToolPairing 响亮报错（带位置与 ID）。
 func trimKeepLast(all []message.Message, n int) []message.Message {
 	if n <= 0 || len(all) <= n {
 		return all
@@ -267,13 +265,6 @@ func trimKeepLast(all []message.Message, n int) []message.Message {
 	start := len(all) - n
 	for start > 0 && all[start].Role == message.RoleTool {
 		start--
-	}
-	if start == 0 && all[0].Role == message.RoleTool {
-		out := all[len(all)-n:]
-		for len(out) > 1 && out[0].Role == message.RoleTool {
-			out = out[1:]
-		}
-		return out
 	}
 	return all[start:]
 }

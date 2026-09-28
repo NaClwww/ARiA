@@ -66,7 +66,8 @@ type Usage struct{ In, Out, Cached int; Cost float64 }
 历史形态唯一约定（canonical transcript）：
 
 - assistant 发起的调用挂在自身 `ToolCalls` 字段上，重放给 provider 时原样携带——缺了它多轮工具循环在真实 provider 上直接 400；
-- 工具结果进入历史只有一条规则：`Message{Role: tool, ToolCallID: result.CallID, Blocks: result.Blocks}`（即 `ToolResult.ToMessage()`）。
+- 工具结果进入历史只有一条规则：`Message{Role: tool, ToolCallID: result.CallID, Blocks: result.Blocks}`（即 `ToolResult.ToMessage()`）；
+- 配对完整性（每个 tool_call 有应答、每条 tool 结果有配对调用）由 `ValidateToolPairing` 在**发送边界**校验并返回带位置与 ID 的 error（core 每轮组装后调用）——坏序列响亮失败，各层（裁剪/适配器）不再对形状悄悄缝补（2026-09-28 定）。
 
 一次工具往返的完整历史示例：
 

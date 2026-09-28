@@ -2,8 +2,46 @@ package message
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
+
+func TestValidateToolPairing(t *testing.T) {
+	asst := func(ids ...string) Message {
+		m := Message{Role: RoleAssistant}
+		for _, id := range ids {
+			m.ToolCalls = append(m.ToolCalls, ToolCall{ID: id, Name: "t"})
+		}
+		return m
+	}
+	tool := func(id string) Message { return Message{Role: RoleTool, ToolCallID: id} }
+
+	cases := []struct {
+		name string
+		msgs []Message
+		want string // 空 = 合法
+	}{
+		{"纯文本对话", []Message{NewUser("q"), NewAssistant("a")}, ""},
+		{"带 system 前缀", []Message{NewSystem("s"), NewUser("q"), NewAssistant("a")}, ""},
+		{"工具组完整", []Message{NewUser("q"), asst("c1", "c2"), tool("c1"), tool("c2"), NewAssistant("a")}, ""},
+		{"孤立 tool 结果", []Message{NewUser("q"), tool("c1")}, "孤立"},
+		{"ID 不匹配", []Message{NewUser("q"), asst("c1"), tool("c2")}, "孤立"},
+		{"调用无应答即换角色", []Message{NewUser("q"), asst("c1"), NewUser("再问")}, "未获应答"},
+		{"调用无应答到结尾", []Message{NewUser("q"), asst("c1")}, "未获应答"},
+	}
+	for _, tc := range cases {
+		err := ValidateToolPairing(tc.msgs)
+		if tc.want == "" {
+			if err != nil {
+				t.Fatalf("%s: want valid, got %v", tc.name, err)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%s: want error containing %q, got %v", tc.name, tc.want, err)
+		}
+	}
+}
 
 func TestToolResultMessageRoundTrip(t *testing.T) {
 	r := ToolResult{CallID: "call-1", Blocks: []Block{TextBlock{Text: "failed"}}, IsError: true}

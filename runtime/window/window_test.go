@@ -209,17 +209,16 @@ func TestKeepLastExtendsBackToPairingAssistant(t *testing.T) {
 	}
 }
 
-// 病态输入兜底：整个切片以 tool 消息开头（配对 assistant 不在切片内，
-// 正常构造不会出现）——向前丢孤儿但至少保留 1 条，绝不返回空
-// （空输出按压缩失败处理，兜底裁剪路径更会整段清空记忆）。
-func TestTrimKeepLastPathologicalAllTools(t *testing.T) {
+// 病态输入（整个切片以 tool 消息开头、无配对可回退）：不修补、原样通过——
+// 序列合法性由发送边界的 message.ValidateToolPairing 响亮报错。
+func TestTrimKeepLastPassesGarbageThrough(t *testing.T) {
 	in := []message.Message{
 		{Role: message.RoleTool, ToolCallID: "x", Blocks: []message.Block{message.TextBlock{Text: "rx"}}},
 		{Role: message.RoleTool, ToolCallID: "y", Blocks: []message.Block{message.TextBlock{Text: "ry"}}},
 	}
 	got := trimKeepLast(in, 1)
-	if len(got) != 1 || got[0].Role != message.RoleTool {
-		t.Fatalf("病态输入应恰好保留 1 条 tool 消息，got %v", texts(got))
+	if !equal(texts(got), texts(in)) {
+		t.Fatalf("坏数据应原样通过（发送边界负责报错），got %v", texts(got))
 	}
 }
 
