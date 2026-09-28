@@ -63,6 +63,7 @@ func main() {
 		noASR        = flag.Bool("no-asr", false, "停用 ASR 插头（纯终端开发）")
 		noStdin      = flag.Bool("no-stdin", false, "停用 stdin 插头（纯语音）")
 		noTTS        = flag.Bool("no-tts", false, "停用 TTS 播放（只看文字）")
+		noInputGate  = flag.Bool("no-input-gate", false, "关闭「说话/生成期间不接受新输入」闸门（半双工）")
 		device       = flag.String("device", "", "launcher 控制面地址，TTS 从设备出声（如 http://127.0.0.1:18900）；空 = 本机 paplay")
 		apiKey       = flag.String("api-key", "", "API key；空则按配置的 api_key_env 读环境变量")
 	)
@@ -151,13 +152,16 @@ func main() {
 		printEvents(ch, os.Stdout, os.Stderr)
 	}()
 
+	// 半双工闸门：生成语言 + 设备放音期间不接受新输入（含自回声防护）。
+	gate := &speakingGate{}
+
 	// TTS 驱动：事件流的第二个消费者（一切服务都是事件订阅者）。
 	var ttsDone <-chan struct{}
 	var ttsUnsub func()
 	if !*noTTS {
 		ttsCh, u := sess.Subscribe(0)
 		ttsUnsub = u
-		d := newTTSDriver(*backend, *device, log)
+		d := newTTSDriver(*backend, *device, gate, log)
 		done := make(chan struct{})
 		ttsDone = done
 		go func() {
@@ -179,6 +183,10 @@ func main() {
 
 	// 输入插头（06 §2：插头交付「一句完整的话 + 谁说的」，多插头谁先来谁先进）。
 	deliver := func(text, speaker string) {
+		if !*noInputGate && gate.active() {
+			fmt.Fprintf(os.Stderr, "·（正在说话，忽略输入）%s\n", truncStr(strings.TrimSpace(text), 40))
+			return
+		}
 		if err := deliverUtterance(sess, text, speaker, cfg); err != nil {
 			log.Error("input failed", "err", err)
 		}
@@ -407,14 +415,44 @@ func parseWavHeader(h []byte) (rate, channels int, err error) {
 	return rate, channels, nil
 }
 
+// speakingGate 是「正在说话」闸门（半双工策略）：从轮次开始（生成语言）
+// 到设备把声音放完期间不接受新输入。引用计数——轮次与每次播放各持一份，
+// 全释放才放行。顺带挡住自回声：播放期间 mic 收到的「设备自己的声音」
+// 不再成轮，自问自答循环消失。
+type speakingGate struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (g *speakingGate) acquire() {
+	g.mu.Lock()
+	g.n++
+	g.mu.Unlock()
+}
+
+func (g *speakingGate) release() {
+	g.mu.Lock()
+	if g.n > 0 {
+		g.n--
+	}
+	g.mu.Unlock()
+}
+
+func (g *speakingGate) active() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.n > 0
+}
+
 // audioSink 是 TTS 音频的去处：每条 assistant 消息一个 sink 实例，按流首
 // 头解析出的采样率/声道配置。write 的阻塞即播放背压（paplay 管道满 /
-// 设备端队列满），反压整条链。
+// 设备端队列满），反压整条链。waitDrain 等实际放完（闸门据此放行输入）。
 type audioSink interface {
 	begin() error
 	write(pcm []byte) error
-	end() error // 输入收口：排空自然收尾
-	stop()      // 立即掐断（幂等，可与 write 并发调用）
+	end() error     // 输入收口：排空自然收尾
+	stop()          // 立即掐断（幂等，可与 write 并发调用）
+	waitDrain()     // 阻塞到声音真正放完/会话已死
 }
 
 // ttsDriver 是事件流的第二个消费者（06：一切服务都是事件订阅者）：assistant
@@ -429,16 +467,17 @@ type ttsDriver struct {
 	base    string
 	log     *slog.Logger
 	hc      *http.Client
+	gate    *speakingGate
 	dev     *deviceClient // 设备播放隧道（单例；本机播放时为 nil）
 	newSink func(ctx context.Context, rate, channels int) audioSink
 	current *ttsPlayback
 }
 
-func newTTSDriver(backend, device string, log *slog.Logger) *ttsDriver {
+func newTTSDriver(backend, device string, gate *speakingGate, log *slog.Logger) *ttsDriver {
 	hc := &http.Client{Transport: &http.Transport{
 		DialContext: (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
 	}}
-	d := &ttsDriver{base: strings.TrimSuffix(backend, "/"), log: log, hc: hc}
+	d := &ttsDriver{base: strings.TrimSuffix(backend, "/"), log: log, hc: hc, gate: gate}
 	if device != "" {
 		d.dev = newDeviceClient(device, log)
 		dev := d.dev
@@ -479,6 +518,9 @@ func (d *ttsDriver) run(ch <-chan loop.Event) {
 			}
 		case loop.AgentStartData:
 			d.stop() // 新一轮开始：上一轮没放完的不放
+			d.gate.acquire() // 生成语言期间不接受新输入
+		case loop.AgentEndData:
+			d.gate.release() // 轮次结束（播放各自持有自己的份额）
 		}
 	}
 	d.stop()
@@ -486,7 +528,7 @@ func (d *ttsDriver) run(ch <-chan loop.Event) {
 
 func (d *ttsDriver) start() {
 	d.stop()
-	p, err := startPlayback(d.base, d.hc, d.log, d.newSink)
+	p, err := startPlayback(d.base, d.hc, d.log, d.newSink, d.gate)
 	if err != nil {
 		d.log.Error("tts: 启动失败（本条静音，文字照常）", "err", err)
 		return
@@ -518,7 +560,8 @@ type ttsPlayback struct {
 }
 
 func startPlayback(base string, hc *http.Client, log *slog.Logger,
-	newSink func(ctx context.Context, rate, channels int) audioSink) (*ttsPlayback, error) {
+	newSink func(ctx context.Context, rate, channels int) audioSink,
+	gate *speakingGate) (*ttsPlayback, error) {
 	pr, pw := io.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/tts/stream_input", pr)
@@ -560,6 +603,8 @@ func startPlayback(base string, hc *http.Client, log *slog.Logger,
 			sink.stop()
 			return
 		}
+		gate.acquire() // 播放持有闸门份额：到声音真正放完才放行输入
+		defer gate.release()
 		p.mu.Lock()
 		if p.fin { // stop() 已先到：刚建好的 sink 直接掐
 			p.mu.Unlock()
@@ -582,6 +627,7 @@ func startPlayback(base string, hc *http.Client, log *slog.Logger,
 			}
 		}
 		sink.end()
+		sink.waitDrain() // 等设备放完（end 之后设备侧还在排空）
 	}()
 
 	return p, nil
@@ -631,11 +677,17 @@ type deviceClient struct {
 // deviceOp 是隧道里的一次请求；ctx 取消即放弃执行（本条已死）。
 // done 为 nil 表示 fire-and-forget（stop 用，不阻塞事件循环）。
 type deviceOp struct {
-	ctx  context.Context
-	path string
+	ctx    context.Context
+	method string
+	path   string
+	body   []byte
+	ct     string
+	done   chan opResult
+}
+
+type opResult struct {
 	body []byte
-	ct   string
-	done chan error
+	err  error
 }
 
 func newDeviceClient(base string, log *slog.Logger) *deviceClient {
@@ -658,64 +710,71 @@ func (c *deviceClient) worker() {
 	for op := range c.ops {
 		if op.ctx != nil && op.ctx.Err() != nil {
 			if op.done != nil {
-				op.done <- op.ctx.Err()
+				op.done <- opResult{err: op.ctx.Err()}
 			}
 			continue
 		}
-		err := c.do(op)
+		body, err := c.do(op)
 		if op.done != nil {
-			op.done <- err
+			op.done <- opResult{body: body, err: err}
 		}
 	}
 }
 
-func (c *deviceClient) do(op deviceOp) error {
+func (c *deviceClient) do(op deviceOp) ([]byte, error) {
 	ctx := op.ctx
 	if ctx == nil {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+op.path,
-		bytes.NewReader(op.body))
+	method := op.method
+	if method == "" {
+		method = http.MethodPost
+	}
+	var reader io.Reader
+	if len(op.body) > 0 {
+		reader = bytes.NewReader(op.body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.base+op.path, reader)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if op.ct != "" {
 		req.Header.Set("Content-Type", op.ct)
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("device %s: status %d", op.path, resp.StatusCode)
+		return nil, fmt.Errorf("device %s: status %d", op.path, resp.StatusCode)
 	}
-	return nil
+	return body, nil
 }
 
-// submit 同步提交（等结果）；返回的 error 供背压与失败判定。
-func (c *deviceClient) submit(ctx context.Context, path string, body []byte, ct string) error {
-	op := deviceOp{ctx: ctx, path: path, body: body, ct: ct, done: make(chan error, 1)}
+// call 同步提交（等结果与响应体）；返回的 error 供背压与失败判定。
+func (c *deviceClient) call(ctx context.Context, method, path string, body []byte, ct string) ([]byte, error) {
+	op := deviceOp{ctx: ctx, method: method, path: path, body: body, ct: ct, done: make(chan opResult, 1)}
 	select {
 	case c.ops <- op:
 	case <-ctx.Done():
-		return ctx.Err()
+		return nil, ctx.Err()
 	}
 	select {
-	case err := <-op.done:
-		return err
+	case r := <-op.done:
+		return r.body, r.err
 	case <-ctx.Done():
-		return ctx.Err()
+		return nil, ctx.Err()
 	}
 }
 
 // fireAndForget 异步提交（stop 用）：绝不阻塞驱动事件循环。
 func (c *deviceClient) fireAndForget(path string) {
 	select {
-	case c.ops <- deviceOp{ctx: nil, path: path}:
+	case c.ops <- deviceOp{path: path}:
 	default:
 		c.log.Warn("tts: 设备请求隧道已满，丢弃", "path", path)
 	}
@@ -737,7 +796,8 @@ type deviceSink struct {
 
 func (d *deviceSink) begin() error {
 	body := fmt.Sprintf(`{"rate":%d,"channels":%d}`, d.rate, d.channels)
-	return d.cl.submit(d.ctx, "/api/voice/play/begin", []byte(body), "application/json")
+	_, err := d.cl.call(d.ctx, http.MethodPost, "/api/voice/play/begin", []byte(body), "application/json")
+	return err
 }
 
 func (d *deviceSink) write(pcm []byte) error {
@@ -747,7 +807,8 @@ func (d *deviceSink) write(pcm []byte) error {
 	if dead {
 		return errors.New("sink stopped")
 	}
-	return d.cl.submit(d.ctx, "/api/voice/play/chunk", pcm, "application/octet-stream")
+	_, err := d.cl.call(d.ctx, http.MethodPost, "/api/voice/play/chunk", pcm, "application/octet-stream")
+	return err
 }
 
 // end 结束输入（设备端排空收尾）。会话已死则静默成功——旧的 end 决不能
@@ -759,7 +820,38 @@ func (d *deviceSink) end() error {
 	if dead {
 		return nil
 	}
-	return d.cl.submit(d.ctx, "/api/voice/play/end", nil, "")
+	_, err := d.cl.call(d.ctx, http.MethodPost, "/api/voice/play/end", nil, "")
+	return err
+}
+
+// waitDrain 轮询设备直到会话排空关闭（open:false）——设备侧 EOF 后还要
+// 把已入队音频放完才收口，这里等的就是那段尾巴。查询失败/超时/会话已死
+// 一律放行：闸门宁可早开也不能卡死输入。
+func (d *deviceSink) waitDrain() {
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		d.mu.Lock()
+		dead := d.dead
+		d.mu.Unlock()
+		if dead {
+			return
+		}
+		body, err := d.cl.call(d.ctx, http.MethodGet, "/api/voice/play", nil, "")
+		if err != nil {
+			return
+		}
+		var st struct {
+			Open bool `json:"open"`
+		}
+		if json.Unmarshal(body, &st) != nil || !st.Open {
+			return
+		}
+		select {
+		case <-d.ctx.Done():
+			return
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }
 
 // stop 立即置死 + 异步投递 /play/stop。置死先于投递：置死前入队的旧 chunk
@@ -805,17 +897,21 @@ func (s *paplaySink) write(pcm []byte) error {
 }
 
 func (s *paplaySink) end() error {
-	if err := s.stdin.Close(); err != nil {
-		return err
-	}
-	go func() { _ = s.cmd.Wait() }() // 排空即退出；不阻塞调用方
-	return nil
+	return s.stdin.Close() // 进程退出交给 waitDrain 的 Wait
 }
 
 func (s *paplaySink) stop() {
 	_ = s.stdin.Close()
 	if s.cmd.Process != nil {
 		_ = s.cmd.Process.Kill()
+	}
+}
+
+// waitDrain 等播放进程自然退出（stdin 已关，放完即退）；被 stop 杀掉时
+// Wait 立即返回。
+func (s *paplaySink) waitDrain() {
+	if s.cmd != nil {
+		_ = s.cmd.Wait()
 	}
 }
 
