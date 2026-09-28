@@ -429,7 +429,8 @@ type ttsDriver struct {
 	base    string
 	log     *slog.Logger
 	hc      *http.Client
-	newSink func(rate, channels int) audioSink
+	dev     *deviceClient // 设备播放隧道（单例；本机播放时为 nil）
+	newSink func(ctx context.Context, rate, channels int) audioSink
 	current *ttsPlayback
 }
 
@@ -439,13 +440,14 @@ func newTTSDriver(backend, device string, log *slog.Logger) *ttsDriver {
 	}}
 	d := &ttsDriver{base: strings.TrimSuffix(backend, "/"), log: log, hc: hc}
 	if device != "" {
-		dev := strings.TrimSuffix(device, "/")
-		d.newSink = func(rate, channels int) audioSink {
-			return &deviceSink{base: dev, hc: hc, log: log, rate: rate, channels: channels}
+		d.dev = newDeviceClient(device, log)
+		dev := d.dev
+		d.newSink = func(ctx context.Context, rate, channels int) audioSink {
+			return &deviceSink{cl: dev, ctx: ctx, rate: rate, channels: channels}
 		}
-		log.Info("tts: 设备端播放", "device", dev)
+		log.Info("tts: 设备端播放", "device", dev.base)
 	} else {
-		d.newSink = func(rate, channels int) audioSink {
+		d.newSink = func(_ context.Context, rate, channels int) audioSink {
 			return &paplaySink{rate: rate, channels: channels}
 		}
 		log.Info("tts: 本机播放（paplay）")
@@ -516,7 +518,7 @@ type ttsPlayback struct {
 }
 
 func startPlayback(base string, hc *http.Client, log *slog.Logger,
-	newSink func(rate, channels int) audioSink) (*ttsPlayback, error) {
+	newSink func(ctx context.Context, rate, channels int) audioSink) (*ttsPlayback, error) {
 	pr, pw := io.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/tts/stream_input", pr)
@@ -551,7 +553,7 @@ func startPlayback(base string, hc *http.Client, log *slog.Logger,
 			log.Error("tts: 非法 WAV 流头", "err", err)
 			return
 		}
-		sink := newSink(rate, channels)
+		sink := newSink(ctx, rate, channels)
 		if err := sink.begin(); err != nil {
 			log.Error("tts: 播放启动失败（本条静音，文字照常）", "err", err,
 				"rate", rate, "channels", channels)
@@ -615,56 +617,159 @@ func (p *ttsPlayback) stop() {
 
 // ---------- 播放 sink：设备端（launcher /api/voice/play*）与本机 paplay ----------
 
-// deviceSink 把 PCM 送到 launcher 的播放端点（对齐记录 #3 落地，口型暂缓）。
-// 三段式（begin/chunk×n/end）+ stop 立即掐断；chunk POST 在设备端队列满时
-// 阻塞，背压天然传导回 TTS 读取。采样率/声道来自流首 WAV 头（自适应）。
-type deviceSink struct {
-	base     string
-	hc       *http.Client
-	log      *slog.Logger
-	rate     int
-	channels int
+// deviceClient 把对设备播放端点的所有请求串成单连接 FIFO：一条隧道连接
+// （MaxConnsPerHost=1）+ 单 worker 逐个执行，设备侧到达序 = 发出序。这是
+// 「对话太快 TTS 被打烂」的根治——此前新旧会话的 POST 各自并发，旧轮次
+// 没死透的 chunk 会混进新会话、旧 end 会掐断新会话的输入。
+type deviceClient struct {
+	base string
+	log  *slog.Logger
+	ops  chan deviceOp
+	hc   *http.Client
 }
 
-func (d *deviceSink) post(path string, body []byte, contentType string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.base+path, bytes.NewReader(body))
+// deviceOp 是隧道里的一次请求；ctx 取消即放弃执行（本条已死）。
+// done 为 nil 表示 fire-and-forget（stop 用，不阻塞事件循环）。
+type deviceOp struct {
+	ctx  context.Context
+	path string
+	body []byte
+	ct   string
+	done chan error
+}
+
+func newDeviceClient(base string, log *slog.Logger) *deviceClient {
+	c := &deviceClient{
+		base: strings.TrimSuffix(base, "/"),
+		log:  log,
+		ops:  make(chan deviceOp, 64),
+		hc: &http.Client{Transport: &http.Transport{
+			DialContext:           (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
+			MaxConnsPerHost:       1, // 单连接：FIFO 发出序才能等于到达序
+			MaxIdleConnsPerHost:   1,
+			ResponseHeaderTimeout: 10 * time.Second,
+		}},
+	}
+	go c.worker()
+	return c
+}
+
+func (c *deviceClient) worker() {
+	for op := range c.ops {
+		if op.ctx != nil && op.ctx.Err() != nil {
+			if op.done != nil {
+				op.done <- op.ctx.Err()
+			}
+			continue
+		}
+		err := c.do(op)
+		if op.done != nil {
+			op.done <- err
+		}
+	}
+}
+
+func (c *deviceClient) do(op deviceOp) error {
+	ctx := op.ctx
+	if ctx == nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+op.path,
+		bytes.NewReader(op.body))
 	if err != nil {
 		return err
 	}
-	if contentType != "" {
-		req.Header.Set("Content-Type", contentType)
+	if op.ct != "" {
+		req.Header.Set("Content-Type", op.ct)
 	}
-	resp, err := d.hc.Do(req)
+	resp, err := c.hc.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("device %s: status %d", path, resp.StatusCode)
+		return fmt.Errorf("device %s: status %d", op.path, resp.StatusCode)
 	}
 	return nil
 }
 
+// submit 同步提交（等结果）；返回的 error 供背压与失败判定。
+func (c *deviceClient) submit(ctx context.Context, path string, body []byte, ct string) error {
+	op := deviceOp{ctx: ctx, path: path, body: body, ct: ct, done: make(chan error, 1)}
+	select {
+	case c.ops <- op:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-op.done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// fireAndForget 异步提交（stop 用）：绝不阻塞驱动事件循环。
+func (c *deviceClient) fireAndForget(path string) {
+	select {
+	case c.ops <- deviceOp{ctx: nil, path: path}:
+	default:
+		c.log.Warn("tts: 设备请求隧道已满，丢弃", "path", path)
+	}
+}
+
+// deviceSink 把 PCM 送到 launcher 的播放端点（对齐记录 #3 落地，口型暂缓）。
+// 三段式（begin/chunk×n/end）+ stop 立即掐断；所有请求走 deviceClient 的
+// 单连接 FIFO，顺序有保证。dead 是会话栅栏：stop() 先置死再投递 stop 操作，
+// 之后本会话的任何请求（包括正卡在背压上的 chunk）一律本地丢弃——旧会话
+// 永远碰不到新会话。采样率/声道来自流首 WAV 头（自适应）。
+type deviceSink struct {
+	cl       *deviceClient
+	ctx      context.Context // 本条消息的播放 ctx（p.stop 先 cancel 再 stop）
+	mu       sync.Mutex
+	dead     bool
+	rate     int
+	channels int
+}
+
 func (d *deviceSink) begin() error {
 	body := fmt.Sprintf(`{"rate":%d,"channels":%d}`, d.rate, d.channels)
-	return d.post("/api/voice/play/begin", []byte(body), "application/json")
+	return d.cl.submit(d.ctx, "/api/voice/play/begin", []byte(body), "application/json")
 }
 
 func (d *deviceSink) write(pcm []byte) error {
-	return d.post("/api/voice/play/chunk", pcm, "application/octet-stream")
-}
-
-func (d *deviceSink) end() error {
-	return d.post("/api/voice/play/end", nil, "")
-}
-
-func (d *deviceSink) stop() {
-	if err := d.post("/api/voice/play/stop", nil, ""); err != nil {
-		d.log.Warn("tts: 设备停播请求失败", "err", err)
+	d.mu.Lock()
+	dead := d.dead
+	d.mu.Unlock()
+	if dead {
+		return errors.New("sink stopped")
 	}
+	return d.cl.submit(d.ctx, "/api/voice/play/chunk", pcm, "application/octet-stream")
+}
+
+// end 结束输入（设备端排空收尾）。会话已死则静默成功——旧的 end 决不能
+// 落到新会话上把人家的输入掐断。
+func (d *deviceSink) end() error {
+	d.mu.Lock()
+	dead := d.dead
+	d.mu.Unlock()
+	if dead {
+		return nil
+	}
+	return d.cl.submit(d.ctx, "/api/voice/play/end", nil, "")
+}
+
+// stop 立即置死 + 异步投递 /play/stop。置死先于投递：置死前入队的旧 chunk
+// 在 FIFO 里位于 stop 之前，落进旧会话后即被 stop 清掉；置死后的请求本地
+// 丢弃，永远到不了设备。
+func (d *deviceSink) stop() {
+	d.mu.Lock()
+	d.dead = true
+	d.mu.Unlock()
+	d.cl.fireAndForget("/api/voice/play/stop")
 }
 
 // paplaySink 从本机声卡出声（开发/无设备场景）。采样率/声道来自流首
