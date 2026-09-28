@@ -1,7 +1,7 @@
 # 草稿 · runtime 并发调度（未定稿）
 
-> 2026-08-27 从 03-context-build 降级为草稿：设计超前于共识深度，**M2 前重新讨论定稿**（05 清单 G1）。
-> 其中的原则方向（actor 单写者、信号量只守外部资源）大概率保留，具体机制以重论为准。
+> 2026-08-27 从 03-context-build 降级为草稿：设计超前于共识深度。
+> **2026-09-11 更新**：M2 不再被调度阻塞——v1 定稿为一 Session 同时只跑一轮、新输入走 core.Queue（互斥+队列语义），schedule/ 子包不建（03 §5、05 G1）。本草案仅在出现真实并发场景（多实例准入、后台任务、限流）时回来定稿，原则方向大概率保留。
 
 ## 原则（三条）
 
@@ -27,7 +27,7 @@ RunScheduler ─多维准入─► Session Actor 池      │
 
 ## Session Actor（会话串行化）
 
-每 session 一个常驻 goroutine：session base ctx（core run ctx 的派生父级）+ 当前 Loop + 触发输入路由（空闲→起 Run；Run 中同会话新输入→Queue）。**同一 session 至多一个 Run**（语义正确性：两个 run 交错写同一 messages 即数据损坏）。空闲 LRU 回收，resume 无状态丢失。
+每 session 一个常驻 goroutine：session base ctx（core run ctx 的派生父级）+ 当前 Loop + 触发输入路由（空闲→起 Run；Run 中同会话新输入→Queue）。**同一 session 至多一个 Run**（语义正确性：两个 run 交错写同一 messages 即数据损坏）——**这一条已在 v1 定稿**（03 §5），只是 v1 用互斥+core.Queue 直接实现、不建常驻 Actor。空闲 LRU 回收，resume 无状态丢失。
 
 ## RunScheduler（准入）
 
@@ -48,6 +48,8 @@ RunScheduler ─多维准入─► Session Actor 池      │
 - 重试：指数退避+抖动；幂等键 `(kind, sessionID, turnID)` + 任务表去重（崩溃后从事件日志重放）；死信入表可重投，绝不静默吞。
 
 ## Ingress 策略（触发源声明队列语义）
+
+> 注：此处 Ingress 指「准入/排队」语义，与 03 §6 的 ingress（输入形成状态机，成轮/归主/判终）不是同一层——前者把已成轮的输入送进 Run，后者把原始感知加工成输入。命名冲突 M2 实现时收口。
 
 | 触发源 | 语义 |
 |---|---|

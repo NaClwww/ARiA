@@ -130,11 +130,34 @@ func TestMultiTurnToolLoop(t *testing.T) {
 	}
 }
 
-// Run 前积压的 Queue 在起点注入。
-func TestQueueBeforeRun(t *testing.T) {
+// Queue 只在运行中接受：未开始 / 已返回一律拒绝（ErrNoActiveRun）。
+// 空闲入队会被下一次 Run 在其新输入之后排空——「后说的在前」（06 §2）。
+func TestQueueRejectedWhenIdle(t *testing.T) {
 	fake := provider.NewFake(provider.FakeStep{Text: []string{"好的。"}})
 	l, _ := New(Config{Provider: fake})
-	l.Queue(message.NewUser("先说这个"))
+	if err := l.Queue(message.NewUser("x")); err == nil {
+		t.Fatal("Run 之前 Queue 应被拒绝")
+	}
+
+	ch, cancel := l.Subscribe(1024)
+	res, err := l.Run(testCtx(), []message.Message{message.NewUser("开场")})
+	assertEnd(t, res, err, EndDone)
+	drain(ch, cancel)
+
+	if err := l.Queue(message.NewUser("y")); err == nil {
+		t.Fatal("Run 返回后 Queue 应被拒绝")
+	}
+}
+
+// 错误收场前挤进队列的消息（入队成功后本轮失败）由下一次 Run 在起点排空：
+// 新输入在前、滞留消息在后。这是 06 §2 记录的既知残留顺序，作为安全网
+// 保留；Queue API 本身不再主动产生这种状态。
+func TestStrandedQueueDrainedAtNextRunStart(t *testing.T) {
+	fake := provider.NewFake(provider.FakeStep{Text: []string{"好的。"}})
+	l, _ := New(Config{Provider: fake})
+	l.mu.Lock()
+	l.queue = append(l.queue, message.NewUser("先说这个")) // 白盒：模拟错误路径滞留
+	l.mu.Unlock()
 
 	ch, cancel := l.Subscribe(1024)
 	res, err := l.Run(testCtx(), []message.Message{message.NewUser("开场")})
@@ -160,7 +183,9 @@ func TestQueueMidRun(t *testing.T) {
 
 	go func() {
 		time.Sleep(20 * time.Millisecond) // 首轮流式中途
-		l.Queue(message.NewUser("等等，补充一点"))
+		if err := l.Queue(message.NewUser("等等，补充一点")); err != nil {
+			t.Errorf("运行中 Queue 应被接受：%v", err)
+		}
 	}()
 
 	res, err := l.Run(testCtx(), []message.Message{message.NewUser("开场")})
@@ -217,7 +242,9 @@ func TestInterruptThenQueueResumes(t *testing.T) {
 
 	go func() {
 		time.Sleep(30 * time.Millisecond)
-		l.Queue(message.NewUser("别说了，说这个"))
+		if err := l.Queue(message.NewUser("别说了，说这个")); err != nil {
+			t.Errorf("运行中 Queue 应被接受：%v", err)
+		}
 		time.Sleep(60 * time.Millisecond)
 		l.Interrupt()
 	}()
@@ -643,5 +670,42 @@ func TestGuardDenyCleansOpCancel(t *testing.T) {
 	assertEnd(t, res, err, EndDone)
 	if box := l.opCancel.Load(); box != nil && box.fn != nil {
 		t.Fatal("opCancel retains stale cancel after GuardDeny branch")
+	}
+}
+
+// AgentStart 的 turn 必须是 0：Loop 会被复用（一个 Session 一个 Loop），
+// 不复位就会把上一轮结束时的计数值写进 durable 记录，同一 run 内 turn 自相矛盾。
+func TestAgentStartTurnResetsBetweenRuns(t *testing.T) {
+	fake := provider.NewFake(
+		provider.FakeStep{Text: []string{"一"}},
+		provider.FakeStep{Text: []string{"二"}},
+	)
+	l, err := New(Config{Provider: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, cancel := l.Subscribe(1024)
+	defer cancel()
+
+	if _, err := l.Run(testCtx(), []message.Message{message.NewUser("第一轮")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Run(testCtx(), []message.Message{message.NewUser("第二轮")}); err != nil {
+		t.Fatal(err)
+	}
+
+	var starts []int
+	for _, ev := range drain(ch, cancel) {
+		if ev.Kind == KindAgentStart {
+			starts = append(starts, ev.Turn)
+		}
+	}
+	if len(starts) != 2 {
+		t.Fatalf("AgentStart 事件数 = %d, want 2", len(starts))
+	}
+	for i, turn := range starts {
+		if turn != 0 {
+			t.Fatalf("第 %d 个 run 的 AgentStart turn = %d, want 0", i+1, turn)
+		}
 	}
 }

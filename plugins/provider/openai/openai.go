@@ -200,6 +200,19 @@ func (a *Adapter) read(ctx context.Context, resp *http.Response, ch chan<- provi
 			if args == "" {
 				args = "{}"
 			}
+			// 参数必须是合法 JSON——这是协议的一部分，而模型输出残缺参数时服务端
+			// 照样原样返回。**绝不当 ToolCall 往下游传**：工具执行、Guard 改写、
+			// durable 落盘、事件重放都以「Args 是合法 JSON」为前提（不合法会让落盘
+			// 编码失败、整条事件丢失，会话直接降级）。这里按可重试错误上报：未产出
+			// 内容时 core 会退避重试（通常能自愈），重试耗尽则以清晰错误收场。
+			if !json.Valid([]byte(args)) {
+				ch <- provider.ErrorEvent{
+					Err: fmt.Errorf("openai: tool_call %q 的 arguments 不是合法 JSON（服务端违反协议）: %s",
+						p.name, snippet(args, 120)),
+					Retryable: true,
+				}
+				return
+			}
 			id := p.id
 			if id == "" {
 				id = fmt.Sprintf("call_%d", i) // 个别实现不回 id
@@ -208,6 +221,15 @@ func (a *Adapter) read(ctx context.Context, resp *http.Response, ch chan<- provi
 		}
 	}
 	ch <- provider.MessageComplete{Message: msg, Usage: usage}
+}
+
+// snippet 截断字符串用于错误信息（rune 安全），避免把大段垃圾塞进错误里。
+func snippet(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 func partial(text, thought strings.Builder) message.Message {
@@ -265,6 +287,19 @@ func (a *Adapter) buildRequest(req provider.Request) ([]byte, error) {
 	return json.Marshal(payload)
 }
 
+// imageURL 计算 ImageBlock 的 wire URL：URL 直用，否则 Data 转 data: URI。
+// 两者都没有是**畸形块**：返回错误而不是发一个空 url 出去——否则服务端只回一个
+// 含糊的 400，排查不到是我们自己造了坏请求。
+func imageURL(b message.ImageBlock) (string, error) {
+	if b.URL != "" {
+		return b.URL, nil
+	}
+	if len(b.Data) > 0 {
+		return "data:" + b.MIME + ";base64," + base64.StdEncoding.EncodeToString(b.Data), nil
+	}
+	return "", errors.New("openai: ImageBlock 既无 URL 也无 Data")
+}
+
 // toWire 转换单条消息；ThoughtBlock 剥除——reasoning 内容不回传
 // （DeepSeek/GLM 语义：reasoning_content 只产出、不回放）。
 func toWire(m message.Message) (wireMessage, error) {
@@ -291,14 +326,28 @@ func toWire(m message.Message) (wireMessage, error) {
 			switch b := blk.(type) {
 			case message.TextBlock:
 				parts = append(parts, wirePart{Type: "text", Text: b.Text})
-			case message.ImageBlock:
-				textOnly = false
-				url := b.URL
-				if url == "" && b.Data != nil {
-					url = "data:" + b.MIME + ";base64," + base64.StdEncoding.EncodeToString(b.Data)
+			case *message.TextBlock:
+				// 指针形态与值形态同为合法 Block（CloneBlock 契约含指针），nil 跳过
+				if b != nil {
+					parts = append(parts, wirePart{Type: "text", Text: b.Text})
 				}
+			case message.ImageBlock:
+				url, err := imageURL(b)
+				if err != nil {
+					return wireMessage{}, err
+				}
+				textOnly = false
 				parts = append(parts, wirePart{Type: "image_url", ImageURL: &wireImgURL{URL: url}})
-			case message.ThoughtBlock:
+			case *message.ImageBlock:
+				if b != nil {
+					url, err := imageURL(*b)
+					if err != nil {
+						return wireMessage{}, err
+					}
+					textOnly = false
+					parts = append(parts, wirePart{Type: "image_url", ImageURL: &wireImgURL{URL: url}})
+				}
+			case message.ThoughtBlock, *message.ThoughtBlock:
 				// 剥除
 			default:
 				return wireMessage{}, fmt.Errorf("openai: unsupported block %T in %s message", blk, m.Role)

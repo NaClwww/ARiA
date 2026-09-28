@@ -9,7 +9,7 @@
 |---|---|---|---|
 | `Provider.Stream(ctx, req)` | core/02 §5 | M1 | §2 各家适配器 |
 | `Tool.Def/Exec` | core/02 §5 | M1 | §3 内置工具 |
-| `Assembler.Assemble` | core/02 §4 | M1 | 默认恒等透传；窗口组装实现 M3 落地（03 §2、notes 草稿） |
+| `Assembler.Assemble` | core/02 §4 | M1 | 恒等兜底；runtime/window 每轮组装（03 §5）在 core 槽 1 上折叠 |
 | `ToolSource.Name/Tools/Close` | 本文 §3 | M2 | §3 工具源；MCP 桥（M4）= 一种 ToolSource，实现时再细化 |
 | `ContextSource.Name/Collect/Observe` | runtime/03 §2 | M3 | §4 默认记忆源、RAG 源 |
 
@@ -22,7 +22,7 @@
 - **openai-compatible**（M1）：一个适配器覆盖 DeepSeek/GLM/Qwen/Ollama 的 OpenAI 端点；规范形互转（pkg/message ↔ OpenAI 格式）；流式 SSE 解析 → PartDelta/MessageComplete。
 - **anthropic / gemini**（M1 后补齐）：官方 Go SDK 或自写 HTTP，同样只做哑管道翻译。
 - 硬性义务（core/02 §5）：取消时以 `MessageComplete(interrupted=true)` 返回已收内容；Usage 必须上报（Budget 扣减依赖）；限流/超时错误标记 Retryable（错误三分法）。
-- 限流包装 `LimitedProvider` 属 runtime（机制草稿 notes/concurrency-draft.md，M2 前重论），适配器本身不管限流。
+- 限流包装 `LimitedProvider` 属 runtime（并发调度草稿 notes/concurrency-draft.md，有需要再定），适配器本身不管限流。
 
 ## 3. 工具：ToolSource 与内置工具
 
@@ -34,9 +34,10 @@ type ToolSource interface {
 }
 ```
 
-- **builtin 源**（M2）：`web_search`、`web_fetch`、`shell`（超时+输出截断）、`fs_read/write`；**memory 源**（M4）：`memory.recall` / `history.load` / `artifact.open`——pull 路工具，属未定稿草稿（notes/context-planning-draft.md，M4 前定）；
+- **builtin 源**（M2）：`web_search`、`web_fetch`、`shell`（超时+输出截断）、`fs_read/write`；**memory 源**（M4）：`memory.recall` / `history.load`——pull 路工具，属未定稿草稿（notes/context-planning-draft.md，M4 前定）。`artifact.open` 已由 runtime 提供（03 §5 工具结果截断），不再属于 memory 源。
 - Registry：接受多个 ToolSource，工具名命名空间化防冲突，支持运行中 refresh（invalidation 后重 list）；
 - 工具实现义务：尊重 ctx 取消（长任务返回部分结果）；结果走 content blocks（可带 image 等）；错误返回 `ToolResult{IsError:true}`（是内容不是故障）；经 ToolGuard 审批后执行（core 保证）。
+- **超长结果由 runtime 统一处理**：Agent 装配时对工具套上 `toolkit.Truncate`（03 §5），全文进 artifact、只把预览+引用喂回模型——插件只需如实返回结果，不必自己截断（`shell` 之类的内部截断仍可保留，属工具自身语义）。
 
 ## 4. ContextSource 实现（默认：SQLite 记忆源）
 
@@ -50,19 +51,21 @@ type ContextSource interface {
 }
 ```
 
-- **调用方是 runtime**（03 §2）：Collect 在组装链上每轮驱动；Observe 在轮次落盘后异步驱动（重试/幂等/死信机制草稿 notes/concurrency-draft.md，M2 前重论）；
+- **调用方是 runtime**（03 §5）：Collect 在每轮组装链上同步驱动；Observe 在轮次落盘后异步驱动（幂等；重试/死信细节随并发调度草稿，有需要再定）；
 - **默认实现 = SQLite 记忆源**（modernc.org/sqlite，纯 Go）：semantic store + FTS5 检索（namespace 进 WHERE 硬隔离；三期 sqlite-vec 向量 + 混合召回 + rerank，只换内部检索，契约不变）；蒸馏是**源内部管线**（构造注入 Provider，episode → 候选事实 → 去重/supersede → 内部写入），策略走配置——换存储实现 ≠ 换蒸馏；
 - **RAG 知识库 = 另一个 ContextSource**：corpus 建索引走 Batch 任务写自己的存储，Collect 只读；
-- **L1 会话全量原文不在此契约**：由 runtime 事件溯源落盘（机制草稿 notes/concurrency-draft.md），`history.load` 直读 L1。
+- **L1 会话全量原文不在此契约**：由 runtime 事件溯源落盘（runtime/persist，v1 只写不恢复）；`history.load` 是 M4 pull 工具，直读 L1。
 
 ## 5. 注册与装配
 
-库暴露**唯一装配函数**（如 `aria.Setup(cfg) (*Runtime, error)`）——唯一知道所有具体插件的地方；当前消费者是嵌入方与集成测试，未来产品入口（CLI/HTTP 薄壳）只是新的嵌入方。core 与 runtime 不 import 任何具体插件包。
+库暴露**唯一装配函数**（如 `aria.Setup(cfg) (*Agent, error)`，03 §5）——唯一知道所有具体插件的地方；消费者是嵌入方与集成测试，未来产品入口（CLI/HTTP 薄壳）只是新的嵌入方。core 与 runtime 不 import 任何具体插件包。
 
 ```
 Setup: ctxx(Scope/Trace/Budget) → Providers(openai…) → ToolSources(builtin, mcp…)
-→ Window/Planner → SessionManager + Scheduler + PersistActor
-→ Loop Deps{Provider, Tools, Assembler: Planner, Guard} → 嵌入方可用的 Runtime 句柄
+→ ContextSources(memory…) + Store(persist 实现)
+→ Agent{Provider, Tools, Compressor, Store} = 装配零件盒（03 §5）
+→ NewSession → Session{压缩记忆(Window) + Loop + persist 订阅}
+→ 每轮：window.Assemble → Run → AgentEnd 结算进窗口
 ```
 
 配置优先级：装配参数 → 环境变量 → 配置文件 → 默认（pi 同款）。

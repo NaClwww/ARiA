@@ -40,6 +40,8 @@ const DefaultMaxTurns = 100
 var (
 	ErrNoScope        = errors.New("loop: scope missing in ctx (fail-closed, 01 R4)")
 	ErrAlreadyRunning = errors.New("loop: concurrent Run on same instance")
+	// ErrNoActiveRun：Queue 只做轮间注入，运行未开始 / 已收敛 / 已返回时拒绝。
+	ErrNoActiveRun = errors.New("loop: no active run (Queue only injects into a running turn)")
 )
 
 // State 是 Assembler 每轮收到的只读快照（core↔runtime 的分界类型，B1）。
@@ -114,6 +116,11 @@ type Loop struct {
 	mu      sync.Mutex // 只守入口边界（队列、运行标志），不守飞轮状态
 	queue   []message.Message
 	running bool
+	// sealed：本轮已在收敛判定时封口，Queue 拒收。与 running 分开：running
+	// 兼任「禁止并发 Run」的入口闸，要等 Run 返回才在 defer 清；而 Queue 的
+	// 收口必须发生在收敛判定的同一临界区，否则消息会挤进「已判空、未返回」
+	// 的缝隙（2026-09-28 审查修复）。
+	sealed bool
 
 	opCancel  atomic.Pointer[cancelBox] // 当前阻塞操作的 cancel（Interrupt 的靶点）
 	interrupt atomic.Bool
@@ -165,6 +172,7 @@ func (l *Loop) Run(parent context.Context, input []message.Message) (RunResult, 
 		return RunResult{}, ErrAlreadyRunning
 	}
 	l.running = true
+	l.sealed = false // 上一轮收敛时封的口，本轮入口重开
 	l.mu.Unlock()
 	defer func() {
 		l.mu.Lock()
@@ -176,6 +184,9 @@ func (l *Loop) Run(parent context.Context, input []message.Message) (RunResult, 
 	defer cancel()
 	l.interrupt.Store(false)
 	l.runID = newID()
+	// AgentStart 属于本轮第 0 轮。不复位会把上一轮结束时的计数值写进 durable
+	// 记录（Loop 是复用的：一个 Session 一个 Loop），同一 run 内 turn 自相矛盾。
+	l.turn = 0
 	l.messages = cloneMessages(input)
 
 	scope, _ := ctxx.ScopeFrom(parent)
@@ -187,9 +198,11 @@ func (l *Loop) Run(parent context.Context, input []message.Message) (RunResult, 
 		if end, err := l.preFlight(parent); end != "" {
 			return l.finish(end, turns, total, err)
 		}
-		l.drainQueue() // Run 前积压 / 轮间竞态到达的 steering 输入并入本轮
-		// 轮间 Interrupt 且无新输入：直接收敛为 EndInterrupted
-		if l.interrupt.Load() && l.queueLen() == 0 {
+		l.drainQueue() // 错误路径滞留的入队消息在此排空（Queue 已拒空闲入队）
+		// 轮间 Interrupt 且无新输入：直接收敛为 EndInterrupted。
+		// sealQuiet 与 Queue 的入队同锁互斥：收敛判定即封口，不存在
+		// 「已判空、未返回」间被入队挤入的缝隙。
+		if l.interrupt.Load() && l.sealQuiet() {
 			return l.finish(EndInterrupted, turns, total, nil)
 		}
 		turns++
@@ -220,22 +233,29 @@ func (l *Loop) Run(parent context.Context, input []message.Message) (RunResult, 
 		if perr := parent.Err(); perr != nil {
 			return l.finish(EndCancelled, turns, total, perr)
 		}
-		if l.interrupt.Load() && l.queueLen() == 0 {
+		if l.interrupt.Load() && l.sealQuiet() {
 			return l.finish(EndInterrupted, turns, total, nil)
 		}
-		// 本轮无工具调用、也没有新注入的输入 → 自然收敛
-		if len(msg.ToolCalls) == 0 && injected == 0 && l.queueLen() == 0 {
+		// 本轮无工具调用、也没有新注入的输入 → 自然收敛（sealQuiet 同上）
+		if len(msg.ToolCalls) == 0 && injected == 0 && l.sealQuiet() {
 			return l.finish(EndDone, turns, total, nil)
 		}
 		// 其余情况续轮：有工具结果待续 / 有新注入的输入待回答
 	}
 }
 
-// Queue 任意时刻入队，轮间注入为 user 消息。
-func (l *Loop) Queue(msg message.Message) {
+// Queue 往**正在进行的** Run 轮间注入 user 消息（steering）。运行未开始、
+// 已收敛或已返回时拒绝 ErrNoActiveRun：空闲入队会被下一次 Run 在其新输入
+// 之后排空，历史「后说的在前」且随记忆长留（06 §2）。「接受入队」与
+// 「结束运行」在同一临界区判定，先到先得。
+func (l *Loop) Queue(msg message.Message) error {
 	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.running || l.sealed {
+		return ErrNoActiveRun
+	}
 	l.queue = append(l.queue, msg.Clone())
-	l.mu.Unlock()
+	return nil
 }
 
 // Interrupt 取消当前 LLM 调用/工具执行，保留部分输出；队列有输入则续轮。
@@ -497,6 +517,20 @@ func (l *Loop) queueLen() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return len(l.queue)
+}
+
+// sealQuiet 在队列无积压时原子地封箱本轮入队口，返回 false 表示有积压。
+// 收敛路径（自然收敛 / Interrupt 收敛）必须经它同时完成「看空」与「封口」：
+// 若分两步，Queue 会挤进「已看空、未返回」的窗口，消息滞留到下一次 Run
+// 并排在其新输入之后（时序颠倒，2026-09-28 审查修复）。
+func (l *Loop) sealQuiet() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.queue) > 0 {
+		return false
+	}
+	l.sealed = true
+	return true
 }
 
 // partialAssistant 在 provider 违约（取消却无 MessageComplete）时兜底合成部分输出。

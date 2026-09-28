@@ -187,6 +187,27 @@ func TestAdapterRequestShape(t *testing.T) {
 	}
 }
 
+// 指针形态 Block 与值形态同为合法输入（CloneBlock 契约），toWire 必须一并接受。
+func TestAdapterPointerBlocks(t *testing.T) {
+	m := message.Message{Role: message.RoleUser, Blocks: []message.Block{
+		&message.TextBlock{Text: "看看这张"},
+		&message.ImageBlock{URL: "https://example.com/a.png", MIME: "image/png"},
+		&message.ThoughtBlock{Text: "不应回传"},
+		(*message.TextBlock)(nil),
+	}}
+	w, err := toWire(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts, ok := w.Content.([]wirePart)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("content parts: %+v", w.Content)
+	}
+	if parts[0].Text != "看看这张" || parts[1].ImageURL == nil || parts[1].ImageURL.URL != "https://example.com/a.png" {
+		t.Fatalf("parts: %+v", parts)
+	}
+}
+
 // 5xx → RetryableError → 飞轮退避重试后成功（02 §7）。
 func TestAdapterRetryOn5xx(t *testing.T) {
 	var failedOnce atomic.Bool
@@ -338,5 +359,94 @@ func TestLiveOpenAICompatible(t *testing.T) {
 		if d, ok := ev.Data.(loop.MessageEndData); ok && ev.Turn == res.Turns-1 {
 			t.Logf("final: %s", d.Message.Text())
 		}
+	}
+}
+
+// 服务端返回残缺的 tool_call arguments（模型输出非法 JSON 很常见）：
+// 必须在适配器层拦下——不合法参数绝不作为 ToolCall 流进领域模型（否则工具、
+// Guard、落盘、重放全部以「Args 是合法 JSON」为前提而被击穿）。
+func TestAdapterRejectsInvalidToolArguments(t *testing.T) {
+	srv := &sseServer{responses: []string{
+		sse(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"get_weather","arguments":"{\"city\": 北京}"}}]},"finish_reason":"tool_calls"}]}`),
+	}}
+	ts := httptest.NewServer(http.HandlerFunc(srv.handler))
+	defer ts.Close()
+
+	adapter := New(Config{BaseURL: ts.URL, APIKey: "k", Model: "m"})
+	ch, err := adapter.Stream(context.Background(), provider.Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotErr error
+	var retryable bool
+	var completed bool
+	for ev := range ch {
+		switch e := ev.(type) {
+		case provider.ErrorEvent:
+			gotErr, retryable = e.Err, e.Retryable
+		case provider.MessageComplete:
+			completed = true
+			if len(e.Message.ToolCalls) > 0 {
+				t.Fatalf("非法参数的 tool call 被放行：%+v", e.Message.ToolCalls)
+			}
+		}
+	}
+	if gotErr == nil {
+		t.Fatal("残缺 arguments 未被拦截")
+	}
+	if !retryable {
+		t.Error("应标记为可重试（未产出内容时 core 会退避重试，通常自愈）")
+	}
+	if !strings.Contains(gotErr.Error(), "不是合法 JSON") {
+		t.Fatalf("错误信息应说明原因：%v", gotErr)
+	}
+	if completed {
+		t.Error("报错后不应再产出 MessageComplete")
+	}
+}
+
+// 合法参数的正常路径不受影响（含空参数 → {}）。
+func TestAdapterAcceptsValidToolArguments(t *testing.T) {
+	srv := &sseServer{responses: []string{
+		sse(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"now","arguments":""}}]},"finish_reason":"tool_calls"}]}`),
+	}}
+	ts := httptest.NewServer(http.HandlerFunc(srv.handler))
+	defer ts.Close()
+
+	ch, err := New(Config{BaseURL: ts.URL, APIKey: "k", Model: "m"}).Stream(context.Background(), provider.Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for ev := range ch {
+		switch e := ev.(type) {
+		case provider.ErrorEvent:
+			t.Fatalf("合法/空参数不应报错：%v", e.Err)
+		case provider.MessageComplete:
+			if len(e.Message.ToolCalls) != 1 || string(e.Message.ToolCalls[0].Args) != "{}" {
+				t.Fatalf("tool calls = %+v", e.Message.ToolCalls)
+			}
+			return
+		}
+	}
+	t.Fatal("没有收到 MessageComplete")
+}
+
+// 畸形图片块（既无 URL 也无 Data）在本地就报错，而不是发个空 url 让服务端回 400。
+func TestAdapterRejectsEmptyImageBlock(t *testing.T) {
+	m := message.Message{Role: message.RoleUser, Blocks: []message.Block{message.ImageBlock{MIME: "image/png"}}}
+	if _, err := toWire(m); err == nil || !strings.Contains(err.Error(), "ImageBlock") {
+		t.Fatalf("err = %v, want 关于 ImageBlock 的显式错误", err)
+	}
+	// Data 形态仍正常转成 data: URI。
+	ok := message.Message{Role: message.RoleUser, Blocks: []message.Block{
+		message.ImageBlock{MIME: "image/png", Data: []byte{1, 2}},
+	}}
+	w, err := toWire(ok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := w.Content.([]wirePart)
+	if parts[0].ImageURL == nil || !strings.HasPrefix(parts[0].ImageURL.URL, "data:image/png;base64,") {
+		t.Fatalf("parts = %+v", parts)
 	}
 }

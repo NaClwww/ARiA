@@ -10,7 +10,7 @@
 
 | 字段 | 类型 | 首次写入 | 消费方 |
 |---|---|---|---|
-| Scope | `Scope{UserID, SessionID, AgentID, Namespace}` | 触发层 | 记忆隔离（SQL WHERE 条件）、日志、计费聚合 |
+| Scope | `Scope{UserID, SessionID, AgentID, Namespace}` | 触发层 | 记忆隔离（SQL WHERE 条件）、日志、计费聚合；UserID = 当次说话人（ingress 归主，03 §6） |
 | Trace | `Trace{TraceID, SpanID}` | 触发层（缺失自动生成） | 全链路日志 |
 | Credentials | 按 provider 的 key / MCP token | 业务层 | Provider 路由、MCP 桥透传 |
 | Budget | token/费用上限 + 原子扣减 | 业务层 | core 预算检查点 |
@@ -18,7 +18,7 @@
 
 ### 1.2 生命周期（与各层的契约，此处仅声明规则）
 
-- run ctx 的父级是 session 的长活上下文（由 runtime 持有，机制 M2 前定稿），**不是触发请求**——视频/语音长会话的前提；
+- run ctx 的父级是 session 的长活上下文（一实例一个长寿命 Session，runtime 持有，见 03 §5），**不是触发请求**——视频/语音长会话的前提；
 - 派生只允许收窄（cancel/timeout/deadline）；
 - 分离任务（异步落盘等）用 `context.WithoutCancel` 保留值、脱离取消，且必须记日志。
 

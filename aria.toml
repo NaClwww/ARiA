@@ -1,0 +1,44 @@
+# aria.toml —— 基准配置（人写；程序永不重写本文件，注释安全）
+#
+# 读取时机：**启动时读一次**。运行期的改动走网页设置面板——面板保存只写
+# aria.override.toml（机器文件），立即生效并持久化到下次启动；本文件作为基准，
+# 与 override 冲突时 override 优先（面板上每项显示「基准值 / 已覆盖」两态）。
+# 手改本文件后想生效：重启进程，或在面板点「重新读取」。
+
+[server]
+listen = "127.0.0.1:8080"      # 只绑本机；暴露局域网需显式修改（本口能触发 LLM 花费）
+
+[provider]
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-chat"
+api_key_env = "ARIA_API_KEY"   # key 本体永远在环境变量，不落任何文件
+
+[persona]
+# 二选一，file 优先
+system_prompt = ""
+system_prompt_file = ""        # 例："persona/default.md"
+
+[session]
+id = "aria"
+default_user = "user"
+
+[llm]                           # 热调区：网页面板改动立即生效（每请求 Options 覆盖）
+temperature = 0.7
+max_tokens = 2048
+
+[compress]
+strategy = "provider"           # provider（调 LLM 压成摘要）| keeplast（不调 LLM，只留最近 N 条）
+keep_last_n = 0                 # strategy = "keeplast" 时的条数；0 = 引擎默认
+# 将来会有第三个策略 twopart（软摘要 + 硬台账），届时这里加个名字即可
+# model = ""                    # provider 策略的模型覆盖；空 = 跟随 provider.model
+# instruction = ""              # provider 策略的提示词覆盖；空 = 默认提示词
+
+[tools]
+builtin = ["now", "lorem"]      # 演示工具；M4 接 ToolSource/MCP 后扩展
+
+[record]
+path = ""                       # 例："chat.jsonl"；空 = 不落盘
+
+[limits]
+max_turns = 0                   # 0 = 引擎默认（100）
+tool_timeout_ms = 30000         # 单个工具执行上限（毫秒）；0 = 不限时（挂死的工具会占住本轮，慎用）

@@ -1,0 +1,538 @@
+// Package agent 是 runtime 的总装（docs/03 §5）：Agent 是装配零件盒，
+// Session 是一实例一个的长寿命容器——压缩记忆 + 飞轮 + 落盘订阅。
+//
+// 主线（v1）：Input(msg) → 窗口组装 → core.Run → 等本轮结算 → 返回。
+// 尚未接入：ingress 成轮（随语音，03 §6）、小轮/抢话（03 §7）、投机（05 G0）。
+//
+// 「不分会话」：一个伴侣实例通常只建一个 Session，从启动活到关闭；
+// 对话边界由话题判终承担，不由会话生命周期承担。
+package agent
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"sync"
+	"time"
+
+	"aria/core/loop"
+	"aria/core/provider"
+	"aria/core/tool"
+	"aria/pkg/ctxx"
+	"aria/pkg/message"
+	"aria/runtime/artifact"
+	"aria/runtime/persist"
+	"aria/runtime/toolkit"
+	"aria/runtime/window"
+)
+
+var (
+	// ErrSessionClosed 表示会话已关闭，不再接受新输入/排队。
+	ErrSessionClosed = errors.New("agent: session closed")
+	// ErrNoActiveRun 表示当前没有在途轮次，Queue 被拒（Queue 是轮间转向，不是发起轮次）。
+	ErrNoActiveRun = errors.New("agent: no run in flight (Queue only injects into a running turn; use Input to start one)")
+	// ErrStreamClosed 表示内部事件流意外中断（会话未关闭，但消费链断了）。
+	ErrStreamClosed = errors.New("agent: event stream closed unexpectedly")
+)
+
+// DefaultCloseGrace 是 Close 等待落盘排空的默认上限。
+const DefaultCloseGrace = 2 * time.Second
+
+type Config struct {
+	Provider provider.Provider
+	Tools    []tool.Tool
+
+	// Compressor 是间隙压缩实现；nil → window.KeepLast(window.DefaultKeepLast)。
+	// 默认实现只保留最近若干条（静默丢弃更早内容）——要「记住更早的事」，
+	// 显式接 window.ProviderCompressor 之类的摘要实现。
+	Compressor window.Compressor
+
+	// Store 是可选的会话历史落盘（v1 只写不恢复）；nil → 不落盘。
+	// 实现必须尊重 ctx 取消，否则关停时尾部事件可能写不完（见 CloseGrace）。
+	Store persist.Store
+
+	// CloseGrace 是 Close 等待落盘排空的上限；0 → DefaultCloseGrace。
+	// 超时后取消落盘（尊重 ctx 的实现会立刻返回），并记一条 warn。
+	CloseGrace time.Duration
+
+	// Assembler 是 core 槽 1 的额外变换，作用在窗口组装结果之上（可空）。
+	Assembler loop.Assembler
+	Guard     loop.ToolGuard
+
+	// SystemPrompt 是每轮置顶的 system 内容（人设/规则）。建议把
+	// window.TagPolicyInstruction 一并写入——标签需要声明才有效（03 §5）。
+	SystemPrompt string
+
+	// ToolResultLimit 是单个工具结果的文本字符上限（rune）：超过则全文存入
+	// Artifacts，只把「预览 + 引用」喂回模型（03 §1 artifact+ref stack）。
+	// 0 → toolkit.DefaultLimit（4000）；负数 → 关闭截断。
+	ToolResultLimit int
+
+	// Artifacts 是超长工具结果的存放处；启用截断且为 nil 时用内存实现
+	// （artifact.NewMemory(DefaultArtifactEntries)，FIFO 淘汰）。
+	Artifacts artifact.Store
+
+	MaxTurns    int
+	ToolTimeout time.Duration
+
+	// SubscribeBuffer 是每个内部订阅者的缓冲；0 → 256。
+	SubscribeBuffer int
+
+	Logger *slog.Logger
+}
+
+// DefaultArtifactEntries 是默认内存 artifact 存储的条数上限（FIFO 淘汰）。
+const DefaultArtifactEntries = 64
+
+// Agent 是 Setup 的产物：纯零件盒，不持会话状态。
+type Agent struct {
+	cfg        Config
+	compressor window.Compressor
+	artifacts  artifact.Store
+	toolLimit  int // 0 = 关闭截断
+	buf        int
+	grace      time.Duration
+	log        *slog.Logger
+}
+
+func New(cfg Config) (*Agent, error) {
+	if cfg.Provider == nil {
+		return nil, errors.New("agent: Provider is required")
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	compressor := cfg.Compressor
+	if compressor == nil {
+		compressor = window.KeepLast(window.DefaultKeepLast)
+	}
+	buf := cfg.SubscribeBuffer
+	if buf <= 0 {
+		buf = 256
+	}
+	grace := cfg.CloseGrace
+	if grace <= 0 {
+		grace = DefaultCloseGrace
+	}
+	// 工具结果截断：负数关闭；启用时必须有存放处（否则宁可长也不丢）。
+	toolLimit := cfg.ToolResultLimit
+	if toolLimit == 0 {
+		toolLimit = toolkit.DefaultLimit
+	}
+	store := cfg.Artifacts
+	if toolLimit > 0 && store == nil {
+		store = artifact.NewMemory(DefaultArtifactEntries)
+	}
+	if toolLimit < 0 {
+		toolLimit = 0
+	}
+	return &Agent{
+		cfg:        cfg,
+		compressor: compressor,
+		artifacts:  store,
+		toolLimit:  toolLimit,
+		buf:        buf,
+		grace:      grace,
+		log:        cfg.Logger,
+	}, nil
+}
+
+// buildTools 组装本会话的工具表（registry 全局包装，03 §3 挂点 5）：
+// 启用截断时注册 artifact.open 读取工具，并对其他工具套上结果截断装饰器。
+// 读取工具自身不截断——否则「读大块」永远读不完。
+func (a *Agent) buildTools() []tool.Tool {
+	tools := append([]tool.Tool(nil), a.cfg.Tools...)
+	if a.toolLimit <= 0 || a.artifacts == nil {
+		return tools
+	}
+	hasOpen := false
+	for _, t := range tools {
+		if t.Def().Name == artifact.OpenToolName {
+			hasOpen = true
+			break
+		}
+	}
+	if !hasOpen {
+		tools = append(tools, artifact.OpenTool(a.artifacts))
+	} else {
+		a.log.Warn("agent: tool name already taken, auto artifact reader skipped",
+			"name", artifact.OpenToolName)
+	}
+	wrap := toolkit.Truncate(toolkit.TruncateConfig{Store: a.artifacts, Limit: a.toolLimit})
+	for i, t := range tools {
+		if t.Def().Name == artifact.OpenToolName {
+			continue
+		}
+		tools[i] = wrap(t)
+	}
+	return tools
+}
+
+// NewSession 建一个长寿命会话。scope 必填（01 R4 fail-closed）：
+// SessionID 是会话锚点（不可被单次输入改写），UserID 是初始说话人；
+// 单次 Input 的 ctx 可以用自己的 UserID 覆盖它（03 §6：当次 Input 的
+// UserID = 说话人，多人共享一个 Session）。
+func (a *Agent) NewSession(scope ctxx.Scope) (*Session, error) {
+	if !scope.Valid() {
+		return nil, loop.ErrNoScope
+	}
+	l, err := loop.New(loop.Config{
+		Provider:    a.cfg.Provider,
+		Tools:       a.buildTools(),
+		Assembler:   a.cfg.Assembler,
+		Guard:       a.cfg.Guard,
+		MaxTurns:    a.cfg.MaxTurns,
+		ToolTimeout: a.cfg.ToolTimeout,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// 会话长活 ctx：携带身份与 Trace。它也是本会话所有 run ctx 的生存期锚点
+	// （01 §1.2：run ctx 的父级是 session，不是触发请求）。
+	base, _ := ctxx.EnsureTrace(context.Background())
+	base, cancel := context.WithCancel(ctxx.WithScope(base, scope))
+	win := window.New(a.compressor, a.log)
+	win.SetSystem(a.cfg.SystemPrompt)
+	s := &Session{
+		loop:   l,
+		win:    win,
+		scope:  scope,
+		ctx:    base,
+		cancel: cancel,
+		closed: make(chan struct{}),
+		dead:   make(chan struct{}),
+		grace:  a.grace,
+		log:    a.log,
+	}
+
+	// 窗口订阅：durable 消息事件进本轮缓冲，AgentEnd 结算进窗口（03 §5）。
+	ch, unsub := l.Subscribe(a.buf)
+	s.unsubs = append(s.unsubs, unsub)
+	s.wg.Add(1)
+	go s.consumeWindow(ch)
+
+	// 可选落盘：自己一条订阅 + 单 goroutine 顺序写（03 §1 存储分账）。
+	// 落盘用独立 ctx——会话 ctx 在 Close 早期就被取消（用于终止在途轮），
+	// 落盘还要把总线里已排队的事件排空，不能跟着一起死。
+	if a.cfg.Store != nil {
+		rec, err := persist.New(a.cfg.Store, a.log)
+		if err != nil {
+			s.Close()
+			return nil, err
+		}
+		pch, punsub := l.Subscribe(a.buf)
+		s.unsubs = append(s.unsubs, punsub)
+		pbase, _ := ctxx.EnsureTrace(context.Background())
+		pctx, pcancel := context.WithCancel(ctxx.WithScope(pbase, scope))
+		s.persistDone = make(chan struct{})
+		s.persistCancel = pcancel
+		go func() {
+			defer close(s.persistDone)
+			// 消费者退出即摘除订阅：死订阅者会继续被克隆事件、积压到总线
+			// 上限才断开（bus overflowCap），并让「durable 不丢」静默失效。
+			defer punsub()
+			err := rec.Consume(pctx, scope.SessionID, pch)
+			switch {
+			case err != nil && pctx.Err() == nil:
+				s.log.Error("agent: persist stopped", "session", scope.SessionID, "err", err)
+				s.fail(err)
+			case err == nil && !s.isClosed():
+				// 会话没关但流断了：总线判定订阅者停滞并把我们断开，
+				// durable 承诺已破，必须让宿主看见（不能静默）。
+				s.log.Error("agent: persist stream closed unexpectedly", "session", scope.SessionID)
+				s.fail(ErrStreamClosed)
+			}
+		}()
+	}
+	return s, nil
+}
+
+// Session 是一个会话的全部运行时状态。并发安全：Input 之间互斥（03 §5）。
+type Session struct {
+	loop   *loop.Loop
+	win    *window.Window
+	scope  ctxx.Scope
+	ctx    context.Context
+	cancel context.CancelFunc
+	closed chan struct{}
+	dead   chan struct{} // 内部消费链意外中断（事件流断开等）
+	once   sync.Once
+	deadOn sync.Once
+	grace  time.Duration
+	unsubs []func()
+	wg     sync.WaitGroup
+	log    *slog.Logger
+
+	persistDone   chan struct{}
+	persistCancel context.CancelFunc
+
+	runMu sync.Mutex // 一 Session 同时只跑一轮
+
+	mu       sync.Mutex
+	inputBuf []message.Message // 本轮的触发输入（Input 写入，结算时消费）
+	turnBuf  []message.Message // 本轮产出（消息事件累积）
+	turnCtx  context.Context   // 本轮 run ctx（压缩继承其身份）
+	runEnd   chan struct{}     // 本轮已结算的信号
+	err      error             // 首个后台错误
+}
+
+// Input 阻塞跑完一轮：组装 → core.Run → 等本轮结算进窗口 → 返回。
+//
+// 返回即保证本轮已进入窗口（会话关闭或消费链断裂除外）：不存在「提前返回
+// 留下未结算轮次」的路径——否则下一次 Input 会覆盖未结算的缓冲，导致整轮
+// 历史永久丢失（审查发现的 P0）。
+//
+// 宿主 ctx 的值（Scope/Credentials/Budget/Options/Trace）随本轮进入 core 与压缩；
+// 宿主取消或会话关闭都会终止本轮（见 runContext）。
+func (s *Session) Input(ctx context.Context, msg message.Message) (loop.RunResult, error) {
+	s.runMu.Lock()
+	defer s.runMu.Unlock()
+
+	if err := s.checkOpen(); err != nil {
+		return loop.RunResult{}, err
+	}
+
+	runCtx, cancel := s.runContext(ctx)
+	defer cancel()
+	done := s.beginTurn(runCtx, msg)
+
+	input := s.win.Assemble([]message.Message{msg})
+	res, err := s.loop.Run(runCtx, input)
+
+	select {
+	case <-done:
+	case <-s.closed:
+		// 关停：不再保证已结算（窗口即将废弃，durable 已由落盘链负责）
+	case <-s.dead:
+		// 消费链断裂：停止等待（本轮自身的结果与错误照常返回，
+		// 后台故障经 Err() 暴露；后续 Input 会被 checkOpen 拒绝）。
+	}
+	return res, err
+}
+
+// Queue 把消息注入**正在进行的** Run 的轮间（core steering），事件记为
+// UserMessageInjected；空闲或本轮已判定结束时拒绝并返回 ErrNoActiveRun
+// （宿主改用 Input 起一轮）。会话已关闭时返回 ErrSessionClosed。
+//
+// 为什么空闲要拒绝（不只是洁癖）：空闲入队的消息会在**下一次** Run 的入口被排空，
+// 而窗口结算按「本轮输入 + 本轮产出」记序，于是它落到那条新输入**之后**——历史
+// 变成「后说的在前」，与 06 §2「多插头谁先来谁先进」相悖，且错误顺序会随记忆
+// 长期留着。
+//
+// 判据在 core 的运行标志（与收敛判定同锁原子），Run 一返回即拒绝。旧实现用
+// runMu.TryLock 推断在途——模型循环结束后的历史结算等待期 Input 仍持锁，
+// 此窗口内 Queue 误收，消息滞留到下一次 Input 且排在其输入之后
+// （2026-09-28 审查修复）。
+func (s *Session) Queue(msg message.Message) error {
+	if err := s.checkOpen(); err != nil {
+		return err
+	}
+	if err := s.loop.Queue(msg); err != nil {
+		return ErrNoActiveRun
+	}
+	return nil
+}
+
+// Interrupt 取消当前 LLM/工具/Guard 等待，保留部分输出（02 §6 转向语义）。
+func (s *Session) Interrupt() { s.loop.Interrupt() }
+
+// Subscribe 订阅本会话事件流：volatile 增量给渲染（TTS 边收边播），
+// durable 供审计与其他消费者；cancel 退订并关闭 channel。
+func (s *Session) Subscribe(buf int) (<-chan loop.Event, func()) { return s.loop.Subscribe(buf) }
+
+// Artifacts 暴露超长工具结果的存放处（宿主可自行读回或预置内容）。
+func (a *Agent) Artifacts() artifact.Store { return a.artifacts }
+
+// History 返回窗口当前内容的只读快照（记忆含在途 + 近轮）。
+// v1 无窗口命令（03 §5）：宿主只能看，不能据此改窗口。
+func (s *Session) History() (memory, recent []message.Message) { return s.win.Snapshot() }
+
+// SetCompressor 热替换压缩策略（03 §5 组装层的零件位）：在途压缩用旧实现跑完、
+// 结果照常落下，下一个轮间隙用新的。网页面板改策略后由宿主调它——不重启、
+// 不丢在途结果。
+func (s *Session) SetCompressor(c window.Compressor) { s.win.SetCompressor(c) }
+
+// WaitCompress 等待在途压缩结束（测试与关停观察用）。
+func (s *Session) WaitCompress() { s.win.Wait() }
+
+// Err 返回首个后台错误（落盘失败、事件流意外断开等）；nil = 一切正常。
+// 后台故障不中断对话（对话继续在窗口里推进），但必须能被宿主看见。
+func (s *Session) Err() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
+// Close 关闭会话，幂等。顺序与保证：
+//
+//  1. 关 closed —— 新输入立即失败，在途 Input 不再死等
+//  2. Interrupt  —— 尽力让在途轮优雅收敛为部分输出
+//  3. 取消会话 ctx —— 硬保证：在途 run ctx 随之取消（Interrupt 可能被
+//     core.Run 入口重置，不能作为终止保证；core 的 interrupt 是转向语义）
+//  4. 等在途 Input 退出
+//  5. 退订 —— 总线把已排队事件投递完再关闭 channel
+//  6. 有界等落盘排空（CloseGrace），超时则取消落盘并 warn
+//  7. 等内部消费者收尾、取消并等在途压缩
+func (s *Session) Close() error {
+	s.once.Do(func() {
+		close(s.closed)
+		s.loop.Interrupt()
+		s.cancel()
+
+		s.runMu.Lock()
+		s.runMu.Unlock()
+
+		for _, u := range s.unsubs {
+			u()
+		}
+		if s.persistDone != nil {
+			select {
+			case <-s.persistDone:
+			case <-time.After(s.grace):
+				s.log.Warn("agent: persist drain timed out; tail events may be unsaved",
+					"session", s.scope.SessionID, "grace", s.grace)
+				s.persistCancel()
+			}
+		}
+		s.wg.Wait()
+		s.win.Close()
+	})
+	return nil
+}
+
+// ---------- 内部 ----------
+
+func (s *Session) isClosed() bool {
+	select {
+	case <-s.closed:
+		return true
+	default:
+		return false
+	}
+}
+
+// checkOpen 报告会话是否还能接受新输入：已关闭 → ErrSessionClosed；
+// 消费链已断（窗口再也不会结算）→ ErrStreamClosed，不能继续无声降级。
+func (s *Session) checkOpen() error {
+	if s.isClosed() {
+		return ErrSessionClosed
+	}
+	select {
+	case <-s.dead:
+		return ErrStreamClosed
+	default:
+		return nil
+	}
+}
+
+// fail 记录首个后台错误并唤醒等待者（dead 只关一次）。
+func (s *Session) fail(err error) {
+	s.mu.Lock()
+	if s.err == nil {
+		s.err = err
+	}
+	s.mu.Unlock()
+	s.deadOn.Do(func() { close(s.dead) })
+}
+
+// runContext 组装本轮 run ctx：值全部来自宿主 ctx（Scope/Credentials/Budget/
+// Options/Trace 因此照常可用），生存期同时挂在会话长活 ctx 上——会话关闭能
+// 终止本轮（01 §1.2）。Scope 的 SessionID 由会话锚定，UserID 允许当次覆盖
+// （03 §6：当次 Input 的 UserID = 说话人）。
+func (s *Session) runContext(host context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(host)
+	stop := context.AfterFunc(s.ctx, cancel)
+	return ctxx.WithScope(ctx, mergeScope(s.scope, ctx)), func() {
+		stop()
+		cancel()
+	}
+}
+
+func mergeScope(session ctxx.Scope, ctx context.Context) ctxx.Scope {
+	out := session
+	if host, ok := ctxx.ScopeFrom(ctx); ok {
+		if host.UserID != "" {
+			out.UserID = host.UserID
+		}
+		if host.AgentID != "" {
+			out.AgentID = host.AgentID
+		}
+	}
+	return out
+}
+
+func (s *Session) beginTurn(ctx context.Context, msg message.Message) <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 深拷贝：inputBuf 存活到 settle，不能持有调用方的切片底层（01 §2）。
+	s.inputBuf = []message.Message{msg.Clone()}
+	s.turnBuf = nil
+	s.turnCtx = ctx
+	s.runEnd = make(chan struct{})
+	return s.runEnd
+}
+
+func (s *Session) consumeWindow(ch <-chan loop.Event) {
+	defer s.wg.Done()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				if !s.isClosed() {
+					// 会话没关但事件流断了：窗口再也不会结算，
+					// 必须唤醒在途 Input 并让宿主看见（否则永久等待）。
+					s.log.Error("agent: window stream closed unexpectedly", "session", s.scope.SessionID)
+					s.fail(ErrStreamClosed)
+				}
+				return
+			}
+			s.handleEvent(ev)
+		}
+	}
+}
+
+// handleEvent 只认「进历史的 durable 消息」与本轮结束：
+// MessageEnd → assistant 消息；ToolExecEnd → tool 消息（含被拒结果）；
+// UserMessageInjected → 轮间注入的用户输入；AgentEnd → 结算本轮进窗口。
+// core 只发值形态（见 core/loop 的 emit 调用点），指针形态不在此处理。
+func (s *Session) handleEvent(ev loop.Event) {
+	switch d := ev.Data.(type) {
+	case loop.MessageEndData:
+		s.appendTurn(d.Message)
+	case loop.ToolExecEndData:
+		s.appendTurn(d.Result.ToMessage())
+	case loop.UserMessageInjectedData:
+		s.appendTurn(d.Message)
+	case loop.AgentEndData:
+		s.settle()
+	}
+}
+
+func (s *Session) appendTurn(m message.Message) {
+	s.mu.Lock()
+	s.turnBuf = append(s.turnBuf, m)
+	s.mu.Unlock()
+}
+
+func (s *Session) settle() {
+	s.mu.Lock()
+	turn := make([]message.Message, 0, len(s.inputBuf)+len(s.turnBuf))
+	turn = append(turn, s.inputBuf...)
+	turn = append(turn, s.turnBuf...)
+	ctx := s.turnCtx
+	s.inputBuf, s.turnBuf, s.turnCtx = nil, nil, nil
+	done := s.runEnd
+	s.runEnd = nil
+	s.mu.Unlock()
+
+	if ctx == nil {
+		ctx = s.ctx // 兜底：没有触发 ctx 时用会话 ctx（身份为会话自身）
+	}
+	s.win.Settle(ctx, turn)
+	if done != nil {
+		close(done)
+	}
+}

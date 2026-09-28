@@ -15,9 +15,9 @@
 | `Interrupt()` | 取消当前 LLM 调用/工具执行/Guard 等待，保留部分输出，可续 |
 | `Subscribe(buf)` | 事件订阅（channel + 分级丢弃；退订/停滞断开时关闭 channel） |
 
-**core 没有也不需要投机/预测入口**：`Run` 无状态（每次由调用方传完整历史），「用预测输入提前生成、确认后复用」整体归 runtime（`runtime/speculate`，见 03 §4）——core 不为预测增加任何 API。
+**core 没有也不需要投机/预测入口**：`Run` 无状态（每次由调用方传完整历史），「用预测输入提前生成、确认后复用」整体归 runtime（`runtime/speculate`，见 03 §4）——core 不为预测增加任何 API。**该能力已实现但优先级最低、v1 不接入**（2026-09-11）。
 
-**三方纪律**：runtime 不得直接读写 loop 状态，只经入口；loop 不做磁盘 I/O（持久化 = runtime 订阅 durable 事件，事件溯源）；工具/Provider 的 I/O 阻塞飞轮 goroutine 允许，但必须尊重 ctx 取消。多 session = 多飞轮并行（actor 模型）。
+**三方纪律**：runtime 不得直接读写 loop 状态，只经入口；loop 不做磁盘 I/O（持久化 = runtime 订阅 durable 事件，事件溯源）；工具/Provider 的 I/O 阻塞飞轮 goroutine 允许，但必须尊重 ctx 取消。多实例（多伴侣）= 多飞轮并行；单实例内 v1 一 Session 同时只跑一轮（03 §5）。
 
 ## 2. 一次 Run 的展开
 
@@ -63,7 +63,7 @@ func (l *Loop) Run(parent context.Context, input []Message) (RunResult, error) {
 
 **durable**：载荷完整、存活订阅者内不丢——runtime 靠它完整重建会话历史（事件溯源是「loop 零磁盘」的前提）。**volatile**：仅渲染用，缓冲满即合并/替换；MessageEnd 永远带全文，丢增量无损。
 
-**事件溯源重建**：runtime 按序消费 durable 事件即可 1:1 还原会话——AgentStart → 初始输入；UserMessageInjected → 轮间注入；MessageEnd → assistant 消息；ToolExecEnd → tool 消息（含被拒结果）；ToolGuardDecision → 审计轨迹。
+**事件溯源重建**：runtime 按序消费 durable 事件即可 1:1 还原会话——AgentStart → 初始输入；UserMessageInjected → 轮间注入；MessageEnd → assistant 消息；ToolExecEnd → tool 消息（含被拒结果）；ToolGuardDecision → 审计轨迹。**这是 core 侧保证的能力**：runtime 的 persist 因此只需订阅落盘（v1 只写不恢复，03 §5；跨天续聊由压缩摘要持久化支撑）。
 
 ### 3.2 总线纪律
 
@@ -101,7 +101,7 @@ type Tool interface {
 
 | 动作 | 行为 |
 |---|---|
-| `Queue` | 任意时刻入队，轮间（工具执行完、下次 LLM 调用前）追加为 user 消息 |
+| `Queue` | 运行中入队（轮间：工具执行完、下次 LLM 调用前追加为 user 消息）；空闲/已收敛时返回 `ErrNoActiveRun`——入队与收敛判定同锁原子 |
 | `Interrupt` | cancel 当前调用 → 保留部分 assistant 消息 → 队列有输入则续轮，否则 EndInterrupted |
 | parent 取消 | 硬终止 EndCancelled，不尝试续跑 |
 

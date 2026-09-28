@@ -1,7 +1,7 @@
 # 草稿 · ContextWindow 与非线性规划（未定稿）
 
 > 2026-08-27 从 03-context-build 降级为草稿：细节超前于共识深度，**M3 前重新讨论定稿**（05 清单 G2）。
-> 已定共识仅三句：ContextWindow 是一等可编程状态；非线性发生在选择而非呈现；ContextSource 契约（Collect/Observe）。以下为草稿细节。
+> 已定共识：ContextWindow 是一等可编程状态；非线性发生在选择而非呈现；ContextSource 契约（Collect/Observe）；**v1 每轮组装模型**（压缩记忆+当前感知+新输入 + 间隙异步压缩，03 §5）。以下为非线性 Planner 的草稿细节，届时在其上扩展。
 
 ## ContextWindow（状态设计草稿）
 
