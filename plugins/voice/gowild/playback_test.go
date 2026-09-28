@@ -1,4 +1,4 @@
-package main
+package gowild
 
 import (
 	"context"
@@ -13,7 +13,33 @@ import (
 )
 
 // 回归：播放闸门份额从「TTS 请求发出」即持有——正文生成完到音频开始
-// 之间的合成排队期（RVC 忙时以十秒计），灯与输入闸门不允许掉下去。
+// 之间的合成排队期（RVC 忙时以十秒计），宿主的灯与输入闸门不允许掉下去。
+
+// testGate 是 Gate 的最小实现（计数），代替宿主的 speakingGate。
+type testGate struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (g *testGate) Acquire() {
+	g.mu.Lock()
+	g.n++
+	g.mu.Unlock()
+}
+
+func (g *testGate) Release() {
+	g.mu.Lock()
+	if g.n > 0 {
+		g.n--
+	}
+	g.mu.Unlock()
+}
+
+func (g *testGate) held() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.n > 0
+}
 
 func wavHeader(t *testing.T, rate, channels, dataLen int) []byte {
 	t.Helper()
@@ -34,7 +60,7 @@ func wavHeader(t *testing.T, rate, channels, dataLen int) []byte {
 	return h
 }
 
-// gateSink 只为闸门测试服务：排空即放行（drained 预先关闭）。
+// gateSink 只为闸门测试服务：排空即放行。
 type gateSink struct {
 	mu      sync.Mutex
 	written int
@@ -42,6 +68,8 @@ type gateSink struct {
 }
 
 func (f *gateSink) begin() error { return nil }
+func (f *gateSink) stop()        {}
+func (f *gateSink) waitDrain()   {}
 func (f *gateSink) write(p []byte) error {
 	f.mu.Lock()
 	f.written += len(p)
@@ -54,8 +82,6 @@ func (f *gateSink) end() error {
 	f.mu.Unlock()
 	return nil
 }
-func (f *gateSink) stop()      {}
-func (f *gateSink) waitDrain() {}
 
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
@@ -80,14 +106,18 @@ func TestGateHeldThroughSynthesisQueue(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	sink := &gateSink{}
-	gate := &speakingGate{}
-	d := &ttsDriver{
-		base: srv.URL, log: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		hc: &http.Client{}, gate: gate,
-		newSink: func(context.Context, int, int) audioSink { return sink },
+	gate := &testGate{}
+	tts := &TTS{
+		cfg:  TTSConfig{Base: srv.URL},
+		log:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		hc:   &http.Client{},
+		gate: gate,
+		newSink: func(context.Context, int, int) audioSink {
+			return sink
+		},
 	}
 
-	p, err := startPlayback(d.base, d.hc, d.log, d.newSink, gate)
+	p, err := startPlayback(tts.cfg.Base, tts.hc, tts.log, tts.newSink, gate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,12 +126,12 @@ func TestGateHeldThroughSynthesisQueue(t *testing.T) {
 
 	// 关键断言：请求已发出、音频还没来（400ms 排队中），闸门必须已持有。
 	time.Sleep(100 * time.Millisecond)
-	if !gate.active() {
+	if !gate.held() {
 		t.Fatal("合成排队期闸门未持有（灯会提前掉回待机）")
 	}
 
 	// 音频送达并排空后正常放行。
-	waitFor(t, "播放完成", func() bool { return !gate.active() })
+	waitFor(t, "播放完成", func() bool { return !gate.held() })
 	sink.mu.Lock()
 	written, ended := sink.written, sink.ended
 	sink.mu.Unlock()

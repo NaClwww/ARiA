@@ -111,12 +111,12 @@ func TestLightStateTransitions(t *testing.T) {
 	assertLastPost(t, rec, [3]int{0x00, 0xa0, 0x00})
 
 	// 闸门激活 → 思考（蓝）优先于 partial
-	gate.acquire()
+	gate.Acquire()
 	l.evaluate(gate)
 	assertLastPost(t, rec, [3]int{0x20, 0x50, 0xff})
 
 	// 闸门释放但 partial 仍在窗口内 → 收听
-	gate.release()
+	gate.Release()
 	l.evaluate(gate)
 	assertLastPost(t, rec, [3]int{0x00, 0xa0, 0x00})
 
@@ -144,7 +144,7 @@ func TestLightFailureBackoff(t *testing.T) {
 	if n := len(rec.posts()); n != 1 {
 		t.Fatalf("退避期内不应重试，共 %d 次", n)
 	}
-	gate.acquire() // 目标变了：立即尝试新目标
+	gate.Acquire() // 目标变了：立即尝试新目标
 	l.evaluate(gate)
 	if n := len(rec.posts()); n != 2 {
 		t.Fatalf("新目标应尝试，共 %d 次", n)
