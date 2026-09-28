@@ -106,6 +106,9 @@ func NewEngine(opts Options) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("人设加载失败: %w", err)
 	}
+	// 说话人标注声明无条件追加（自定义人设也不例外）：[名字] 前缀是
+	// Sink 的投递格式，不是人设的风格选择——不声明模型就不认得这个标记。
+	systemPrompt += "\n" + SpeakerInstruction(cfg.Session.DefaultUser)
 
 	var store persist.Store
 	var jsonlStore *jsonl.Store

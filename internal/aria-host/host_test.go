@@ -37,3 +37,28 @@ func TestTruncStr(t *testing.T) {
 		t.Errorf("rune 截断不符：%q", got)
 	}
 }
+
+func TestTagSpeakerRoundTrip(t *testing.T) {
+	// 统一前缀：默认说话人也带标记（模型只见同一种格式）
+	if got := TagSpeaker("user", "你好"); got != "[user] 你好" {
+		t.Fatalf("TagSpeaker(user) = %q", got)
+	}
+	if got := TagSpeaker("nacl", "早"); got != "[nacl] 早" {
+		t.Fatalf("TagSpeaker(nacl) = %q", got)
+	}
+	// stdin 的 [名字] 解析与标注互为往返
+	sp, text := SplitSpeaker("[nacl] 早", "user")
+	if sp != "nacl" || text != "早" {
+		t.Fatalf("SplitSpeaker = %q,%q", sp, text)
+	}
+	if TagSpeaker(sp, text) != "[nacl] 早" {
+		t.Fatal("往返不一致")
+	}
+}
+
+func TestSpeakerInstruction(t *testing.T) {
+	inst := SpeakerInstruction("user")
+	if !strings.Contains(inst, "[user]") {
+		t.Fatalf("声明应含默认说话人：%q", inst)
+	}
+}
