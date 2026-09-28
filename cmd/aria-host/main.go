@@ -21,6 +21,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -60,6 +61,7 @@ func main() {
 		noASR        = flag.Bool("no-asr", false, "停用 ASR 插头（纯终端开发）")
 		noStdin      = flag.Bool("no-stdin", false, "停用 stdin 插头（纯语音）")
 		noTTS        = flag.Bool("no-tts", false, "停用 TTS 播放（只看文字）")
+		device       = flag.String("device", "", "launcher 控制面地址，TTS 从设备出声（如 http://127.0.0.1:18900）；空 = 本机 paplay")
 		apiKey       = flag.String("api-key", "", "API key；空则按配置的 api_key_env 读环境变量")
 	)
 	flag.Parse()
@@ -153,7 +155,7 @@ func main() {
 	if !*noTTS {
 		ttsCh, u := sess.Subscribe(0)
 		ttsUnsub = u
-		d := newTTSDriver(*backend, log)
+		d := newTTSDriver(*backend, *device, log)
 		done := make(chan struct{})
 		ttsDone = done
 		go func() {
@@ -374,11 +376,20 @@ func (p *asrPlug) consume(ctx context.Context) (connected bool, err error) {
 	return true, errors.New("sse stream closed by server")
 }
 
-// ---------- TTS 驱动：事件流 → /tts/stream_input → paplay ----------
+// ---------- TTS 驱动：事件流 → /tts/stream_input → 播放 sink ----------
 
 // wavHeaderLen 是 backend 流式响应开头的 WAV 头长度（PCM16 单声道，RIFF
-// 占位长度）；剥掉后喂 paplay --raw。
+// 占位长度）；剥掉后按 raw PCM 送播放 sink。
 const wavHeaderLen = 44
+
+// audioSink 是 TTS 音频的去处：每条 assistant 消息一个 sink 实例。
+// write 的阻塞即播放背压（paplay 管道满 / 设备端队列满），反压整条链。
+type audioSink interface {
+	begin() error
+	write(pcm []byte) error
+	end() error // 输入收口：排空自然收尾
+	stop()      // 立即掐断（幂等，可与 write 并发调用）
+}
 
 // ttsDriver 是事件流的第二个消费者（06：一切服务都是事件订阅者）：assistant
 // 的文本增量直接透传给 backend 的流式 TTS——其 StreamingSession.feed 内部
@@ -392,17 +403,24 @@ type ttsDriver struct {
 	base    string
 	log     *slog.Logger
 	hc      *http.Client
+	newSink func() audioSink
 	current *ttsPlayback
 }
 
-func newTTSDriver(base string, log *slog.Logger) *ttsDriver {
-	return &ttsDriver{
-		base: strings.TrimSuffix(base, "/"),
-		log:  log,
-		hc: &http.Client{Transport: &http.Transport{
-			DialContext: (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
-		}},
+func newTTSDriver(backend, device string, log *slog.Logger) *ttsDriver {
+	hc := &http.Client{Transport: &http.Transport{
+		DialContext: (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
+	}}
+	d := &ttsDriver{base: strings.TrimSuffix(backend, "/"), log: log, hc: hc}
+	if device != "" {
+		dev := strings.TrimSuffix(device, "/")
+		d.newSink = func() audioSink { return &deviceSink{base: dev, hc: hc, log: log} }
+		log.Info("tts: 设备端播放", "device", dev)
+	} else {
+		d.newSink = func() audioSink { return &paplaySink{} }
+		log.Info("tts: 本机播放（paplay）")
 	}
+	return d
 }
 
 // run 是单消费者事件循环：全部状态 confinement 在本 goroutine，无锁。
@@ -436,11 +454,7 @@ func (d *ttsDriver) run(ch <-chan loop.Event) {
 
 func (d *ttsDriver) start() {
 	d.stop()
-	if _, err := exec.LookPath("paplay"); err != nil {
-		d.log.Error("tts: 找不到 paplay，本轮起静音（--no-tts 可关掉本告警）", "err", err)
-		return
-	}
-	p, err := startPlayback(d.base, d.hc, d.log)
+	p, err := startPlayback(d.base, d.hc, d.log, d.newSink())
 	if err != nil {
 		d.log.Error("tts: 启动失败（本条静音，文字照常）", "err", err)
 		return
@@ -462,36 +476,29 @@ func (d *ttsDriver) stop() {
 }
 
 // ttsPlayback 是一条 assistant 消息的 TTS 会话：文本增量写入请求体管道，
-// 音频从响应体剥掉 WAV 头后喂 paplay。
+// 音频从响应体剥掉 WAV 头后送播放 sink。
 type ttsPlayback struct {
-	ctx    context.Context
 	cancel context.CancelFunc
 	pw     *io.PipeWriter // 请求体：文本增量
-	fin    bool           // 输入已收口/会话已死：后续增量丢弃
+	sink   audioSink
+	fin    bool // 输入已收口/会话已死：后续增量丢弃
 }
 
-func startPlayback(base string, hc *http.Client, log *slog.Logger) (*ttsPlayback, error) {
+func startPlayback(base string, hc *http.Client, log *slog.Logger, sink audioSink) (*ttsPlayback, error) {
+	if err := sink.begin(); err != nil {
+		sink.stop()
+		return nil, err
+	}
 	pr, pw := io.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/tts/stream_input", pr)
 	if err != nil {
 		cancel()
 		pw.Close()
+		sink.stop()
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
-
-	// PCM16 单声道 16k（backend tts_rvc 的输出规格）。
-	cmd := exec.CommandContext(ctx, "paplay", "--raw",
-		"--format=s16le", "--rate=16000", "--channels=1")
-	audioPr, audioPw := io.Pipe()
-	cmd.Stdin = audioPr
-	if err := cmd.Start(); err != nil {
-		cancel()
-		pw.Close()
-		audioPw.Close()
-		return nil, err
-	}
 
 	go func() {
 		resp, err := hc.Do(req)
@@ -500,19 +507,32 @@ func startPlayback(base string, hc *http.Client, log *slog.Logger) (*ttsPlayback
 				log.Error("tts: 请求失败", "err", err)
 			}
 			_ = pw.CloseWithError(err) // feed 侧随即 fin
-			audioPw.Close()
+			sink.stop()
 			return
 		}
-		go func() { defer resp.Body.Close() }()
-		// 响应体 = WAV 头 + PCM16 流；剥头直喂 paplay，排空即自然收尾。
-		if _, err := io.CopyN(io.Discard, resp.Body, wavHeaderLen); err == nil {
-			_, _ = io.Copy(audioPw, resp.Body)
+		// 响应体 = WAV 头 + PCM16 流；剥头读出，逐块送 sink（阻塞写=背压）。
+		if _, err := io.CopyN(io.Discard, resp.Body, wavHeaderLen); err != nil {
+			log.Error("tts: 响应异常", "err", err)
+			sink.stop()
+		} else {
+			buf := make([]byte, 32768)
+			for {
+				n, rerr := resp.Body.Read(buf)
+				if n > 0 {
+					if werr := sink.write(buf[:n]); werr != nil {
+						break // sink 已被掐/死亡：本条止播
+					}
+				}
+				if rerr != nil {
+					break // io.EOF：音频全量送达
+				}
+			}
+			sink.end()
 		}
-		audioPw.Close()
-		_ = cmd.Wait()
+		resp.Body.Close()
 	}()
 
-	return &ttsPlayback{ctx: ctx, cancel: cancel, pw: pw}, nil
+	return &ttsPlayback{cancel: cancel, pw: pw, sink: sink}, nil
 }
 
 func (p *ttsPlayback) feed(delta string) {
@@ -533,8 +553,102 @@ func (p *ttsPlayback) finishInput() {
 
 func (p *ttsPlayback) stop() {
 	p.fin = true
-	p.cancel() // 掐 HTTP 请求与 paplay（exec.CommandContext）
+	p.cancel() // 掐 HTTP 请求
 	_ = p.pw.Close()
+	p.sink.stop()
+}
+
+// ---------- 播放 sink：设备端（launcher /api/voice/play*）与本机 paplay ----------
+
+// deviceSink 把 PCM 送到 launcher 的播放端点（对齐记录 #3 落地，口型暂缓）。
+// 三段式（begin/chunk×n/end）+ stop 立即掐断；chunk POST 在设备端队列满时
+// 阻塞，背压天然传导回 TTS 读取。
+type deviceSink struct {
+	base string
+	hc   *http.Client
+	log  *slog.Logger
+}
+
+func (d *deviceSink) post(path string, body []byte, contentType string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.base+path, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	resp, err := d.hc.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("device %s: status %d", path, resp.StatusCode)
+	}
+	return nil
+}
+
+func (d *deviceSink) begin() error {
+	return d.post("/api/voice/play/begin", []byte(`{"rate":16000,"channels":1}`), "application/json")
+}
+
+func (d *deviceSink) write(pcm []byte) error {
+	return d.post("/api/voice/play/chunk", pcm, "application/octet-stream")
+}
+
+func (d *deviceSink) end() error {
+	return d.post("/api/voice/play/end", nil, "")
+}
+
+func (d *deviceSink) stop() {
+	if err := d.post("/api/voice/play/stop", nil, ""); err != nil {
+		d.log.Warn("tts: 设备停播请求失败", "err", err)
+	}
+}
+
+// paplaySink 从本机声卡出声（开发/无设备场景）。PCM16 单声道 16k。
+type paplaySink struct {
+	cmd  *exec.Cmd
+	stdin io.WriteCloser
+}
+
+func (s *paplaySink) begin() error {
+	if _, err := exec.LookPath("paplay"); err != nil {
+		return fmt.Errorf("找不到 paplay（PipeWire/Pulse）：%w", err)
+	}
+	cmd := exec.Command("paplay", "--raw", "--format=s16le", "--rate=16000", "--channels=1")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	s.cmd, s.stdin = cmd, stdin
+	return nil
+}
+
+func (s *paplaySink) write(pcm []byte) error {
+	_, err := s.stdin.Write(pcm)
+	return err
+}
+
+func (s *paplaySink) end() error {
+	if err := s.stdin.Close(); err != nil {
+		return err
+	}
+	go func() { _ = s.cmd.Wait() }() // 排空即退出；不阻塞调用方
+	return nil
+}
+
+func (s *paplaySink) stop() {
+	_ = s.stdin.Close()
+	if s.cmd.Process != nil {
+		_ = s.cmd.Process.Kill()
+	}
 }
 
 // ---------- 事件渲染（stdout = 回答增量，stderr = 工具轨迹） ----------
