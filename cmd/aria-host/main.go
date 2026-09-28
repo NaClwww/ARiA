@@ -34,7 +34,9 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"aria/core/loop"
@@ -378,12 +380,36 @@ func (p *asrPlug) consume(ctx context.Context) (connected bool, err error) {
 
 // ---------- TTS 驱动：事件流 → /tts/stream_input → 播放 sink ----------
 
-// wavHeaderLen 是 backend 流式响应开头的 WAV 头长度（PCM16 单声道，RIFF
-// 占位长度）；剥掉后按 raw PCM 送播放 sink。
+// wavHeaderLen 是 backend 流式响应开头的 WAV 头长度（标准 44 字节，RIFF
+// 占位长度）。采样率/声道从头部自适应解析——backend 按模型原生率出流
+// （如 40k 的 RVC），写死 16k 会慢放降调。
 const wavHeaderLen = 44
 
-// audioSink 是 TTS 音频的去处：每条 assistant 消息一个 sink 实例。
-// write 的阻塞即播放背压（paplay 管道满 / 设备端队列满），反压整条链。
+// parseWavHeader 解析流首 WAV 头的采样率与声道（backend 契约：流首必带
+// WAV 头且为真值）。bits 必须 PCM16；头不合法即报错——不猜默认值，
+// 猜错了就是又一次慢放降调。
+func parseWavHeader(h []byte) (rate, channels int, err error) {
+	if len(h) < wavHeaderLen || string(h[0:4]) != "RIFF" || string(h[8:12]) != "WAVE" {
+		return 0, 0, errors.New("missing RIFF/WAVE magic")
+	}
+	channels = int(h[22]) | int(h[23])<<8
+	rate = int(h[24]) | int(h[25])<<8 | int(h[26])<<16 | int(h[27])<<24
+	bits := int(h[34]) | int(h[35])<<8
+	if channels < 1 || channels > 2 {
+		return 0, 0, fmt.Errorf("bad channels %d", channels)
+	}
+	if rate < 8000 || rate > 96000 {
+		return 0, 0, fmt.Errorf("bad sample rate %d", rate)
+	}
+	if bits != 16 {
+		return 0, 0, fmt.Errorf("unsupported bits %d (want PCM16)", bits)
+	}
+	return rate, channels, nil
+}
+
+// audioSink 是 TTS 音频的去处：每条 assistant 消息一个 sink 实例，按流首
+// 头解析出的采样率/声道配置。write 的阻塞即播放背压（paplay 管道满 /
+// 设备端队列满），反压整条链。
 type audioSink interface {
 	begin() error
 	write(pcm []byte) error
@@ -403,7 +429,7 @@ type ttsDriver struct {
 	base    string
 	log     *slog.Logger
 	hc      *http.Client
-	newSink func() audioSink
+	newSink func(rate, channels int) audioSink
 	current *ttsPlayback
 }
 
@@ -414,10 +440,14 @@ func newTTSDriver(backend, device string, log *slog.Logger) *ttsDriver {
 	d := &ttsDriver{base: strings.TrimSuffix(backend, "/"), log: log, hc: hc}
 	if device != "" {
 		dev := strings.TrimSuffix(device, "/")
-		d.newSink = func() audioSink { return &deviceSink{base: dev, hc: hc, log: log} }
+		d.newSink = func(rate, channels int) audioSink {
+			return &deviceSink{base: dev, hc: hc, log: log, rate: rate, channels: channels}
+		}
 		log.Info("tts: 设备端播放", "device", dev)
 	} else {
-		d.newSink = func() audioSink { return &paplaySink{} }
+		d.newSink = func(rate, channels int) audioSink {
+			return &paplaySink{rate: rate, channels: channels}
+		}
 		log.Info("tts: 本机播放（paplay）")
 	}
 	return d
@@ -454,7 +484,7 @@ func (d *ttsDriver) run(ch <-chan loop.Event) {
 
 func (d *ttsDriver) start() {
 	d.stop()
-	p, err := startPlayback(d.base, d.hc, d.log, d.newSink())
+	p, err := startPlayback(d.base, d.hc, d.log, d.newSink)
 	if err != nil {
 		d.log.Error("tts: 启动失败（本条静音，文字照常）", "err", err)
 		return
@@ -475,31 +505,29 @@ func (d *ttsDriver) stop() {
 	}
 }
 
-// ttsPlayback 是一条 assistant 消息的 TTS 会话：文本增量写入请求体管道，
-// 音频从响应体剥掉 WAV 头后送播放 sink。
+// ttsPlayback 是一条 assistant 消息的 TTS 会话：文本增量写入请求体管道；
+// 音频响应先解析流首 WAV 头（自适应采样率/声道）再建 sink、逐块送播。
 type ttsPlayback struct {
 	cancel context.CancelFunc
 	pw     *io.PipeWriter // 请求体：文本增量
-	sink   audioSink
-	fin    bool // 输入已收口/会话已死：后续增量丢弃
+	mu     sync.Mutex
+	sink   audioSink // 头解析后创建；stop 可能先到
+	fin    bool      // 输入已收口/会话已死：后续增量丢弃
 }
 
-func startPlayback(base string, hc *http.Client, log *slog.Logger, sink audioSink) (*ttsPlayback, error) {
-	if err := sink.begin(); err != nil {
-		sink.stop()
-		return nil, err
-	}
+func startPlayback(base string, hc *http.Client, log *slog.Logger,
+	newSink func(rate, channels int) audioSink) (*ttsPlayback, error) {
 	pr, pw := io.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/tts/stream_input", pr)
 	if err != nil {
 		cancel()
 		pw.Close()
-		sink.stop()
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
 
+	p := &ttsPlayback{cancel: cancel, pw: pw}
 	go func() {
 		resp, err := hc.Do(req)
 		if err != nil {
@@ -507,32 +535,54 @@ func startPlayback(base string, hc *http.Client, log *slog.Logger, sink audioSin
 				log.Error("tts: 请求失败", "err", err)
 			}
 			_ = pw.CloseWithError(err) // feed 侧随即 fin
+			return
+		}
+		defer resp.Body.Close()
+
+		// 流首 WAV 头：解析真实采样率/声道（模型原生率，如 40k），
+		// 非法头响亮失败——不猜默认值。
+		header := make([]byte, wavHeaderLen)
+		if _, err := io.ReadFull(resp.Body, header); err != nil {
+			log.Error("tts: 流头读取失败", "err", err)
+			return
+		}
+		rate, channels, err := parseWavHeader(header)
+		if err != nil {
+			log.Error("tts: 非法 WAV 流头", "err", err)
+			return
+		}
+		sink := newSink(rate, channels)
+		if err := sink.begin(); err != nil {
+			log.Error("tts: 播放启动失败（本条静音，文字照常）", "err", err,
+				"rate", rate, "channels", channels)
 			sink.stop()
 			return
 		}
-		// 响应体 = WAV 头 + PCM16 流；剥头读出，逐块送 sink（阻塞写=背压）。
-		if _, err := io.CopyN(io.Discard, resp.Body, wavHeaderLen); err != nil {
-			log.Error("tts: 响应异常", "err", err)
+		p.mu.Lock()
+		if p.fin { // stop() 已先到：刚建好的 sink 直接掐
+			p.mu.Unlock()
 			sink.stop()
-		} else {
-			buf := make([]byte, 32768)
-			for {
-				n, rerr := resp.Body.Read(buf)
-				if n > 0 {
-					if werr := sink.write(buf[:n]); werr != nil {
-						break // sink 已被掐/死亡：本条止播
-					}
-				}
-				if rerr != nil {
-					break // io.EOF：音频全量送达
+			return
+		}
+		p.sink = sink
+		p.mu.Unlock()
+
+		buf := make([]byte, 32768)
+		for {
+			n, rerr := resp.Body.Read(buf)
+			if n > 0 {
+				if werr := sink.write(buf[:n]); werr != nil {
+					break // sink 已被掐/死亡：本条止播
 				}
 			}
-			sink.end()
+			if rerr != nil {
+				break // io.EOF：音频全量送达
+			}
 		}
-		resp.Body.Close()
+		sink.end()
 	}()
 
-	return &ttsPlayback{cancel: cancel, pw: pw, sink: sink}, nil
+	return p, nil
 }
 
 func (p *ttsPlayback) feed(delta string) {
@@ -552,21 +602,28 @@ func (p *ttsPlayback) finishInput() {
 }
 
 func (p *ttsPlayback) stop() {
+	p.mu.Lock()
 	p.fin = true
+	s := p.sink
+	p.mu.Unlock()
 	p.cancel() // 掐 HTTP 请求
 	_ = p.pw.Close()
-	p.sink.stop()
+	if s != nil {
+		s.stop()
+	}
 }
 
 // ---------- 播放 sink：设备端（launcher /api/voice/play*）与本机 paplay ----------
 
 // deviceSink 把 PCM 送到 launcher 的播放端点（对齐记录 #3 落地，口型暂缓）。
 // 三段式（begin/chunk×n/end）+ stop 立即掐断；chunk POST 在设备端队列满时
-// 阻塞，背压天然传导回 TTS 读取。
+// 阻塞，背压天然传导回 TTS 读取。采样率/声道来自流首 WAV 头（自适应）。
 type deviceSink struct {
-	base string
-	hc   *http.Client
-	log  *slog.Logger
+	base     string
+	hc       *http.Client
+	log      *slog.Logger
+	rate     int
+	channels int
 }
 
 func (d *deviceSink) post(path string, body []byte, contentType string) error {
@@ -592,7 +649,8 @@ func (d *deviceSink) post(path string, body []byte, contentType string) error {
 }
 
 func (d *deviceSink) begin() error {
-	return d.post("/api/voice/play/begin", []byte(`{"rate":16000,"channels":1}`), "application/json")
+	body := fmt.Sprintf(`{"rate":%d,"channels":%d}`, d.rate, d.channels)
+	return d.post("/api/voice/play/begin", []byte(body), "application/json")
 }
 
 func (d *deviceSink) write(pcm []byte) error {
@@ -609,17 +667,22 @@ func (d *deviceSink) stop() {
 	}
 }
 
-// paplaySink 从本机声卡出声（开发/无设备场景）。PCM16 单声道 16k。
+// paplaySink 从本机声卡出声（开发/无设备场景）。采样率/声道来自流首
+// WAV 头（自适应），PCM16 固定。
 type paplaySink struct {
-	cmd  *exec.Cmd
-	stdin io.WriteCloser
+	rate     int
+	channels int
+	stdin    io.WriteCloser
+	cmd      *exec.Cmd
 }
 
 func (s *paplaySink) begin() error {
 	if _, err := exec.LookPath("paplay"); err != nil {
 		return fmt.Errorf("找不到 paplay（PipeWire/Pulse）：%w", err)
 	}
-	cmd := exec.Command("paplay", "--raw", "--format=s16le", "--rate=16000", "--channels=1")
+	cmd := exec.Command("paplay", "--raw", "--format=s16le",
+		"--rate="+strconv.Itoa(s.rate),
+		"--channels="+strconv.Itoa(s.channels))
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
