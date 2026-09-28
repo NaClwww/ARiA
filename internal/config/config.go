@@ -394,8 +394,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("persona.system_prompt_file", "")
 	v.SetDefault("session.id", "aria")
 	v.SetDefault("session.default_user", "user")
-	v.SetDefault("llm.temperature", 0.7)
-	v.SetDefault("llm.max_tokens", 2048)
+	// llm.temperature / llm.max_tokens 故意无默认：0 = 不下发该字段，
+	// 交给 provider 的模型默认（thinking 型模型一般不用这两个旋钮）。
 	v.SetDefault("compress.strategy", "provider")
 	v.SetDefault("compress.keep_last_n", 0)
 	v.SetDefault("compress.model", "")

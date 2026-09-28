@@ -3,6 +3,8 @@ package ariahost
 import (
 	"strings"
 	"testing"
+
+	"aria/internal/config"
 )
 
 func TestSplitSpeaker(t *testing.T) {
@@ -60,5 +62,23 @@ func TestSpeakerInstruction(t *testing.T) {
 	inst := SpeakerInstruction("user")
 	if !strings.Contains(inst, "[user]") {
 		t.Fatalf("声明应含默认说话人：%q", inst)
+	}
+}
+
+// llmOptions：[llm] 缺省（0）= 不下发该字段——temperature 绝不能以 0
+// 值显式下发（那等于贪心解码）；显式配置才进 Options。
+func TestLLMOptionsZeroMeansAbsent(t *testing.T) {
+	var cfg config.Config
+	cfg.Provider.Model = "m"
+
+	off := llmOptions(cfg)
+	if off.Model != "m" || off.Temperature != nil || off.MaxTokens != 0 {
+		t.Fatalf("缺省应不下发温度/上限：%+v", off)
+	}
+
+	cfg.LLM.Temperature, cfg.LLM.MaxTokens = 0.7, 2048
+	on := llmOptions(cfg)
+	if on.Temperature == nil || *on.Temperature != 0.7 || on.MaxTokens != 2048 {
+		t.Fatalf("显式配置必须生效：%+v", on)
 	}
 }

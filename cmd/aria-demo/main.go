@@ -265,10 +265,12 @@ func run(sess *agent.Session, lines <-chan string, mgr *config.Manager, prov pro
 			utterance = "[" + speaker + "] " + utterance
 		}
 		ctx := ctxx.WithScope(context.Background(), ctxx.Scope{UserID: speaker})
-		temp := cfg.LLM.Temperature
-		ctx = ctxx.WithOptions(ctx, ctxx.Options{
-			Model: cfg.Provider.Model, Temperature: &temp, MaxTokens: cfg.LLM.MaxTokens,
-		})
+		opts := ctxx.Options{Model: cfg.Provider.Model, MaxTokens: cfg.LLM.MaxTokens}
+		if cfg.LLM.Temperature > 0 { // 0 = 不下发（用 provider 模型默认），不发 temperature:0
+			temp := cfg.LLM.Temperature
+			opts.Temperature = &temp
+		}
+		ctx = ctxx.WithOptions(ctx, opts)
 		fmt.Fprintf(errw, "%s> %s\n", speaker, utterance)
 		if _, err := sess.Input(ctx, message.NewUser(utterance)); err != nil {
 			fmt.Fprintf(errw, "！输入失败：%v\n", err)
@@ -323,7 +325,14 @@ func printEffective(w io.Writer, configPath, overridePath string, mgr *config.Ma
 	fmt.Fprintf(w, "服务地址   %s\n", orDefault(eff.Provider.BaseURL, "(官方默认)"))
 	fmt.Fprintf(w, "key 环境变量 %s\n", eff.Provider.APIKeyEnv)
 	fmt.Fprintf(w, "人设       %s\n", personaSource(eff.Persona))
-	fmt.Fprintf(w, "温度/上限   %v / %d\n", eff.LLM.Temperature, eff.LLM.MaxTokens)
+	temp, toks := "(模型默认)", "(不限)"
+	if eff.LLM.Temperature > 0 {
+		temp = fmt.Sprintf("%v", eff.LLM.Temperature)
+	}
+	if eff.LLM.MaxTokens > 0 {
+		toks = fmt.Sprintf("%d", eff.LLM.MaxTokens)
+	}
+	fmt.Fprintf(w, "温度/上限   %s / %s\n", temp, toks)
 	fmt.Fprintf(w, "压缩       strategy=%s keep_last_n=%d model=%q instruction=%s\n",
 		eff.Compress.Strategy, eff.Compress.KeepLastN, eff.Compress.Model,
 		orDefault(eff.Compress.Instruction, "(默认提示词)"))

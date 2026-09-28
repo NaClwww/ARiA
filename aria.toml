@@ -23,8 +23,8 @@ id = "aria"
 default_user = "user"
 
 [llm]                           # 热调区：网页面板改动立即生效（每请求 Options 覆盖）
-temperature = 0.7
-max_tokens = 2048
+#temperature = 0.7              # 不设（默认）= 请求里不下发该字段，用 provider 模型默认
+#max_tokens = 8192              # 不设（默认）= 不限；thinking 型模型一般不用这两个旋钮
 
 [compress]
 strategy = "provider"           # provider（调 LLM 压成摘要）| keeplast（不调 LLM，只留最近 N 条）

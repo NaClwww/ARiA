@@ -28,10 +28,7 @@ func (s Sink) Deliver(text, speaker string) error {
 	msg := message.NewUser(TagSpeaker(speaker, text))
 	if err := sess.Queue(msg); errors.Is(err, agent.ErrNoActiveRun) {
 		ctx := ctxx.WithScope(context.Background(), ctxx.Scope{UserID: speaker})
-		temp := cfg.LLM.Temperature
-		ctx = ctxx.WithOptions(ctx, ctxx.Options{
-			Model: cfg.Provider.Model, Temperature: &temp, MaxTokens: cfg.LLM.MaxTokens,
-		})
+		ctx = ctxx.WithOptions(ctx, llmOptions(cfg))
 		_, err := sess.Input(ctx, msg)
 		return err
 	} else if err != nil {
@@ -39,6 +36,18 @@ func (s Sink) Deliver(text, speaker string) error {
 	}
 	fmt.Fprintf(os.Stderr, "  · 轮间注入：%s\n", strings.TrimSpace(text))
 	return nil
+}
+
+// llmOptions 把 [llm] 配置翻译成每请求 Options。temperature/max_tokens
+// 无 viper 兜底，0 = 不下发该字段（用 provider 的模型默认）——绝不显式
+// 发 temperature:0，那等于把人设锁进贪心解码。
+func llmOptions(cfg config.Config) ctxx.Options {
+	opts := ctxx.Options{Model: cfg.Provider.Model, MaxTokens: cfg.LLM.MaxTokens}
+	if cfg.LLM.Temperature > 0 {
+		temp := cfg.LLM.Temperature
+		opts.Temperature = &temp
+	}
+	return opts
 }
 
 // TagSpeaker 统一给用户消息标说话人：「[名字] 内容」。所有消息同格式
