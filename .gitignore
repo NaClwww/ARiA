@@ -29,3 +29,6 @@ test
 
 # 宿主运行时覆盖文件（机器写；key 一律走环境变量，永不落盘）
 aria.override.toml
+
+# 运行期产物（record 落盘等）
+var/
