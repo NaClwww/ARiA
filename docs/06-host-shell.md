@@ -81,6 +81,7 @@
 |---|---|
 | `internal/config` | 配置管理器（Load/Effective/Base/Set/Clear/SetLocal/Reload/OnChange/SetLogf）；启动读一次、运行期只写回 |
 | `internal/assemble` | 宿主侧「名字 → 零件」装配表（压缩策略等）：引擎只认接口，不认识配置里的名字 |
+| `internal/aria-host` | aria-host 的定制组件集：`Engine`（配置→provider→agent→会话组装/收尾）、`Sink`（多插头投递纪律，本表 §2）、`StdinPlug`/`SplitSpeaker`、`ConsumeTerminal` 终端渲染、`ResolvePersona`、echo provider——main 只做接线 |
 | `cmd/aria-demo` | 终端薄壳：**吃配置文件**（flag 只作进程内覆盖 = local 层）、stdin 行 = 成轮话语、`[名字]` 前缀切换说话人、流式打印、Ctrl+C 打断、`--record` JSONL、`/reload` 重读文件、`--print-config` 打印生效配置 |
 | `cmd/aria-web` | 浏览器薄壳（待做） |
 | `plugins/persist/jsonl` | durable 事件的 JSONL 落盘（格式 v1 带版本号，写路完整、读路随恢复需求） |
