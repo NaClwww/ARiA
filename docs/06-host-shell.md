@@ -84,7 +84,7 @@
 | `cmd/aria-demo` | 终端薄壳：**吃配置文件**（flag 只作进程内覆盖 = local 层）、stdin 行 = 成轮话语、`[名字]` 前缀切换说话人、流式打印、Ctrl+C 打断、`--record` JSONL、`/reload` 重读文件、`--print-config` 打印生效配置 |
 | `cmd/aria-web` | 浏览器薄壳（待做） |
 | `plugins/persist/jsonl` | durable 事件的 JSONL 落盘（格式 v1 带版本号，写路完整、读路随恢复需求） |
-| `plugins/voice/gowild` | Gowild-HE 语音插件：ASR 输入插头（backend SSE）+ TTS 事件订阅者（流式合成 → launcher 三段式播放 / paplay）。消费宿主的 `Gate`（半双工闸门）能力，结构化注入 |
+| `plugins/voice/gowild` | Gowild-HE 语音插件全家桶：`Gate`（半双工闸门：引用计数 + 迁移订阅，控制流的信号源）、`Input`（半双工输入纪律，引擎投递口 `InputSink` 由宿主实现多插头纪律）、ASR 输入插头（backend SSE）、TTS 事件订阅者（流式合成 → launcher 三段式播放 / paplay）、`Light`（RGB 状态灯：订阅闸门迁移与 partial 心跳，事件驱动） |
 
 **同一进程内的即时生效**：面板保存 → `Set` 写入 override 层并更新内存 → 宿主下一轮 `Effective()` 就能拿到新值（demo 里模型/温度是每轮现取的，所以改完下一句就换模型）。压缩策略这类「构造期才注入」的部件由宿主在变更后重新装配并调 `Session.SetCompressor` 热切换（demo 的 `/reload` 就是这么做的）。这是「改配置不必重启」的实际含义；手改文件仍需 `Reload`/重启（见 §3）。
 
