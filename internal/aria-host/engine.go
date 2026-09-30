@@ -25,6 +25,7 @@ import (
 	"aria/pkg/ctxx"
 	"aria/plugins/persist/jsonl"
 	openai "aria/plugins/provider/openai"
+	"aria/plugins/tool/basic"
 	gowildvision "aria/plugins/vision/gowild"
 	gowildvoice "aria/plugins/voice/gowild"
 	"aria/runtime/agent"
@@ -144,9 +145,30 @@ func NewEngine(opts Options) (*Engine, error) {
 		log.Info("record", "path", cfg.Record.Path)
 	}
 
+	// 内置工具：按 [tools] builtin 的名字从共享注册表（plugins/tool/basic）
+	// 挑选；未知名字报错（fail-loud，与 aria-demo 同纪律——静默少一个工具
+	// 比启动失败更难排查）。空名单 = 不挂工具。
+	registry := basic.All()
+	tools := make([]tool.Tool, 0, len(cfg.Tools.Builtin)+len(opts.Tools))
+	for _, name := range cfg.Tools.Builtin {
+		t, ok := registry[name]
+		if !ok {
+			return nil, fmt.Errorf("未知内置工具 %q（可选：now, calc, random, weather, bash）", name)
+		}
+		tools = append(tools, t)
+	}
+	tools = append(tools, opts.Tools...)
+	if len(tools) > 0 {
+		names := make([]string, 0, len(tools))
+		for _, t := range tools {
+			names = append(names, t.Def().Name)
+		}
+		log.Info("tools", "count", len(tools), "names", names)
+	}
+
 	ag, err := agent.New(agent.Config{
 		Provider:     prov,
-		Tools:        opts.Tools,
+		Tools:        tools,
 		Compressor:   compressor,
 		Assembler:    vision,
 		Store:        store,

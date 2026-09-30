@@ -42,6 +42,7 @@ import (
 	"aria/pkg/message"
 	"aria/plugins/persist/jsonl"
 	openai "aria/plugins/provider/openai"
+	"aria/plugins/tool/basic"
 	"aria/runtime/agent"
 	"aria/runtime/persist"
 	"aria/runtime/window"
@@ -295,18 +296,19 @@ func resolvePersona(p config.Persona, fallback string) (string, error) {
 	return fallback, nil
 }
 
-// buildTools 按配置里的名字装配演示工具；未知名字报错（不静默少工具）。
+// buildTools 按配置里的名字装配工具：通用四件套（now/calc/random/weather）
+// 来自共享注册表 plugins/tool/basic，lorem 是本宿主的纯演示工具；未知名字
+// 报错（不静默少工具）。
 func buildTools(names []string, log *slog.Logger) ([]tool.Tool, error) {
+	registry := basic.All()
+	registry["lorem"] = makeLoremTool()
 	var tools []tool.Tool
 	for _, name := range names {
-		switch name {
-		case "now":
-			tools = append(tools, makeNowTool())
-		case "lorem":
-			tools = append(tools, makeLoremTool())
-		default:
-			return nil, fmt.Errorf("未知内置工具 %q（可选：now, lorem）", name)
+		t, ok := registry[name]
+		if !ok {
+			return nil, fmt.Errorf("未知内置工具 %q（可选：now, calc, random, weather, lorem）", name)
 		}
+		tools = append(tools, t)
 	}
 	log.Info("tools", "count", len(tools))
 	return tools, nil
@@ -432,16 +434,6 @@ func (t simpleTool) Def() tool.Def {
 
 func (t simpleTool) Exec(ctx context.Context, call tool.Call) tool.Result {
 	return tool.Result{CallID: call.ID, Blocks: []message.Block{message.TextBlock{Text: t.fn(ctx, call.Args)}}}
-}
-
-func makeNowTool() simpleTool {
-	return simpleTool{
-		name: "now",
-		desc: "查询当前时间",
-		fn: func(_ context.Context, _ json.RawMessage) string {
-			return "现在是 " + time.Now().Format("2006-01-02 15:04:05 MST Mon")
-		},
-	}
 }
 
 func makeLoremTool() simpleTool {

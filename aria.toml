@@ -50,7 +50,7 @@ keep_last_n = 0                 # strategy = "keeplast" 时的条数；0 = 引�
 # instruction = ""              # provider 策略的提示词覆盖；空 = 默认提示词
 
 [tools]
-builtin = ["now", "lorem"]      # 演示工具；M4 接 ToolSource/MCP 后扩展
+builtin = ["bash"]  # 共享注册表（plugins/tool/basic）；bash 以宿主身份执行任意命令，不想要就去掉；lorem 是 aria-demo 专属
 
 [record]
 path = ""                       # 例："chat.jsonl"；空 = 不落盘
