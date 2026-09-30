@@ -41,7 +41,6 @@ import (
 	"aria/pkg/ctxx"
 	"aria/pkg/message"
 	"aria/plugins/persist/jsonl"
-	openai "aria/plugins/provider/openai"
 	"aria/plugins/tool/basic"
 	"aria/runtime/agent"
 	"aria/runtime/persist"
@@ -112,20 +111,15 @@ func main() {
 		prov = newDemoProvider()
 		log.Info("provider: fake（无网络；压缩策略已改为 keeplast 以保持确定性）")
 	} else {
-		key := *apiKey
-		if key == "" && cfg.Provider.APIKeyEnv != "" {
-			key = os.Getenv(cfg.Provider.APIKeyEnv)
-		}
-		if key == "" {
-			key = os.Getenv("OPENAI_API_KEY")
-		}
-		if key == "" || cfg.Provider.Model == "" {
-			fmt.Fprintf(os.Stderr, "真实模式需要模型与 API key：配置 provider.model + 环境变量 %s（或用 --model/--api-key/--fake）\n",
-				orDefault(cfg.Provider.APIKeyEnv, "ARIA_API_KEY"))
+		// 配置 → provider 走共享装配表（与 aria-host 同源；kind=deepseek
+		// 吃默认模型，openai 兼容端点保持原语义）。
+		res, perr := assemble.Provider(cfg, *apiKey)
+		if perr != nil {
+			log.Error("真实模式 provider 装配失败", "err", perr, "hint", "或用 --model/--api-key/--fake")
 			os.Exit(2)
 		}
-		prov = openai.New(openai.Config{BaseURL: cfg.Provider.BaseURL, APIKey: key, Model: cfg.Provider.Model})
-		log.Info("provider: openai-compatible", "model", cfg.Provider.Model, "base_url", orDefault(cfg.Provider.BaseURL, "(官方默认)"))
+		prov = res.Impl
+		log.Info("provider", "kind", res.Kind, "model", res.Model, "base_url", orDefault(cfg.Provider.BaseURL, "(官方默认)"))
 	}
 
 	compressor, err = assemble.Compressor(cfg, prov)
@@ -266,7 +260,7 @@ func run(sess *agent.Session, lines <-chan string, mgr *config.Manager, prov pro
 			utterance = "[" + speaker + "] " + utterance
 		}
 		ctx := ctxx.WithScope(context.Background(), ctxx.Scope{UserID: speaker})
-		opts := ctxx.Options{Model: cfg.Provider.Model, MaxTokens: cfg.LLM.MaxTokens}
+		opts := ctxx.Options{Model: cfg.Provider.Model, MaxTokens: cfg.LLM.MaxTokens, ReasoningEffort: cfg.LLM.ReasoningEffort}
 		if cfg.LLM.Temperature > 0 { // 0 = 不下发（用 provider 模型默认），不发 temperature:0
 			temp := cfg.LLM.Temperature
 			opts.Temperature = &temp

@@ -65,6 +65,9 @@ type Server struct {
 }
 
 type Provider struct {
+	// Kind 是适配器名（internal/assemble.Provider 的装配键）：
+	// "deepseek"（官方端点特化）| "openai"/空（OpenAI 兼容端点通用）。
+	Kind      string
 	BaseURL   string
 	Model     string
 	APIKeyEnv string // key 本体永远在环境变量；这里只存变量名
@@ -83,6 +86,9 @@ type Session struct {
 type LLM struct {
 	Temperature float64
 	MaxTokens   int
+	// ReasoningEffort 是思考等级（none/low/high/max，provider 支持才生效，
+	// 如 kind=deepseek）：空 = 不下发，用服务端默认。
+	ReasoningEffort string
 }
 
 type Compress struct {
@@ -388,6 +394,7 @@ func configFrom(v *viper.Viper) Config {
 		},
 		Server: Server{Listen: v.GetString("server.listen")},
 		Provider: Provider{
+			Kind:      v.GetString("provider.kind"),
 			BaseURL:   v.GetString("provider.base_url"),
 			Model:     v.GetString("provider.model"),
 			APIKeyEnv: v.GetString("provider.api_key_env"),
@@ -401,8 +408,9 @@ func configFrom(v *viper.Viper) Config {
 			DefaultUser: v.GetString("session.default_user"),
 		},
 		LLM: LLM{
-			Temperature: v.GetFloat64("llm.temperature"),
-			MaxTokens:   v.GetInt("llm.max_tokens"),
+			Temperature:     v.GetFloat64("llm.temperature"),
+			MaxTokens:       v.GetInt("llm.max_tokens"),
+			ReasoningEffort: v.GetString("llm.reasoning_effort"),
 		},
 		Compress: Compress{
 			Strategy:    v.GetString("compress.strategy"),
@@ -426,6 +434,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("host.device", "")
 	v.SetDefault("host.light_colors", "202020,00a000,2050ff")
 	v.SetDefault("server.listen", "127.0.0.1:8080")
+	// provider.kind 故意无默认：空 = openai（通用适配器）；deepseek 在
+	// assemble.Provider 里吃默认模型 deepseek-flash，这里不重复默认值。
 	v.SetDefault("provider.base_url", "")
 	v.SetDefault("provider.model", "")
 	v.SetDefault("provider.api_key_env", "ARIA_API_KEY")
@@ -433,8 +443,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("persona.system_prompt_file", "")
 	v.SetDefault("session.id", "aria")
 	v.SetDefault("session.default_user", "user")
-	// llm.temperature / llm.max_tokens 故意无默认：0 = 不下发该字段，
-	// 交给 provider 的模型默认（thinking 型模型一般不用这两个旋钮）。
+	// llm.temperature / llm.max_tokens / llm.reasoning_effort 故意无默认：
+	// 空 = 不下发该字段，交给 provider 的模型默认（thinking 型模型一般
+	// 不用这几个旋钮）。
 	v.SetDefault("compress.strategy", "provider")
 	v.SetDefault("compress.keep_last_n", 0)
 	v.SetDefault("compress.model", "")

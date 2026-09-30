@@ -14,7 +14,6 @@ package ariahost
 import (
 	"fmt"
 	"log/slog"
-	"os"
 	"time"
 
 	"aria/core/loop"
@@ -24,7 +23,6 @@ import (
 	"aria/internal/config"
 	"aria/pkg/ctxx"
 	"aria/plugins/persist/jsonl"
-	openai "aria/plugins/provider/openai"
 	"aria/plugins/tool/basic"
 	gowildvision "aria/plugins/vision/gowild"
 	gowildvoice "aria/plugins/voice/gowild"
@@ -61,6 +59,7 @@ type Engine struct {
 	log        *slog.Logger
 	jsonlStore *jsonl.Store
 	fake       bool
+	model      string // 生效模型名（deepseek kind 留空配置时为默认 flash）
 }
 
 // NewEngine 走完「配置 → provider → 压缩 → 人设 → 落盘 → agent → 会话」
@@ -77,25 +76,22 @@ func NewEngine(opts Options) (*Engine, error) {
 	cfg := mgr.Effective()
 
 	var prov provider.Provider
+	var model string
 	if opts.Fake {
 		prov = echoProvider{}
+		model = "echo"
 		mgr.SetLocal("compress.strategy", "keeplast") // echo 不做真摘要，保持确定性
 		cfg = mgr.Effective()
 		log.Info("provider: echo（无网络冒烟）")
 	} else {
-		key := opts.APIKey
-		if key == "" && cfg.Provider.APIKeyEnv != "" {
-			key = os.Getenv(cfg.Provider.APIKeyEnv)
+		// 配置 → provider 走共享装配表（kind=deepseek 官方特化 / openai 兼容；
+		// 模型默认、环境变量兜底都在 assemble.Provider 里，与 aria-demo 同源）。
+		res, perr := assemble.Provider(cfg, opts.APIKey)
+		if perr != nil {
+			return nil, fmt.Errorf("真实模式 provider 装配失败: %w（或用 --api-key/--fake）", perr)
 		}
-		if key == "" {
-			key = os.Getenv("OPENAI_API_KEY")
-		}
-		if key == "" || cfg.Provider.Model == "" {
-			return nil, fmt.Errorf("真实模式需要模型与 API key：配置 provider.model + 环境变量 %s（或用 --api-key/--fake）",
-				orDefault(cfg.Provider.APIKeyEnv, "ARIA_API_KEY"))
-		}
-		prov = openai.New(openai.Config{BaseURL: cfg.Provider.BaseURL, APIKey: key, Model: cfg.Provider.Model})
-		log.Info("provider: openai-compatible", "model", cfg.Provider.Model,
+		prov, model = res.Impl, res.Model
+		log.Info("provider", "kind", res.Kind, "model", res.Model,
 			"base_url", orDefault(cfg.Provider.BaseURL, "(官方默认)"))
 	}
 
@@ -184,15 +180,16 @@ func NewEngine(opts Options) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("会话建立失败: %w", err)
 	}
-	return &Engine{Cfg: cfg, Session: sess, log: log, jsonlStore: jsonlStore, fake: opts.Fake}, nil
+	return &Engine{Cfg: cfg, Session: sess, log: log, jsonlStore: jsonlStore, fake: opts.Fake, model: model}, nil
 }
 
-// ModelName 是对外展示的模型名（echo 冒烟时为 "echo"）。
+// ModelName 是对外展示的模型名（echo 冒烟时为 "echo"；deepseek kind 留空
+// 配置时展示生效默认 deepseek-flash，不展示空串）。
 func (e *Engine) ModelName() string {
 	if e.fake {
 		return "echo"
 	}
-	return e.Cfg.Provider.Model
+	return e.model
 }
 
 // Close 收尾落盘（会话本身的 Close 由宿主在等待消费者退出前先行调用，

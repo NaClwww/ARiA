@@ -153,6 +153,10 @@ type Options struct {
 	Temperature *float64
 	MaxTokens   int
 	Stop        []string
+	// ReasoningEffort 是思考等级（DeepSeek reasoning_effort / OpenAI o 系同构），
+	// 取值 none|low|high|max；空 = 不下发，交给 provider 的模型默认。不认识
+	// 思考等级的适配器忽略之——语义是「请求方意愿」，不是协议必选项。
+	ReasoningEffort string
 }
 
 type optionsKey struct{}

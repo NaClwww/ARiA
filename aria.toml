@@ -25,9 +25,10 @@ speak_tool = true    # TTS 改为 speak 工具：模型显式调用出声（可�
 listen = "127.0.0.1:8080"      # 只绑本机；暴露局域网需显式修改（本口能触发 LLM 花费）
 
 [provider]
-base_url = "https://api.deepseek.com/v1"
-model = "deepseek-chat"
-api_key_env = "ARIA_API_KEY"   # key 本体永远在环境变量，不落任何文件
+kind = "deepseek"                        # deepseek（官方端点特化：思考等级/流式 toolcall 细节/官方 finish_reason）| openai 或留空（OpenAI 兼容端点通用，含 DeepSeek/GLM/Kimi/Ollama）
+base_url = "https://api.deepseek.com"   # deepseek kind 可省略（默认官方端点；/v1 别名亦可）；openai kind 默认官方 OpenAI
+model = "deepseek-flash"                 # 稳定默认：V4.1-Flash（tool calls + 视觉 + 思考，并发 2500，输入 1 元/M 档）；备选 deepseek-v4-pro（无视觉，勿用于摄像头注入）；deepseek kind 留空也用它
+api_key_env = "ARIA_API_KEY"   # key 本体永远在环境变量，不落任何文件；deepseek kind 另兜底 DEEPSEEK_API_KEY
 
 [persona]
 # 二选一，file 优先
@@ -39,8 +40,9 @@ id = "aria"
 default_user = "user"
 
 [llm]                           # 热调区：网页面板改动立即生效（每请求 Options 覆盖）
-#temperature = 0.7              # 不设（默认）= 请求里不下发该字段，用 provider 模型默认
-#max_tokens = 8192              # 不设（默认）= 不限；thinking 型模型一般不用这两个旋钮
+#temperature = 0.7              # 不设（默认）= 请求里不下发该字段，用 provider 模型默认；思考模式下服务端本就忽略它
+#max_tokens = 8192              # 不设（默认）= 不限；thinking 型模型一般不用这两个旋钮（思考态默认 64K，effort=max 128K）
+#reasoning_effort = "high"      # 思考等级（kind=deepseek 生效）：none/low/high/max；不设 = 不下发，用服务端默认（思考开/high）。注意压缩摘要请求也会继承本值
 
 [compress]
 strategy = "provider"           # provider（调 LLM 压成摘要）| keeplast（不调 LLM，只留最近 N 条）

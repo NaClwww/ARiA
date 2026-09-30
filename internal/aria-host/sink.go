@@ -38,11 +38,17 @@ func (s Sink) Deliver(text, speaker string) error {
 	return nil
 }
 
-// llmOptions 把 [llm] 配置翻译成每请求 Options。temperature/max_tokens
-// 无 viper 兜底，0 = 不下发该字段（用 provider 的模型默认）——绝不显式
-// 发 temperature:0，那等于把人设锁进贪心解码。
+// llmOptions 把 [llm] 配置翻译成每请求 Options。temperature/max_tokens/
+// reasoning_effort 无 viper 兜底，零值 = 不下发该字段（用 provider 的模型
+// 默认）——绝不显式发 temperature:0，那等于把人设锁进贪心解码。
+// 注意 Options 会被压缩摘要继承（model/temperature；max_tokens 已隔离）：
+// reasoning_effort 设 none 时摘要也不思考，见 deepseek 适配器的等级解析。
 func llmOptions(cfg config.Config) ctxx.Options {
-	opts := ctxx.Options{Model: cfg.Provider.Model, MaxTokens: cfg.LLM.MaxTokens}
+	opts := ctxx.Options{
+		Model:           cfg.Provider.Model,
+		MaxTokens:       cfg.LLM.MaxTokens,
+		ReasoningEffort: cfg.LLM.ReasoningEffort,
+	}
 	if cfg.LLM.Temperature > 0 {
 		temp := cfg.LLM.Temperature
 		opts.Temperature = &temp
