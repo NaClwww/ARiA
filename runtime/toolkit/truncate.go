@@ -75,6 +75,11 @@ type truncating struct {
 
 func (t *truncating) Def() tool.Def { return t.inner.Def() }
 
+// Unwrap 交出内层工具（Go 惯例）：装饰器只变换结果负载，不吞内层的
+// 可选能力（如 core/tool.Stopper）——消费方按 Unwrap 链解包探测。
+// 真机教训（2026-09-29）：没有这一层，stop 工具执行成功 run 却续轮。
+func (t *truncating) Unwrap() tool.Tool { return t.inner }
+
 func (t *truncating) Exec(ctx context.Context, call tool.Call) tool.Result {
 	res := t.inner.Exec(ctx, call)
 

@@ -436,3 +436,37 @@ func TestToolTimeoutDefault(t *testing.T) {
 		t.Fatalf("显式 0 被默认值顶掉：%d", got)
 	}
 }
+
+// [host] 段（宿主启动项）：base 给值、override 覆盖、未写的走代码默认。
+func TestHostSection(t *testing.T) {
+	dir := t.TempDir()
+	base := writeBase(t, dir, baseBody+`
+[host]
+device = "http://127.0.0.1:18900"
+no_tts = true
+`)
+	over := filepath.Join(dir, "aria.override.toml")
+	if err := os.WriteFile(over, []byte("[host]\nasr_gateway = \"ws://172.16.53.179:8210\"\nno_tts = false\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := Load(base, over)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := m.Effective().Host
+	if h.Device != "http://127.0.0.1:18900" { // base 填充
+		t.Fatalf("device = %q, want base value", h.Device)
+	}
+	if h.ASRGateway != "ws://172.16.53.179:8210" { // override 胜
+		t.Fatalf("asr_gateway = %q, want override value", h.ASRGateway)
+	}
+	if h.NoTTS { // override 的 false 盖掉 base 的 true
+		t.Fatal("no_tts = true, want override false")
+	}
+	if h.Backend != "http://127.0.0.1:8800" || h.LightColors != "202020,00a000,2050ff" { // 默认兜底
+		t.Fatalf("host 默认缺失：%+v", h)
+	}
+	if h.NoASR || h.NoStdin || h.NoInputGate || h.NoLight || h.NoMicMute || h.NoVision {
+		t.Fatalf("no_* 零值默认被破坏：%+v", h)
+	}
+}

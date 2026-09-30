@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 // wavHeaderLen 是 backend 流式响应开头的 WAV 头长度（标准 44 字节，RIFF
@@ -49,11 +50,25 @@ type ttsPlayback struct {
 	killed bool      // stop() 已到：整条掐断。与 fin 分开——收口是正常生命
 	// 周期（音频还要继续放完），死亡才要掐；共用一个标志会让「先收口、
 	// 后建好 sink」（合成排队慢时必现）被误判成掐断，整条静音。
+
+	// done 在播放 goroutine 结束后关闭；err 是失败原因（写 err 与
+	// close done 都在 goroutine 内，等待方经 done 读到的即定值）——
+	// speak 工具阻塞等的就是 done。
+	done chan struct{}
+	err  error
+
+	// chain 是 FIFO 队列的收尾钩子（nil = 无队列）：播放 goroutine 退出
+	// 前恰好调用一次，成功路径在 waitDrain 后（返回值决定是否还要回声
+	// 静默窗——下一段紧跟着播就没有静默可言），失败路径经 defer 兜底
+	// （死段也要推进队列，否则 FIFO 卡死）。仅播放 goroutine 触碰。
+	chain   func() bool
+	chained bool
 }
 
 func startPlayback(base string, hc *http.Client, log *slog.Logger,
 	newSink func(ctx context.Context, rate, channels int) audioSink,
-	gate Gate) (*ttsPlayback, error) {
+	gate Gate, echoMute time.Duration,
+	chain func() bool) (*ttsPlayback, error) {
 	pr, pw := io.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
@@ -65,19 +80,33 @@ func startPlayback(base string, hc *http.Client, log *slog.Logger,
 	}
 	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
 
-	p := &ttsPlayback{cancel: cancel, pw: pw}
+	p := &ttsPlayback{cancel: cancel, pw: pw, done: make(chan struct{}), chain: chain}
 	go func() {
+		// 注册在最前 = 最后执行：gate.Release() 先走、done 后关——等待方
+		// 看到 done 时播放份额已还。
+		defer close(p.done)
 		// 播放份额从「TTS 请求发出」就持有（而非首个音频到达后）：
 		// 正文生成完到音频开始之间可能隔着整个合成排队（RVC 忙时以十秒
 		// 计），这段空窗里轮次份额已还、闸门清空——灯提前掉回待机、
 		// 半双工放行，等音频来了再跳回去。份额现在覆盖 请求→排空 全程。
 		gate.Acquire()
 		defer gate.Release()
+		if chain != nil {
+			// 失败路径的兜底推进（成功路径在 waitDrain 后已内联调用）：
+			// 注册在 Release 之后 = 先于它执行，队列不等闸门归还。
+			defer func() {
+				if !p.chained {
+					p.chained = true
+					chain()
+				}
+			}()
+		}
 		resp, err := hc.Do(req)
 		if err != nil {
 			if ctx.Err() == nil {
 				log.Error("tts: 请求失败", "err", err)
 			}
+			p.err = err
 			_ = pw.CloseWithError(err) // feed 侧随即 fin
 			return
 		}
@@ -87,16 +116,19 @@ func startPlayback(base string, hc *http.Client, log *slog.Logger,
 		// 非法头响亮失败——不猜默认值。
 		header := make([]byte, wavHeaderLen)
 		if _, err := io.ReadFull(resp.Body, header); err != nil {
+			p.err = fmt.Errorf("流头读取失败: %w", err)
 			log.Error("tts: 流头读取失败", "err", err)
 			return
 		}
 		rate, channels, err := parseWavHeader(header)
 		if err != nil {
+			p.err = err
 			log.Error("tts: 非法 WAV 流头", "err", err)
 			return
 		}
 		sink := newSink(ctx, rate, channels)
 		if err := sink.begin(); err != nil {
+			p.err = fmt.Errorf("播放启动失败: %w", err)
 			log.Error("tts: 播放启动失败（本条静音，文字照常）", "err", err,
 				"rate", rate, "channels", channels)
 			sink.stop()
@@ -120,11 +152,31 @@ func startPlayback(base string, hc *http.Client, log *slog.Logger,
 				}
 			}
 			if rerr != nil {
-				break // io.EOF：音频全量送达
+				if !errors.Is(rerr, io.EOF) {
+					p.err = fmt.Errorf("音频流中断: %w", rerr) // EOF=正常收流，其余是截断
+				}
+				break
 			}
 		}
 		sink.end()
 		sink.waitDrain() // 等设备放完（end 之后设备侧还在排空）
+		// FIFO 收尾钩子：段放完时推进队列（放行预取段的缓冲直灌）。
+		// 返回 false = 下一段无缝紧跟，跳过回声静默窗——接缝处声音
+		// 不断，VAD 无从把尾音误成轮。
+		mute := true
+		if chain != nil {
+			p.chained = true
+			mute = chain()
+		}
+		// 回声静默窗：闸门再续持一会儿，吞掉 VAD 对播放尾音的迟到成轮
+		// ——final 若恰好在闸门放行后到达，就成了自问自答的种子。打断
+		// （ctx 取消）时立即让位，不拖响应。
+		if mute && echoMute > 0 {
+			select {
+			case <-time.After(echoMute):
+			case <-ctx.Done():
+			}
+		}
 	}()
 
 	return p, nil

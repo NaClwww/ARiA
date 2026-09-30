@@ -129,6 +129,9 @@ type Loop struct {
 	messages []message.Message
 	turn     int
 	runID    string
+	// stopRequested：本 run 内 Stopper 工具成功执行过（模型显式收尾），
+	// 工具段结束时收敛；steering 输入送达时复位（插话优先于收尾）。
+	stopRequested bool
 }
 
 type cancelBox struct{ fn context.CancelFunc }
@@ -190,6 +193,7 @@ func (l *Loop) Run(parent context.Context, input []message.Message) (RunResult, 
 	// AgentStart 属于本轮第 0 轮。不复位会把上一轮结束时的计数值写进 durable
 	// 记录（Loop 是复用的：一个 Session 一个 Loop），同一 run 内 turn 自相矛盾。
 	l.turn = 0
+	l.stopRequested = false
 	l.messages = cloneMessages(input)
 
 	scope, _ := ctxx.ScopeFrom(parent)
@@ -230,6 +234,9 @@ func (l *Loop) Run(parent context.Context, input []message.Message) (RunResult, 
 			l.execCalls(runCtx, msg.ToolCalls)
 		}
 		injected := l.drainQueue()
+		if injected > 0 {
+			l.stopRequested = false // steering 送达：插话优先于模型收尾，回答后可再停
+		}
 		l.emit(KindTurnEnd, TurnEndData{Turn: l.turn, Usage: usage})
 
 		// 恢复点先查 parent（02 §6）：Interrupt（转向）≠ parent 取消（关机）
@@ -239,8 +246,9 @@ func (l *Loop) Run(parent context.Context, input []message.Message) (RunResult, 
 		if l.interrupt.Load() && l.sealQuiet() {
 			return l.finish(EndInterrupted, turns, total, nil)
 		}
-		// 本轮无工具调用、也没有新注入的输入 → 自然收敛（sealQuiet 同上）
-		if len(msg.ToolCalls) == 0 && injected == 0 && l.sealQuiet() {
+		// 本轮无工具调用、也没有新注入的输入 → 自然收敛（sealQuiet 同上）；
+		// Stopper 工具成功执行过 → 模型显式收尾，同样收敛为 EndDone。
+		if (l.stopRequested || len(msg.ToolCalls) == 0) && injected == 0 && l.sealQuiet() {
 			return l.finish(EndDone, turns, total, nil)
 		}
 		// 其余情况续轮：有工具结果待续 / 有新注入的输入待回答
@@ -405,6 +413,15 @@ attemptLoop:
 // 注册 cancel」空档内到达的 Interrupt 必被捕获。
 func (l *Loop) execCalls(ctx context.Context, calls []message.ToolCall) {
 	for _, tc := range calls {
+		// 收尾已请求（同批更早的 Stopper 成功过）：剩余调用不再执行——
+		// 模型把 stop 排在批次中间时，后面的调用是它的犹豫改口，照单执行
+		// 只会把矛盾内容全部放出去。补 stopped 结果保证配对完整。
+		if l.stopRequested {
+			res := stopped(tc.ID)
+			l.messages = append(l.messages, res.ToMessage())
+			l.emit(KindToolExecEnd, ToolExecEndData{Call: tc, Result: res})
+			continue
+		}
 		callCtx, callCancel := context.WithCancel(ctx)
 		l.opCancel.Store(&cancelBox{fn: callCancel})
 		if l.interrupt.Load() {
@@ -488,6 +505,13 @@ func (l *Loop) execTool(ctx context.Context, tc message.ToolCall) message.ToolRe
 	if tctx.Err() != nil && !res.IsError {
 		res.IsError = true
 		res.Blocks = append(res.Blocks, message.TextBlock{Text: "[tool interrupted]"})
+	}
+	// Stopper 在成功（含上面翻转后的最终态）之后才计收尾请求：被取消/失败
+	// 的 stop 不许拦腰掐 run——模型没说成这句话。
+	if !res.IsError {
+		if s, ok := asStopper(t); ok && s.StopsLoop() {
+			l.stopRequested = true
+		}
 	}
 	return res
 }
@@ -614,6 +638,28 @@ func (l *Loop) waitRetry(ctx context.Context, attempt int) bool {
 func aborted(callID string) message.ToolResult {
 	return message.ToolResult{CallID: callID, IsError: true,
 		Blocks: []message.Block{message.TextBlock{Text: "[interrupted]"}}}
+}
+
+// stopped 是「本 run 已收尾，调用未执行」的结果（Stopper 截断批次用）。
+func stopped(callID string) message.ToolResult {
+	return message.ToolResult{CallID: callID, IsError: true,
+		Blocks: []message.Block{message.TextBlock{Text: "[stopped: run 已收尾，本调用未执行]"}}}
+}
+
+// asStopper 沿 Unwrap 链解包探测 Stopper：装饰器（如 toolkit.Truncate）
+// 包装工具时不必转发每个能力接口，只要按惯例交出内层。真机教训
+// （2026-09-29）：直接断言包装器，stop 执行成功 run 却续了轮。
+func asStopper(t tool.Tool) (tool.Stopper, bool) {
+	for {
+		if s, ok := t.(tool.Stopper); ok {
+			return s, true
+		}
+		u, ok := t.(interface{ Unwrap() tool.Tool })
+		if !ok {
+			return nil, false
+		}
+		t = u.Unwrap()
+	}
 }
 
 func cloneMessages(in []message.Message) []message.Message {

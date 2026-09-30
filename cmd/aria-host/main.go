@@ -9,7 +9,12 @@
 //	  │partial                     │轮次份额        │事件流
 //	  ↓                            ↓               ├──→ 终端渲染（ariahost）
 //	gowild.Light ←──迁移订阅── gowild.Gate ←─生成/播放份额
-//	gowild.MicMute ←─迁移订阅──┘（闭耳：回合中 backend 源头丢 mic 流，防自回声）
+//	gowild.MicMute ←──迁移订阅──┘（闭耳：回合中 backend 源头丢 mic 流，防自回声）
+//
+// asr-gateway 模式（EPYC VM 网关，见 Gowild-HE/asr_backend）：mic 由
+// gowild.Gateway 自己拉音箱流转发网关 WS（FSMN-VAD+整句 ASR+声纹），
+// speech_start 驱灯、final 交付同上；闭耳 = 网关 reset + 本地停转
+// （MicMute/backend SSE 不参与，TTS 仍走 backend）。
 //
 // 挂载顺序纪律（runtime/app，执行顺序是容器存在的理由）：链底 OnShutdown
 // 先注册（会话/引擎关闭最后跑）→ 事件消费者（终端/TTS）→ 闸门订阅者
@@ -17,6 +22,11 @@
 //
 // 尚未接入：口型同步、真·抢话（现在是半双工闸门：说话/生成期间不收新
 // 输入）、人设标签剥离与表情映射。引擎不动。
+//
+// 启动项：装配项（backend/asr_gateway/device/light_colors/各 no_* 开关）
+// 的基准在 aria.toml [host] 段，机器差异写 aria.override.toml；同名 flag
+// 显式给出时仅本次运行覆盖。留成 flag 的只有引导三件（--config/--override
+// 路径本身）、--fake（冒烟开关）和 --api-key（秘密，本体不落盘）。
 //
 // 用法：
 //
@@ -39,41 +49,131 @@ import (
 	"time"
 
 	"aria/core/loop"
+	"aria/core/tool"
 	ariahost "aria/internal/aria-host"
+	"aria/internal/config"
 	gowild "aria/plugins/voice/gowild"
 	"aria/runtime/app"
 )
 
-const defaultBackend = "http://127.0.0.1:8800"
-
 func main() {
 	var (
+		// 引导项：只能走 flag（config 路径本身 / 冒烟开关 / 秘密）。
 		fake         = flag.Bool("fake", false, "使用内置 echo provider（无网络，验证链路）")
 		configPath   = flag.String("config", "aria.toml", "配置文件路径（人写基准，启动时读一次）")
 		overridePath = flag.String("override", "aria.override.toml", "覆盖文件路径")
-		backend      = flag.String("backend", defaultBackend, "ASR/TTS 后端地址（Gowild-HE-Backend :8800）")
-		noASR        = flag.Bool("no-asr", false, "停用 ASR 插头（纯终端开发）")
-		noStdin      = flag.Bool("no-stdin", false, "停用 stdin 插头（纯语音）")
-		noTTS        = flag.Bool("no-tts", false, "停用 TTS 播放（只看文字）")
-		noInputGate  = flag.Bool("no-input-gate", false, "关闭「说话/生成期间不接受新输入」闸门（半双工）")
-		device       = flag.String("device", "", "launcher 控制面地址，TTS 从设备出声（如 http://127.0.0.1:18900）；空 = 本机 paplay")
 		apiKey       = flag.String("api-key", "", "API key；空则按配置的 api_key_env 读环境变量")
-		noLight      = flag.Bool("no-light", false, "停用状态灯（会话状态 → 设备 RGB 指示灯，仅 --device 模式）")
-		lightColors  = flag.String("light-colors", "202020,00a000,2050ff", "状态灯颜色 idle,listening,thinking（hex，# 可选；暗白/绿/蓝）")
-		noMicMute    = flag.Bool("no-mic-mute", false, "停用回合内闭耳（默认开：agent 生成/放音期间 backend 源头丢 mic 流，防自回声+省解码）")
-		noVision     = flag.Bool("no-vision", false, "停用视觉注入（默认开：摄像头当前帧每轮进上下文底部，仅 --device 模式）")
+
+		// 装配项：基准在 aria.toml [host] 段，这里只做「本次运行」的显式
+		// 覆盖——默认零值 = 不覆盖，生效值一律以解析后的 h 为准。
+		backend     = flag.String("backend", "", "覆盖 [host] backend：TTS 后端根地址（非 gateway 模式下也是 ASR 地址）")
+		asrGateway  = flag.String("asr-gateway", "", "覆盖 [host] asr_gateway：asr-gateway WS 根地址（EPYC VM）；非空 = ASR 走网关（需 device；TTS 仍走 backend）")
+		device      = flag.String("device", "", "覆盖 [host] device：launcher 控制面根地址；空 = 本机 paplay")
+		lightColors = flag.String("light-colors", "", "覆盖 [host] light_colors：灯色 idle,listening,thinking（hex，逗号分隔）")
+		noASR       = flag.Bool("no-asr", false, "覆盖 [host] no_asr：停用 ASR 插头（纯终端开发）")
+		noStdin     = flag.Bool("no-stdin", false, "覆盖 [host] no_stdin：停用 stdin 插头（纯语音）")
+		noTTS       = flag.Bool("no-tts", false, "覆盖 [host] no_tts：停用 TTS 播放（只看文字）")
+		noInputGate = flag.Bool("no-input-gate", false, "覆盖 [host] no_input_gate：关闭「播放期间不接受新输入」闸门（半双工）")
+		noLight     = flag.Bool("no-light", false, "覆盖 [host] no_light：停用状态灯（会话状态 → 设备 RGB 指示灯，仅 device 模式）")
+		noMicMute   = flag.Bool("no-mic-mute", false, "覆盖 [host] no_mic_mute：停用播放期间闭耳（默认开：实际送播至排空期间丢 mic，之后保留 300ms 尾音缓冲）")
+		noVision    = flag.Bool("no-vision", false, "覆盖 [host] no_vision：停用视觉注入（默认开：摄像头当前帧每轮进上下文底部，仅 device 模式）")
+		speakTool   = flag.Bool("speak-tool", false, "覆盖 [host] speak_tool：TTS 改为 speak 工具（模型显式调用出声、正文不自动朗读）")
 	)
 	flag.Parse()
 
+	// 显式给出的 flag 才参与覆盖：Visit 只报命令行真正出现的名字，零值
+	// 默认不算。装配项全部收口到 h，此后只读 h。
+	set := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-	visionBase := *device
-	if *noVision {
+	// [host] 要在引擎装配前生效（device/no_vision 是 NewEngine 的入参），
+	// 先读一份；NewEngine 内部会再 Load 一次（两个小文件，双读无碍）。
+	mgr, err := config.Load(*configPath, *overridePath)
+	if err != nil {
+		log.Error("配置加载失败（仓库根有 aria.toml 样例，路径可用 --config 指定）", "err", err)
+		os.Exit(2)
+	}
+	h := mgr.Effective().Host
+	if set["backend"] {
+		h.Backend = *backend
+	}
+	if set["asr-gateway"] {
+		h.ASRGateway = *asrGateway
+	}
+	if set["device"] {
+		h.Device = *device
+	}
+	if set["light-colors"] {
+		h.LightColors = *lightColors
+	}
+	if set["no-asr"] {
+		h.NoASR = *noASR
+	}
+	if set["no-stdin"] {
+		h.NoStdin = *noStdin
+	}
+	if set["no-tts"] {
+		h.NoTTS = *noTTS
+	}
+	if set["no-input-gate"] {
+		h.NoInputGate = *noInputGate
+	}
+	if set["no-light"] {
+		h.NoLight = *noLight
+	}
+	if set["no-mic-mute"] {
+		h.NoMicMute = *noMicMute
+	}
+	if set["no-vision"] {
+		h.NoVision = *noVision
+	}
+	if set["speak-tool"] {
+		h.SpeakTool = *speakTool
+	}
+	if h.SpeakTool && h.NoTTS {
+		log.Error("speak_tool 需要 TTS 管线（不能同时给 no_tts）")
+		os.Exit(2)
+	}
+
+	visionBase := h.Device
+	if h.NoVision {
 		visionBase = ""
 	}
+
+	// 半双工闸门与 TTS 管线先于 agent 就位：speak 工具复用 TTS 管线与闸门
+	// （工具表在引擎装配 agent.New 时就要交出去），闸门又是 TTS/灯/闭耳/
+	// 输入纪律共用的信号源。
+	gate := gowild.NewGate()         // 轮次忙碌，供状态灯使用
+	playbackGate := gowild.NewGate() // 仅实际放音，供半双工输入使用
+	var tts *gowild.TTS
+	var speakTools []tool.Tool
+	extraPrompt := ""
+	if !h.NoTTS {
+		t, terr := gowild.NewTTS(gowild.TTSConfig{
+			Base: h.Backend, Device: h.Device, SilentBody: h.SpeakTool, PlaybackGate: playbackGate,
+		}, gate, log)
+		if terr != nil {
+			log.Error("tts 装配失败", "err", terr)
+			os.Exit(2)
+		}
+		tts = t
+		// 语音声明跟装配走：模型得知道这台设备上「什么话会出声、怎么
+		// 说才像人话」——两种模式答案不同，见各 Instruction 注释。
+		if h.SpeakTool {
+			speakTools = append(speakTools, gowild.NewSpeakTool(tts), gowild.NewStopTool())
+			extraPrompt = gowild.SpeakToolInstruction
+			log.Info("tts: speak 工具模式（模型显式调用出声、正文不再自动朗读；block 可选阻塞/非阻塞；stop 显式收尾）")
+		} else {
+			extraPrompt = gowild.VoiceRenderInstruction
+		}
+	}
+
 	eng, err := ariahost.NewEngine(ariahost.Options{
 		ConfigPath: *configPath, OverridePath: *overridePath,
-		Fake: *fake, APIKey: *apiKey, VisionBase: visionBase, Logger: log,
+		Fake: *fake, APIKey: *apiKey, VisionBase: visionBase,
+		Tools: speakTools, ExtraPrompt: extraPrompt, SpeakTool: h.SpeakTool, Logger: log,
 	})
 	if err != nil {
 		log.Error("engine 装配失败", "err", err)
@@ -97,9 +197,9 @@ func main() {
 		}
 	})
 
-	// 半双工闸门（引用计数 + 迁移订阅）：输入纪律、TTS、状态灯、闭耳共用
-	// 的信号源——「她正忙着说」这条总线在插件里，宿主只接线。
-	gate := gowild.NewGate()
+	// 半双工闸门（引用计数 + 迁移订阅）：已在引擎装配前创建（speak 工具
+	// 复用）——输入纪律、TTS、状态灯、闭耳共用的信号源，「她正忙着说」
+	// 这条总线在插件里，宿主只接线。
 
 	// ---- 事件消费者（输入插头之前挂：事件不重放，晚订阅者错过即错过）----
 
@@ -108,44 +208,43 @@ func main() {
 		ariahost.ConsumeTerminal(ch, os.Stdout, os.Stderr)
 	})
 
-	// 消费者 2：TTS（流式合成 → 设备扬声器/paplay；闸门的生成/播放份额在此持有）。
-	if !*noTTS {
-		tts, terr := gowild.NewTTS(gowild.TTSConfig{Base: *backend, Device: *device}, gate, log)
-		if terr != nil {
-			log.Error("tts 装配失败", "err", terr)
-			os.Exit(2)
-		}
+	// 消费者 2：TTS（流式合成 → 设备扬声器/paplay；闸门的生成/播放份额在此
+	// 持有）。speak 工具模式下正文不上嘴，消费者只留轮次份额与未出声提示。
+	if tts != nil {
 		app.Mount("tts", 0, tts.Run)
 	}
 
 	// ---- 闸门订阅者 ----
 
-	// 闭耳：回合中 backend 源头丢 mic 流（防自回声 + 省流式解码）。收尾先
-	// 停桥再显式开耳——耳朵是音箱的资产，别把 backend 留在闭耳态。
-	if !*noASR && !*noMicMute {
-		micMute := gowild.NewMicMute(*backend, log)
-		cancel := gowild.FollowGate(gate, micMute, 300*time.Millisecond)
+	// 闭耳：回合中在源头丢 mic 流（防自回声 + 省流式解码）。收尾先停桥再
+	// 显式开耳——耳朵是音箱的资产，别把水槽留在闭耳态。asr-gateway 模式
+	// 的闭耳挂到网关插头自身（reset + 停转），在插头段装配。
+	useGateway := h.ASRGateway != ""
+	if !h.NoASR && !h.NoMicMute && !useGateway {
+		micMute := gowild.NewMicMute(h.Backend, log)
+		cancel := gowild.FollowGate(playbackGate, micMute, 300*time.Millisecond)
 		app.OnShutdown("micmute", func() { cancel(); micMute.Set(false) })
 	}
 
 	// 状态灯（摄像头旁 RGB）：订阅闸门迁移 + partial 心跳；退出收回待机。
 	var light *gowild.Light
-	if *device != "" && !*noLight {
-		ld, lerr := gowild.NewLight(gowild.LightConfig{Base: *device, Colors: *lightColors}, gate, log)
+	if h.Device != "" && !h.NoLight {
+		ld, lerr := gowild.NewLight(gowild.LightConfig{Base: h.Device, Colors: h.LightColors}, gate, log)
 		if lerr != nil {
 			log.Error("light 装配失败", "err", lerr)
 			os.Exit(2)
 		}
 		light = ld
 		app.OnShutdown("light", light.SettleIdle)
-		log.Info("light: 状态灯联动（待机暗白 / 收听绿 / 思考蓝）", "device", *device)
+		log.Info("light: 状态灯联动（待机暗白 / 收听绿 / 思考蓝）", "device", h.Device)
 	}
 
 	// 输入纪律（半双工：拦截 + 轮次份额）——策略在插件，引擎投递口在本壳。
 	input, ierr := gowild.NewInput(gowild.InputConfig{
-		Sink:   ariahost.Sink{Session: sess, Cfg: cfg},
-		Gate:   gate,
-		Bypass: *noInputGate,
+		Sink:         ariahost.Sink{Session: sess, Cfg: cfg},
+		Gate:         gate,
+		PlaybackGate: playbackGate,
+		Bypass:       h.NoInputGate,
 		OnIgnored: func(text string) {
 			fmt.Fprintf(os.Stderr, "·（正在说话，忽略输入）%s\n", ariahost.TruncStr(strings.TrimSpace(text), 40))
 		},
@@ -170,52 +269,75 @@ func main() {
 	// ---- 输入插头最后挂：所有消费者就位后才放输入进来 ----
 	var plugs []string
 	quit := make(chan struct{})
-	if !*noASR {
+	if !h.NoASR {
 		var onPartial func()
 		if light != nil {
 			onPartial = light.Heartbeat
 		}
-		asr, aerr := gowild.NewASR(gowild.ASRConfig{
-			Base:    *backend,
-			Speaker: cfg.Session.DefaultUser,
-			OnFinal: func(text, speaker string) {
-				fmt.Fprintf(os.Stderr, "%s(语音)> %s\n", speaker, text) // 渲染归宿主，插件只交付
-				input.Deliver(text, speaker)
-			},
-			OnPartial: onPartial,
-		}, log)
-		if aerr != nil {
-			log.Error("asr 装配失败", "err", aerr)
-			os.Exit(2)
+		if useGateway {
+			if h.Device == "" {
+				log.Error("asr-gateway 模式需要 device（拉音箱 mic 流）")
+				os.Exit(2)
+			}
+			gw, gerr := gowild.NewGateway(gowild.GatewayConfig{
+				Base:    h.ASRGateway,
+				MicURL:  strings.TrimSuffix(h.Device, "/") + "/api/voice/mic/stream",
+				Speaker: cfg.Session.DefaultUser,
+				OnFinal: func(text, speaker string) {
+					fmt.Fprintf(os.Stderr, "%s(语音)> %s\n", speaker, text) // 渲染归宿主，插件只交付
+					input.Deliver(text, speaker)
+				},
+				OnSpeechStart: onPartial, // 整句 ASR 无 partial，收听信号 = VAD 开口
+			}, log)
+			if gerr != nil {
+				log.Error("asr-gateway 装配失败", "err", gerr)
+				os.Exit(2)
+			}
+			app.Service("asr-gateway", gw.Run)
+			plugs = append(plugs, "asr-gateway")
+			if !h.NoMicMute {
+				cancel := gowild.FollowGate(playbackGate, gw, 300*time.Millisecond)
+				app.OnShutdown("micmute", func() { cancel(); gw.Set(false) })
+			}
+		} else {
+			asr, aerr := gowild.NewASR(gowild.ASRConfig{
+				Base:    h.Backend,
+				Speaker: cfg.Session.DefaultUser,
+				OnFinal: func(text, speaker string) {
+					fmt.Fprintf(os.Stderr, "%s(语音)> %s\n", speaker, text) // 渲染归宿主，插件只交付
+					input.Deliver(text, speaker)
+				},
+				OnPartial: onPartial,
+			}, log)
+			if aerr != nil {
+				log.Error("asr 装配失败", "err", aerr)
+				os.Exit(2)
+			}
+			app.Service("asr", asr.Run) // ctx 取消即断流退场（旧版 Background 从不收）
+			plugs = append(plugs, "asr")
 		}
-		app.Service("asr", asr.Run) // ctx 取消即断流退场（旧版 Background 从不收）
-		plugs = append(plugs, "asr")
 	}
-	if !*noStdin {
+	if !h.NoStdin {
 		// stdin EOF 是否收工取决于有没有 ASR 插头：语音形态要常驻；quit 由
 		// /quit/EOF 触发，Service 收尾等它自然返回即可。
 		app.Service("stdin", func(context.Context) {
-			ariahost.StdinPlug(os.Stdin, input.Deliver, cfg.Session.DefaultUser, *noASR, quit)
+			ariahost.StdinPlug(os.Stdin, input.Deliver, cfg.Session.DefaultUser, h.NoASR, quit)
 		})
 		plugs = append(plugs, "stdin")
 	}
 	if len(plugs) == 0 {
-		fmt.Fprintln(os.Stderr, "没有启用的插头（--no-asr --no-stdin）——无事可做，退出")
+		fmt.Fprintln(os.Stderr, "没有启用的插头（no_asr && no_stdin）——无事可做，退出")
 		os.Exit(0)
 	}
 
 	fmt.Fprintf(os.Stderr, "ARiA host · 插头 %v · backend %s · 模型 %s · 会话 %s · 说话人 %s\n",
-		plugs, orDefault(*backend, defaultBackend), eng.ModelName(), cfg.Session.ID, cfg.Session.DefaultUser)
+		plugs, h.Backend, eng.ModelName(), cfg.Session.ID, cfg.Session.DefaultUser)
+	if useGateway {
+		fmt.Fprintf(os.Stderr, "asr-gateway %s（backend 仅承担 TTS）\n", h.ASRGateway)
+	}
 	fmt.Fprintln(os.Stderr, "输入一句话回车发送；[名字] 开头切换说话人；/quit 退出；Ctrl+C 打断。")
 
 	// 阻塞到 /quit/EOF，然后逆序收尾：输入插头先停 → 消费者排干 → 灯/耳
 	// 资产回收 → 会话结算 → record 收口。
 	app.Run(quit)
-}
-
-func orDefault(s, def string) string {
-	if s == "" {
-		return def
-	}
-	return s
 }

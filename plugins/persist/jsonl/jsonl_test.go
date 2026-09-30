@@ -209,3 +209,27 @@ func TestStoreUnknownKindKept(t *testing.T) {
 		t.Fatalf("unknown kind dropped: %s", b)
 	}
 }
+
+func TestStoreWindowCompressedShape(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.jsonl")
+	s, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	rep := loop.WindowCompressedData{
+		InMessages: 24, InChars: 21482, OutMessages: 2, OutChars: 640,
+	}
+	if err := s.Append(context.Background(), "aria", loop.Event{Kind: loop.KindWindowCompressed, Data: rep}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"kind":"window_compressed"`, `"in_messages":24`, `"in_chars":21482`, `"out_messages":2`} {
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("压缩事件缺字段 %s：%s", want, b)
+		}
+	}
+}

@@ -2,7 +2,10 @@ module aria
 
 go 1.24
 
-require github.com/spf13/viper v1.21.0
+require (
+	github.com/gorilla/websocket v1.5.3
+	github.com/spf13/viper v1.21.0
+)
 
 require (
 	github.com/fsnotify/fsnotify v1.10.1 // indirect

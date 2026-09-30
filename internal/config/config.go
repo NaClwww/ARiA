@@ -29,6 +29,7 @@ import (
 // 访问一律带段名（c.Provider.Model）：内嵌会让 c.Model 这类写法在多个段
 // 有同名字段时产生歧义（Provider.Model 与 Compress.Model）。
 type Config struct {
+	Host     Host
 	Server   Server
 	Provider Provider
 	Persona  Persona
@@ -38,6 +39,25 @@ type Config struct {
 	Tools    Tools
 	Record   Record
 	Limits   Limits
+}
+
+// Host 是宿主装配段（cmd/aria-host 的启动项基准）：地址与开关。同名 flag
+// 显式给出时由 main.go 覆盖（进程内、不落盘）；机器差异（IP/端口/adb 转发
+// 口）放 override 层。fake/api-key 不进本段——前者是冒烟开关、后者是秘密，
+// 都留在 flag。
+type Host struct {
+	Backend     string // TTS 后端根地址（非 gateway 模式下也是 ASR 地址）
+	ASRGateway  string // 非空 = ASR 走 asr-gateway（WS，需 device）
+	Device      string // launcher 控制面根地址；空 = 本机 paplay、无灯无视觉
+	LightColors string // 灯色 idle,listening,thinking（hex，逗号分隔）
+	SpeakTool   bool   // TTS 改为 speak 工具：模型显式调用出声，正文不自动朗读
+	NoASR       bool   // 停用 ASR 插头（纯终端开发）
+	NoStdin     bool   // 停用 stdin 插头（纯语音形态）
+	NoTTS       bool   // 停用 TTS 播放（只看文字）
+	NoInputGate bool   // 关闭半双工闸门（说话/生成期间不收新输入）
+	NoLight     bool   // 停用状态灯
+	NoMicMute   bool   // 停用回合内闭耳
+	NoVision    bool   // 停用视觉注入
 }
 
 type Server struct {
@@ -352,6 +372,20 @@ func (m *Manager) notify(c Config) {
 
 func configFrom(v *viper.Viper) Config {
 	return Config{
+		Host: Host{
+			Backend:     v.GetString("host.backend"),
+			ASRGateway:  v.GetString("host.asr_gateway"),
+			Device:      v.GetString("host.device"),
+			LightColors: v.GetString("host.light_colors"),
+			SpeakTool:   v.GetBool("host.speak_tool"),
+			NoASR:       v.GetBool("host.no_asr"),
+			NoStdin:     v.GetBool("host.no_stdin"),
+			NoTTS:       v.GetBool("host.no_tts"),
+			NoInputGate: v.GetBool("host.no_input_gate"),
+			NoLight:     v.GetBool("host.no_light"),
+			NoMicMute:   v.GetBool("host.no_mic_mute"),
+			NoVision:    v.GetBool("host.no_vision"),
+		},
 		Server: Server{Listen: v.GetString("server.listen")},
 		Provider: Provider{
 			BaseURL:   v.GetString("provider.base_url"),
@@ -386,6 +420,11 @@ func configFrom(v *viper.Viper) Config {
 }
 
 func setDefaults(v *viper.Viper) {
+	// host.no_* 不设默认：bool 零值 false 就是默认（关）。
+	v.SetDefault("host.backend", "http://127.0.0.1:8800")
+	v.SetDefault("host.asr_gateway", "")
+	v.SetDefault("host.device", "")
+	v.SetDefault("host.light_colors", "202020,00a000,2050ff")
 	v.SetDefault("server.listen", "127.0.0.1:8080")
 	v.SetDefault("provider.base_url", "")
 	v.SetDefault("provider.model", "")

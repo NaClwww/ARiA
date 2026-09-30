@@ -204,6 +204,20 @@ func (a *Agent) NewSession(scope ctxx.Scope) (*Session, error) {
 		dead:   make(chan struct{}),
 		grace:  a.grace,
 		log:    a.log,
+		store:  a.cfg.Store,
+	}
+	// 压缩观测 → durable 事件直写 store（压缩发生在 run 之间，不经飞轮总线；
+	// jsonl 单行锁串行化两路写入）。失败只响亮记日志——压缩本身已落地，
+	// 审计写失败不该连坐会话。
+	if a.cfg.Store != nil {
+		win.SetOnCompress(func(rep loop.WindowCompressedData) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			ev := loop.Event{Kind: loop.KindWindowCompressed, At: time.Now(), Data: rep}
+			if err := s.store.Append(ctx, scope.SessionID, ev); err != nil {
+				s.log.Error("agent: window_compressed 落盘失败", "session", scope.SessionID, "err", err)
+			}
+		})
 	}
 
 	// 窗口订阅：durable 消息事件进本轮缓冲，AgentEnd 结算进窗口（03 §5）。
@@ -266,6 +280,7 @@ type Session struct {
 
 	persistDone   chan struct{}
 	persistCancel context.CancelFunc
+	store         persist.Store // 压缩事件直写用；主 durable 流仍走总线订阅
 
 	runMu sync.Mutex // 一 Session 同时只跑一轮
 

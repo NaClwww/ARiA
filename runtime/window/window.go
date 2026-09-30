@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"sync"
 
+	"aria/core/loop"
 	"aria/pkg/ctxx"
 	"aria/pkg/message"
 )
@@ -46,6 +47,7 @@ type Window struct {
 	compressing bool
 	pending     bool
 	pendingCtx  context.Context // 触发待压缩批次的 Settle 的 ctx：下一轮压缩换用它的身份
+	onCompress  func(loop.WindowCompressedData)
 	closed      bool
 	cancel      context.CancelFunc // 在途压缩的取消（Close 用）
 	compDone    chan struct{}      // 在途压缩的完成信号：结束即关闭（Wait 用）
@@ -67,6 +69,16 @@ func New(compressor Compressor, log *slog.Logger) *Window {
 func (w *Window) SetSystem(text string) {
 	w.mu.Lock()
 	w.system = text
+	w.mu.Unlock()
+}
+
+// SetOnCompress 注册压缩观测（装配期调用）：每次间隙压缩结束后（成功或
+// 失败）在压缩 goroutine 上同步回调，报告规模与结果。回调必须快、不得再
+// 调窗口方法（会死锁）；nil 关闭。落盘审计（window_compressed 事件）经此缝
+// 由 Session 接走——窗口本身不认识事件总线。
+func (w *Window) SetOnCompress(fn func(loop.WindowCompressedData)) {
+	w.mu.Lock()
+	w.onCompress = fn
 	w.mu.Unlock()
 }
 
@@ -165,11 +177,18 @@ func (w *Window) compress(ctx context.Context) {
 		w.recent, w.pending = nil, false
 		w.inflight = turn
 		comp := w.compressor // 持锁取出：SetCompressor 可能并发替换字段
+		onCompress := w.onCompress
 		w.mu.Unlock()
 
 		out, err := comp.Compress(ctx, mem, turn)
 		if err == nil && len(out) == 0 {
 			err = errors.New("window: compressor returned empty memory")
+		}
+		report := loop.WindowCompressedData{
+			InMessages:  len(mem) + len(turn),
+			InChars:     charsOf(mem) + charsOf(turn),
+			OutMessages: len(out),
+			OutChars:    charsOf(out),
 		}
 
 		w.mu.Lock()
@@ -181,25 +200,49 @@ func (w *Window) compress(ctx context.Context) {
 			if n := w.fallbackCap; n > 0 && len(mem) > n {
 				trimmed := trimKeepLast(mem, n)
 				w.log.Warn("window: fallback trimmed", "dropped", len(mem)-len(trimmed), "cap", n)
+				report.FallbackDropped = len(mem) - len(trimmed)
 				mem = trimmed
 			}
 			w.memory = mem
+			report.Err = err.Error()
+			report.OutMessages, report.OutChars = len(mem), charsOf(mem)
 		} else {
 			w.memory = cloneAll(out) // 不持有 Compressor 的切片
 		}
 		w.inflight = nil
-		if !w.pending || w.closed {
+		done := !w.pending || w.closed
+		if done {
 			w.compressing = false
 			w.cancel = nil
 			if w.compDone != nil {
 				close(w.compDone)
 				w.compDone = nil
 			}
-			w.mu.Unlock()
+		}
+		w.mu.Unlock()
+		if onCompress != nil {
+			onCompress(report) // 锁外回调：见 SetOnCompress 的纪律
+		}
+		if done {
 			return
 		}
-		w.mu.Unlock() // 待压缩批次在下一轮快照处换身份（见循环头）
 	}
+}
+
+// charsOf 统计消息中文本与思考块的总字符数（rune）——报告里的信息量粗估。
+func charsOf(ms []message.Message) int {
+	n := 0
+	for _, m := range ms {
+		for _, b := range m.Blocks {
+			switch v := b.(type) {
+			case message.TextBlock:
+				n += len([]rune(v.Text))
+			case message.ThoughtBlock:
+				n += len([]rune(v.Text))
+			}
+		}
+	}
+	return n
 }
 
 // Snapshot 返回记忆（含在途）与近轮的副本（调试与测试用）。

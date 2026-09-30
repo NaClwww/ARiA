@@ -81,11 +81,17 @@ func (m *MicMute) Set(on bool) error {
 	}
 }
 
-// FollowGate 把闸门迁移接到闭耳上：忙 → 闭耳；闲 → 先等 unmuteHold（放掉
-// 设备在途的尾巴 chunk）再确认仍闲才开耳。HTTP 由内部 goroutine 异步下发
-// ——Observe 回调的契约是不做慢活。启动时若闸门闲，先补一发开耳：宿主
-// 若曾在回合中崩溃，backend 会残留在闭耳态，这里负责修复。返回退订函数。
-func FollowGate(gate GateState, mute *MicMute, unmuteHold time.Duration) (cancel func()) {
+// MuteSink 是闭耳水槽：闸门忙 → Set(true) 丢 mic，闲 → Set(false) 开耳。
+// MicMute（backend /asr/mute）与 Gateway（WS reset + 本地停转）各是其实现。
+type MuteSink interface {
+	Set(on bool) error
+}
+
+// FollowGate 把闸门迁移接到闭耳水槽上：忙 → 闭耳；闲 → 先等 unmuteHold
+// （放掉设备在途的尾巴 chunk）再确认仍闲才开耳。下发由内部 goroutine
+// 异步执行——Observe 回调的契约是不做慢活。启动时若闸门闲，先补一发开
+// 耳：宿主若曾在回合中崩溃，水槽会残留在闭耳态，这里负责修复。返回退订函数。
+func FollowGate(gate GateState, mute MuteSink, unmuteHold time.Duration) (cancel func()) {
 	if gate == nil || mute == nil {
 		return func() {}
 	}
@@ -119,11 +125,11 @@ func FollowGate(gate GateState, mute *MicMute, unmuteHold time.Duration) (cancel
 	}
 }
 
-// muteBridge 是迁移→闭耳的桥：吃闸门回调（快），慢活（HTTP）在自己的
+// muteBridge 是迁移→闭耳的桥：吃闸门回调（快），慢活（下发）在自己的
 // goroutine 里做。hold 期间闸门再次变忙则作废本次开耳。
 type muteBridge struct {
 	gate GateState
-	mute *MicMute
+	mute MuteSink
 	hold time.Duration
 	wake chan struct{}
 	done chan struct{}

@@ -755,3 +755,148 @@ func TestAgentStartTurnResetsBetweenRuns(t *testing.T) {
 		}
 	}
 }
+
+// ---------- Stopper：模型显式收尾 ----------
+
+// stopperTool 是 Stopper 的最小实现（模拟 speak 模式的 stop 工具）。
+type stopperTool struct{ onExec func() }
+
+func (stopperTool) Def() tool.Def { return tool.Def{Name: "stop"} }
+func (s stopperTool) Exec(_ context.Context, call tool.Call) tool.Result {
+	if s.onExec != nil {
+		s.onExec()
+	}
+	return tool.Result{CallID: call.ID,
+		Blocks: []message.Block{message.TextBlock{Text: "已收尾"}}}
+}
+func (stopperTool) StopsLoop() bool { return true }
+
+// Stopper 成功执行 → 本轮工具段后收敛 EndDone，不再发起下一轮 provider
+// 调用（第二段脚本不被消费），工具结果照常进历史（配对完整）。
+func TestStopperEndsRunAfterToolBatch(t *testing.T) {
+	call := message.ToolCall{ID: "c1", Name: "stop"}
+	fake := provider.NewFake(
+		provider.FakeStep{Calls: []message.ToolCall{call}},
+		provider.FakeStep{Text: []string{"这段不该被生成"}},
+	)
+	l, err := New(Config{Provider: fake, Tools: []tool.Tool{stopperTool{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, cancel := l.Subscribe(1024)
+	res, err := l.Run(testCtx(), []message.Message{message.NewUser("说完了")})
+	assertEnd(t, res, err, EndDone)
+	if res.Turns != 1 {
+		t.Fatalf("turns: want 1 got %d", res.Turns)
+	}
+	if left := fake.Left(); left != 1 {
+		t.Fatalf("stop 后不应再调 provider：剩 %d 段脚本未消费（want 1）", left)
+	}
+	var toolResults int
+	for _, ev := range drain(ch, cancel) {
+		if ev.Kind == KindToolExecEnd {
+			toolResults++
+		}
+	}
+	if toolResults != 1 {
+		t.Fatalf("工具结果事件 = %d, want 1", toolResults)
+	}
+}
+
+// steering 插话优先于收尾：stop 执行期间入队的用户消息让 run 续轮回答，
+// 回答完自然收敛（stop 请求被插话复位，不拦后续）。
+func TestSteeringSupersedesStopRequest(t *testing.T) {
+	var l *Loop
+	qstop := stopperTool{onExec: func() {
+		if err := l.Queue(message.NewUser("等等，还有一件事")); err != nil {
+			t.Errorf("Queue 注入失败: %v", err)
+		}
+	}}
+	call := message.ToolCall{ID: "c1", Name: "stop"}
+	fake := provider.NewFake(
+		provider.FakeStep{Calls: []message.ToolCall{call}},
+		provider.FakeStep{Text: []string{"好，你说。"}},
+	)
+	var err error
+	l, err = New(Config{Provider: fake, Tools: []tool.Tool{qstop}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, cancel := l.Subscribe(1024)
+	res, err := l.Run(testCtx(), []message.Message{message.NewUser("说完了")})
+	assertEnd(t, res, err, EndDone)
+	if res.Turns != 2 {
+		t.Fatalf("插话应续轮回答：turns = %d, want 2", res.Turns)
+	}
+	var injected int
+	for _, ev := range drain(ch, cancel) {
+		if ev.Kind == KindUserMessageInjected {
+			injected++
+		}
+	}
+	if injected != 1 {
+		t.Fatalf("steering 注入事件 = %d, want 1", injected)
+	}
+}
+
+// 回归（真机 2026-09-29：模型一批发出 [speak,speak,stop,speak,speak]）：
+// stop 成功后同批次剩余调用不得执行——那是模型的犹豫改口，照单执行会把
+// 矛盾内容全部放出去。剩余调用补 stopped 结果（配对完整，重放不炸）。
+func TestStopperTruncatesRestOfBatch(t *testing.T) {
+	var execs int
+	counting := execCounting{name: "speak", n: &execs}
+	calls := []message.ToolCall{
+		{ID: "c1", Name: "speak"},
+		{ID: "c2", Name: "stop"},
+		{ID: "c3", Name: "speak"},
+	}
+	fake := provider.NewFake(
+		provider.FakeStep{Calls: calls},
+		provider.FakeStep{Text: []string{"不该到这"}},
+	)
+	l, err := New(Config{Provider: fake, Tools: []tool.Tool{counting, stopperTool{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, cancel := l.Subscribe(1024)
+	res, err := l.Run(testCtx(), []message.Message{message.NewUser("看得到吗")})
+	assertEnd(t, res, err, EndDone)
+	if execs != 1 {
+		t.Fatalf("stop 前的 speak 应执行 1 次，实际 %d（stop 后的不得执行）", execs)
+	}
+	if left := fake.Left(); left != 1 {
+		t.Fatalf("不应进入下一轮：剩 %d 段脚本（want 1）", left)
+	}
+	var stoppedResults, okResults int
+	for _, ev := range drain(ch, cancel) {
+		e, isEnd := ev.Data.(ToolExecEndData)
+		if !isEnd {
+			continue
+		}
+		switch e.Call.ID {
+		case "c1":
+			if !e.Result.IsError {
+				okResults++
+			}
+		case "c3":
+			if e.Result.IsError {
+				stoppedResults++
+			}
+		}
+	}
+	if okResults != 1 || stoppedResults != 1 {
+		t.Fatalf("c1 应成功、c3 应 stopped：ok=%d stopped=%d", okResults, stoppedResults)
+	}
+}
+
+// execCounting 是记执行次数的哑工具。
+type execCounting struct {
+	name string
+	n    *int
+}
+
+func (e execCounting) Def() tool.Def { return tool.Def{Name: e.name} }
+func (e execCounting) Exec(_ context.Context, call tool.Call) tool.Result {
+	*e.n++
+	return tool.Result{CallID: call.ID, Blocks: []message.Block{message.TextBlock{Text: "done"}}}
+}

@@ -117,3 +117,40 @@ func TestBaseRequired(t *testing.T) {
 		t.Fatal("空 Base 应报错")
 	}
 }
+
+// Reassembling replaces the camera slot without removing user images or
+// modifying earlier requests. A failed refresh must not reuse a stale frame.
+func TestVisualSlotRefreshAndFailure(t *testing.T) {
+	count := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count++
+		if count == 3 {
+			http.Error(w, "offline", 500)
+			return
+		}
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Write([]byte{byte(count)})
+	}))
+	defer srv.Close()
+	v, _ := New(Config{Base: srv.URL}, quietLog())
+	original := userMsg("看看我上传的图片")
+	original.Blocks = append(original.Blocks, message.ImageBlock{Data: []byte{9}, MIME: "image/jpeg"})
+	first := v.Assemble(context.Background(), loop.State{Messages: []message.Message{original}})
+	second := v.Assemble(context.Background(), loop.State{Messages: first})
+	if len(second) != 2 || second[1].ID != visualSlotID {
+		t.Fatal("camera slot accumulated")
+	}
+	a, _ := lastImage(first[1])
+	b, _ := lastImage(second[1])
+	u, _ := lastImage(second[0])
+	if a.Data[0] != 1 || b.Data[0] != 2 || u.Data[0] != 9 {
+		t.Fatal("refresh mutated history or user image")
+	}
+	if second[1].Blocks[0].(message.TextBlock).Text != visualSlotOpen+"\n" {
+		t.Fatal("missing visual boundary")
+	}
+	failed := v.Assemble(context.Background(), loop.State{Messages: second})
+	if len(failed) != 1 {
+		t.Fatal("failed refresh retained stale camera image")
+	}
+}

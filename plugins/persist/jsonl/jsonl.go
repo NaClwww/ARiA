@@ -200,8 +200,8 @@ func marshalData(ev loop.Event) (json.RawMessage, error) {
 		}
 		return marshal(struct {
 			Call   message.ToolCall `json:"call"`
-			Result wireToolResult  `json:"result"`
-			Denied bool            `json:"denied,omitempty"`
+			Result wireToolResult   `json:"result"`
+			Denied bool             `json:"denied,omitempty"`
 		}{d.Call, tr, d.Denied})
 	case *loop.ToolExecEndData:
 		return marshalData(loop.Event{Kind: ev.Kind, Data: *d})
@@ -217,6 +217,8 @@ func marshalData(ev loop.Event) (json.RawMessage, error) {
 			w.Err = d.Err.Error()
 		}
 		return marshal(w)
+	case loop.WindowCompressedData:
+		return marshal(d) // 自带 json 标签，字段按原样落盘
 	default:
 		return json.RawMessage("null"), nil
 	}

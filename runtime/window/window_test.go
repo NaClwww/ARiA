@@ -2,6 +2,7 @@ package window
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"aria/core/loop"
 	"aria/core/provider"
 	"aria/pkg/ctxx"
 	"aria/pkg/message"
@@ -346,6 +348,84 @@ func TestProviderCompressorMaxTokensNotInherited(t *testing.T) {
 	}
 	if got := explicit.req.Options.MaxTokens; got != 512 {
 		t.Fatalf("显式 MaxTokens 必须生效，got %d", got)
+	}
+}
+
+// ProviderCompressor：转写必须渲染工具调用的参数——speak 类宿主里
+// assistant 正文恒空，调用参数就是它的口头回复；丢了它摘要只剩
+// 「已说完」空壳，会凭空推出未完成事项（2026-09-29 真机：摘要据此
+// 认定「未确认用户是否被看到」，后续 run 重复播报外观在补假待办）。
+func TestProviderCompressorRendersToolCallArgs(t *testing.T) {
+	rec := &recordingProvider{}
+	pc := &ProviderCompressor{Provider: rec}
+
+	turn := []message.Message{
+		message.NewUser("[user] 嗯，能看到我吗？"),
+		{Role: message.RoleAssistant, ToolCalls: []message.ToolCall{{
+			ID:   "c1",
+			Name: "speak",
+			Args: json.RawMessage(`{"text":"能看到，你戴着眼镜，白色短袖"}`),
+		}}},
+		(message.ToolResult{CallID: "c1", Blocks: []message.Block{message.TextBlock{Text: "已说完"}}}).ToMessage(),
+	}
+	if _, err := pc.Compress(context.Background(), nil, turn); err != nil {
+		t.Fatal(err)
+	}
+	var rendered string
+	for _, m := range rec.req.Messages {
+		if m.Role == message.RoleUser {
+			rendered = m.Text()
+		}
+	}
+	for _, want := range []string{"speak", "能看到，你戴着眼镜，白色短袖", "已说完"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("摘要输入缺少 %q：\n%s", want, rendered)
+		}
+	}
+}
+
+// 超长参数（长 bash 命令）保头去尾截断，转写不随命令全文无限膨胀。
+func TestProviderCompressorTruncatesLongArgs(t *testing.T) {
+	rec := &recordingProvider{}
+	pc := &ProviderCompressor{Provider: rec}
+
+	cmd := strings.Repeat("a", callArgsLimit+100)
+	turn := []message.Message{{Role: message.RoleAssistant, ToolCalls: []message.ToolCall{{
+		ID:   "c1",
+		Name: "bash",
+		Args: json.RawMessage(`{"command":"` + cmd + `"}`),
+	}}}}
+	if _, err := pc.Compress(context.Background(), nil, turn); err != nil {
+		t.Fatal(err)
+	}
+	var rendered string
+	for _, m := range rec.req.Messages {
+		if m.Role == message.RoleUser {
+			rendered = m.Text()
+		}
+	}
+	if !strings.Contains(rendered, "…") || strings.Contains(rendered, cmd) {
+		t.Fatalf("超长参数应截断到 %d rune 内", callArgsLimit)
+	}
+}
+
+// system（人设/指令）永不进压缩输入、组装时置顶重加——指令位与记忆分层
+// （03 §5）。指令不是对话内容，摘要模型看不到也不该看到。
+func TestSystemNeverEntersCompression(t *testing.T) {
+	c := &recordingCompressor{out: []message.Message{MemoryMessage("概要")}}
+	w := New(c, quiet())
+	w.SetSystem("人设指令：你是 ARiA")
+	w.Settle(context.Background(), []message.Message{message.NewUser("你好")})
+	w.Wait()
+
+	for _, s := range c.seen() {
+		if strings.Contains(s, "人设指令") {
+			t.Fatalf("system 内容泄进压缩输入: %q", s)
+		}
+	}
+	got := w.Assemble(nil)
+	if len(got) == 0 || got[0].Role != message.RoleSystem || !strings.Contains(got[0].Text(), "人设指令") {
+		t.Fatalf("组装必须把 system 置顶: %v", texts(got))
 	}
 }
 
@@ -713,4 +793,34 @@ func TestWaitConcurrentWithSettle(t *testing.T) {
 	close(stop)
 	wg.Wait()
 	w.Wait()
+}
+
+// ---------- 压缩观测（SetOnCompress → window_compressed durable 事件） ----------
+
+func TestOnCompressReportsSuccessAndFailure(t *testing.T) {
+	// 成功：in/out 规模如数报告。
+	var got loop.WindowCompressedData
+	var wg sync.WaitGroup
+	wg.Add(1)
+	c := &recordingCompressor{out: []message.Message{message.NewSystem("摘要")}}
+	w := New(c, quiet())
+	w.SetOnCompress(func(r loop.WindowCompressedData) { got = r; wg.Done() })
+	w.Settle(context.Background(), []message.Message{message.NewUser("第一轮")})
+	w.Wait()
+	wg.Wait()
+	if got.Err != "" || got.InMessages != 1 || got.OutMessages != 1 || got.InChars != 3 || got.OutChars != 2 {
+		t.Fatalf("成功报告不符: %+v", got)
+	}
+
+	// 失败：Err 在场，退回后 Out=原输入规模。
+	wg.Add(1)
+	c2 := &recordingCompressor{err: errors.New("boom")}
+	w2 := New(c2, quiet())
+	w2.SetOnCompress(func(r loop.WindowCompressedData) { got = r; wg.Done() })
+	w2.Settle(context.Background(), []message.Message{message.NewUser("话")})
+	w2.Wait()
+	wg.Wait()
+	if got.Err == "" || got.InMessages != 1 || got.OutMessages != 1 {
+		t.Fatalf("失败报告不符: %+v", got)
+	}
 }

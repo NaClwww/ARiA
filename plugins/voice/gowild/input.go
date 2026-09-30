@@ -14,9 +14,10 @@ type InputSink interface {
 
 // InputConfig 是半双工输入纪律的装配参数。
 type InputConfig struct {
-	Sink InputSink // 引擎投递口。必填。
-	Gate GateState // 半双工闸门（状态 + 份额）。必填。
-	// Bypass 关闭「说话/生成期间不接受新输入」拦截（--no-input-gate）。
+	Sink         InputSink // 引擎投递口。必填。
+	Gate         GateState // 轮次忙碌状态（供状态灯使用）。必填。
+	PlaybackGate GateState // 非空时只在实际播放期间拦截输入。
+	// Bypass 关闭输入拦截（--no-input-gate）；宿主使用 PlaybackGate 时仅拦播放。
 	// 轮次份额仍照持（闸门同时是状态灯的信号源）。
 	Bypass bool
 	// OnIgnored 是「正在说话，忽略输入」的提示回调（渲染归宿主）。可空。
@@ -24,7 +25,8 @@ type InputConfig struct {
 }
 
 // Input 是半双工输入纪律：闸门激活期间的输入直接丢弃（自回声防护），
-// 放行的输入从被接收持轮次份额到本轮结算——与 TTS 的生成份额、播放
+// PlaybackGate 可将输入拦截与忙碌状态分开。放行的输入持轮次份额到结算，
+// 与 TTS 的生成份额、播放
 // 份额同池计数，灯的 thinking 态由此覆盖整轮。
 type Input struct {
 	cfg InputConfig
@@ -46,7 +48,11 @@ func NewInput(cfg InputConfig, log *slog.Logger) (*Input, error) {
 
 // Deliver 是所有输入插头（ASR、stdin、……）的统一入口。
 func (in *Input) Deliver(text, speaker string) {
-	if !in.cfg.Bypass && in.cfg.Gate.Active() {
+	block := in.cfg.PlaybackGate
+	if block == nil {
+		block = in.cfg.Gate
+	}
+	if !in.cfg.Bypass && block.Active() {
 		if in.cfg.OnIgnored != nil {
 			in.cfg.OnIgnored(text)
 		}

@@ -13,7 +13,22 @@ import (
 
 // DefaultSummaryInstruction 是间隙压缩的默认提示词。
 const DefaultSummaryInstruction = "把下面的对话压缩成简洁的摘要，保留：谁说了什么关键信息、" +
-	"已达成的结论、未完成的事项、与用户相关的偏好。不要添加原文没有的内容。"
+	"已达成的结论、未完成的事项、与用户相关的偏好。assistant 的工具调用记录着它" +
+	"实际做了什么、说了什么（调用参数就是内容，如语音播报的原文），必须一并保留，" +
+	"不要只留「已说完」之类的结果状态。不要添加原文没有的内容。"
+
+// callArgsLimit 是单个工具调用参数的渲染上限（rune）：长 bash 命令保头去尾，
+// 摘要要的是「做了什么」的事实，不是命令全文。
+const callArgsLimit = 400
+
+// truncRunes 按 rune 截断超长字符串，保头去尾加省略号。
+func truncRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}
 
 // ProviderCompressor 用一次 Provider 调用把「记忆 + 本轮」压成一段摘要（03 §5）。
 // 它是 Compressor 的默认 LLM 实现；换压缩策略只需换 Compressor，窗口不动。
@@ -39,6 +54,13 @@ func (p *ProviderCompressor) Compress(ctx context.Context, memory, turn []messag
 
 	var b strings.Builder
 	for _, m := range msgs {
+		// 工具调用先于正文渲染：参数是 assistant 实际做过的事/说过的话。
+		// speak 类宿主里 assistant 正文恒空，调用参数就是它的口头回复——
+		// 丢了它摘要只剩「已说完」空壳，会凭空推出未完成事项
+		// （2026-09-29 真机：摘要据此认定「未确认用户是否被看到」）。
+		for _, c := range m.ToolCalls {
+			fmt.Fprintf(&b, "%s 调用 %s: %s\n", m.Role, c.Name, truncRunes(string(c.Args), callArgsLimit))
+		}
 		text := strings.TrimSpace(m.Text())
 		if text == "" {
 			continue

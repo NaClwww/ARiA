@@ -19,12 +19,14 @@ import (
 
 	"aria/core/loop"
 	"aria/core/provider"
+	"aria/core/tool"
 	"aria/internal/assemble"
 	"aria/internal/config"
 	"aria/pkg/ctxx"
 	"aria/plugins/persist/jsonl"
 	openai "aria/plugins/provider/openai"
 	gowildvision "aria/plugins/vision/gowild"
+	gowildvoice "aria/plugins/voice/gowild"
 	"aria/runtime/agent"
 	"aria/runtime/persist"
 )
@@ -38,7 +40,16 @@ type Options struct {
 	// VisionBase 是 launcher 根地址；非空 = 启用视觉注入（摄像头当前帧
 	// 每轮进组装链底部，plugins/vision/gowild）。空 = 无视觉。
 	VisionBase string
-	Logger     *slog.Logger
+	// Tools 是宿主装配的额外工具（如 speak——依赖宿主的 gate/TTS，引擎
+	// 无从代建）：与 [tools] builtin 注册表工具合并成会话工具表。
+	Tools []tool.Tool
+	// ExtraPrompt 追加到人设之后的宿主声明（如 speak 工具的使用规则——
+	// 工具存在与否是宿主的装配事实，得让人设知道）。
+	ExtraPrompt string
+	// SpeakTool=true 表示宿主开了 speak 工具：tool_timeout_ms 自动抬到
+	// gowild.MinSpeakToolTimeoutMS（30s 默认会把长段播放拦腰掐断）。
+	SpeakTool bool
+	Logger    *slog.Logger
 }
 
 // Engine 是组装完成的宿主引擎面：配置快照 + 就绪会话。
@@ -100,7 +111,7 @@ func NewEngine(opts Options) (*Engine, error) {
 			return nil, fmt.Errorf("视觉装配失败: %w", verr)
 		}
 		vision = v
-		log.Info("vision: 摄像头当前帧注入组装链（每轮现拉，底部追加）", "device", opts.VisionBase)
+		log.Info("vision: 固定视觉参考区启用（每次请求更新一张，不作为用户发言）", "device", opts.VisionBase)
 	}
 	systemPrompt, err := ResolvePersona(cfg.Persona)
 	if err != nil {
@@ -109,6 +120,18 @@ func NewEngine(opts Options) (*Engine, error) {
 	// 说话人标注声明无条件追加（自定义人设也不例外）：[名字] 前缀是
 	// Sink 的投递格式，不是人设的风格选择——不声明模型就不认得这个标记。
 	systemPrompt += "\n" + SpeakerInstruction(cfg.Session.DefaultUser)
+	if vision != nil {
+		systemPrompt += "\n" + gowildvision.VisualContextInstruction
+	}
+	if opts.ExtraPrompt != "" {
+		systemPrompt += "\n" + opts.ExtraPrompt
+	}
+	if opts.SpeakTool && cfg.Limits.ToolTimeoutMS < gowildvoice.MinSpeakToolTimeoutMS {
+		// 阻塞放音要盖过最长段落的播放时长。
+		mgr.SetLocal("limits.tool_timeout_ms", gowildvoice.MinSpeakToolTimeoutMS)
+		cfg = mgr.Effective()
+		log.Info("speak 工具：tool_timeout_ms 提到播放需要的上限", "ms", cfg.Limits.ToolTimeoutMS)
+	}
 
 	var store persist.Store
 	var jsonlStore *jsonl.Store
@@ -123,6 +146,7 @@ func NewEngine(opts Options) (*Engine, error) {
 
 	ag, err := agent.New(agent.Config{
 		Provider:     prov,
+		Tools:        opts.Tools,
 		Compressor:   compressor,
 		Assembler:    vision,
 		Store:        store,

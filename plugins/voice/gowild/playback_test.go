@@ -117,7 +117,7 @@ func TestGateHeldThroughSynthesisQueue(t *testing.T) {
 		},
 	}
 
-	p, err := startPlayback(tts.cfg.Base, tts.hc, tts.log, tts.newSink, gate)
+	p, err := startPlayback(tts.cfg.Base, tts.hc, tts.log, tts.newSink, gate, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

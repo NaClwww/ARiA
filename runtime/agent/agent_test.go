@@ -1261,3 +1261,72 @@ func TestSetCompressorWhileTurnInFlight(t *testing.T) {
 	<-done
 	s.WaitCompress()
 }
+
+// ---------- Stopper × 工具装饰器 ----------
+
+// agentStopTool 是收尾工具（core/tool.Stopper）。
+type agentStopTool struct{}
+
+func (agentStopTool) Def() tool.Def { return tool.Def{Name: "stop"} }
+func (agentStopTool) Exec(_ context.Context, call tool.Call) tool.Result {
+	return tool.Result{CallID: call.ID,
+		Blocks: []message.Block{message.TextBlock{Text: "本轮已收尾"}}}
+}
+func (agentStopTool) StopsLoop() bool { return true }
+
+// 回归（真机 2026-09-29 18:48：stop 执行成功、run 却续轮又说了两段）：
+// buildTools 默认给所有工具套 toolkit.Truncate 装饰器，loop 若对包装器
+// 直接断言 Stopper 就会漏判——收尾能力必须沿 Unwrap 链透出。
+func TestStopperSurvivesToolWrapping(t *testing.T) {
+	fake := provider.NewFake(
+		provider.FakeStep{Calls: []message.ToolCall{{ID: "c1", Name: "stop", Args: []byte(`{}`)}}},
+		provider.FakeStep{Text: []string{"不该有这段"}},
+	)
+	s, _ := newTestSession(t, Config{
+		Provider:   fake,
+		Tools:      []tool.Tool{agentStopTool{}},
+		Compressor: window.KeepLast(100),
+	})
+	res, err := s.Input(context.Background(), message.NewUser("说完了"))
+	if err != nil {
+		t.Fatalf("input: %v", err)
+	}
+	if res.EndReason != loop.EndDone || res.Turns != 1 {
+		t.Fatalf("stop 应在工具轮后收敛为 EndDone（turns=1）：end=%s turns=%d", res.EndReason, res.Turns)
+	}
+	if left := fake.Left(); left != 1 {
+		t.Fatalf("stop 后不应再调 provider：剩 %d 段脚本（want 1）", left)
+	}
+}
+
+// 间隙压缩产生 window_compressed durable 事件（异步，轮询等它落盘）。
+func TestWindowCompressedEventPersisted(t *testing.T) {
+	st := &memStore{}
+	s, _ := newTestSession(t, Config{
+		Provider:   provider.NewFake(provider.FakeStep{Text: []string{"好"}}),
+		Store:      st,
+		Compressor: window.KeepLast(10),
+	})
+	if _, err := s.Input(context.Background(), message.NewUser("你好")); err != nil {
+		t.Fatalf("input: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if st.hasKind(loop.KindWindowCompressed) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("window_compressed 事件未落盘")
+}
+
+func (s *memStore) hasKind(k loop.Kind) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, got := range s.got {
+		if got == k {
+			return true
+		}
+	}
+	return false
+}

@@ -5,6 +5,22 @@
 # 与 override 冲突时 override 优先（面板上每项显示「基准值 / 已覆盖」两态）。
 # 手改本文件后想生效：重启进程，或在面板点「重新读取」。
 
+[host]                              # 宿主装配（aria-host 启动项的基准；同名 flag 显式给出时仅本次覆盖）
+backend = "http://127.0.0.1:8800"    # TTS 后端根地址（非 gateway 模式下也是 ASR 地址）
+# asr_gateway = "ws://172.16.53.179:8210"  # 非空 = ASR 走 asr-gateway（EPYC VM WS；需 device；TTS 仍走 backend）
+# device = "http://127.0.0.1:18900"        # launcher 控制面；空 = 本机 paplay 出声、无灯无视觉
+# light_colors = "202020,00a000,2050ff"    # 灯色 idle,listening,thinking（hex，逗号分隔）
+# no_asr = false        # 停用 ASR 插头（纯终端开发）
+# no_stdin = false      # 停用 stdin 插头（纯语音形态）
+# no_tts = false        # 停用 TTS 播放（只看文字）
+# no_input_gate = false # 关闭播放期间的半双工输入保护
+# no_light = false      # 停用状态灯
+# no_mic_mute = false   # 停用播放期间闭耳
+# no_vision = false     # 停用视觉注入
+speak_tool = true    # TTS 改为 speak 工具：模型显式调用出声（可阻塞/非阻塞），正文不再自动朗读
+# fake / api-key 不进本段：前者是冒烟开关（--fake）、后者是秘密（--api-key 或
+# provider.api_key_env 指的环境变量），都只走 flag/环境。
+
 [server]
 listen = "127.0.0.1:8080"      # 只绑本机；暴露局域网需显式修改（本口能触发 LLM 花费）
 

@@ -25,7 +25,11 @@ const (
 	KindToolExecStart       Kind = "tool_exec_start"
 	KindToolExecEnd         Kind = "tool_exec_end"
 	KindProgress            Kind = "progress" // volatile；M4 MCP progress 映射
-	KindAgentEnd            Kind = "agent_end"
+	// KindWindowCompressed 由 runtime 窗口在间隙压缩后发出（不是飞轮事件：
+	// 无 RunID/Turn，发生在 run 之间），durable——压缩何时发生、压了多少，
+	// 落盘可审计（否则只能从 token 量间接推断）。
+	KindWindowCompressed Kind = "window_compressed"
+	KindAgentEnd         Kind = "agent_end"
 )
 
 // Durable 报告事件级别。两个 volatile 词汇之外全部 durable。
@@ -95,6 +99,17 @@ type ProgressData struct {
 	CallID  string
 	Percent float64
 	Note    string
+}
+
+// WindowCompressedData 是间隙压缩的一次报告：输入（旧记忆+本批）与输出的
+// 规模、失败原因（空=成功）、失败退回时按上限裁掉的消息数。
+type WindowCompressedData struct {
+	InMessages      int    `json:"in_messages"`
+	InChars         int    `json:"in_chars"` // 文本+思考块字符数（信息量粗估）
+	OutMessages     int    `json:"out_messages"`
+	OutChars        int    `json:"out_chars"`
+	Err             string `json:"err,omitempty"`
+	FallbackDropped int    `json:"fallback_dropped,omitempty"` // 压缩失败退回时裁掉的消息数
 }
 
 type AgentEndData struct {
