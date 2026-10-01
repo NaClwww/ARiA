@@ -509,19 +509,15 @@ func (s *Session) consumeWindow(ch <-chan loop.Event) {
 	}
 }
 
-// handleEvent 只认「进历史的 durable 消息」与本轮结束：
-// MessageEnd → assistant 消息；ToolExecEnd → tool 消息（含被拒结果）；
-// UserMessageInjected → 轮间注入的用户输入；AgentEnd → 结算本轮进窗口。
-// core 只发值形态（见 core/loop 的 emit 调用点），指针形态不在此处理。
+// handleEvent 只认「进历史的 durable 消息」与本轮结束：消息取数统一经
+// loop.HistoryMessage（「哪些事件进历史」的权威定义，记忆 Pump 共用）；
+// AgentEnd → 结算本轮进窗口。
 func (s *Session) handleEvent(ev loop.Event) {
-	switch d := ev.Data.(type) {
-	case loop.MessageEndData:
-		s.appendTurn(d.Message)
-	case loop.ToolExecEndData:
-		s.appendTurn(d.Result.ToMessage())
-	case loop.UserMessageInjectedData:
-		s.appendTurn(d.Message)
-	case loop.AgentEndData:
+	if m, ok := loop.HistoryMessage(ev); ok {
+		s.appendTurn(m)
+		return
+	}
+	if _, ok := ev.Data.(loop.AgentEndData); ok {
 		s.settle()
 	}
 }

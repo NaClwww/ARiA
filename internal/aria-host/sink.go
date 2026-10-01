@@ -25,7 +25,7 @@ type Sink struct {
 
 func (s Sink) Deliver(text, speaker string) error {
 	sess, cfg := s.Session, s.Cfg
-	msg := message.NewUser(TagSpeaker(speaker, text))
+	msg := message.NewUser(message.TagSpeaker(speaker, text))
 	if err := sess.Queue(msg); errors.Is(err, agent.ErrNoActiveRun) {
 		ctx := ctxx.WithScope(context.Background(), ctxx.Scope{UserID: speaker})
 		ctx = ctxx.WithOptions(ctx, llmOptions(cfg))
@@ -54,12 +54,4 @@ func llmOptions(cfg config.Config) ctxx.Options {
 		opts.Temperature = &temp
 	}
 	return opts
-}
-
-// TagSpeaker 统一给用户消息标说话人：「[名字] 内容」。所有消息同格式
-// （含默认说话人）——模型靠这个标记分辨谁在说话，含义声明在
-// SpeakerInstruction（随人设下发）；stdin 插头的「[名字] 内容」输入
-// 解析（SplitSpeaker）与这里互为往返。
-func TagSpeaker(speaker, text string) string {
-	return "[" + speaker + "] " + text
 }

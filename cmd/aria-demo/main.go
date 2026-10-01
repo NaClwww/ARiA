@@ -252,12 +252,9 @@ func run(sess *agent.Session, lines <-chan string, mgr *config.Manager, prov pro
 			continue
 		}
 		defUser := orDefault(cfg.Session.DefaultUser, "user")
-		speaker, utterance := splitSpeaker(text, defUser)
+		speaker, utterance := message.SplitSpeaker(text, defUser)
 		if utterance == "" {
 			continue
-		}
-		if speaker != defUser {
-			utterance = "[" + speaker + "] " + utterance
 		}
 		ctx := ctxx.WithScope(context.Background(), ctxx.Scope{UserID: speaker})
 		opts := ctxx.Options{Model: cfg.Provider.Model, MaxTokens: cfg.LLM.MaxTokens, ReasoningEffort: cfg.LLM.ReasoningEffort}
@@ -267,7 +264,8 @@ func run(sess *agent.Session, lines <-chan string, mgr *config.Manager, prov pro
 		}
 		ctx = ctxx.WithOptions(ctx, opts)
 		fmt.Fprintf(errw, "%s> %s\n", speaker, utterance)
-		if _, err := sess.Input(ctx, message.NewUser(utterance)); err != nil {
+		// 统一前缀：默认说话人也标（与 aria-host 的 Sink 同语义，模型只见一种格式）。
+		if _, err := sess.Input(ctx, message.NewUser(message.TagSpeaker(speaker, utterance))); err != nil {
 			fmt.Fprintf(errw, "！输入失败：%v\n", err)
 			return 1
 		}
@@ -354,19 +352,6 @@ func orDefault(s, def string) string {
 		return def
 	}
 	return s
-}
-
-// splitSpeaker 解析「[名字] 内容」的说话人前缀；无前缀用默认说话人。
-func splitSpeaker(line, def string) (string, string) {
-	if strings.HasPrefix(line, "[") {
-		if i := strings.Index(line, "]"); i > 0 && i <= 24 {
-			name, rest := strings.TrimSpace(line[1:i]), strings.TrimSpace(line[i+1:])
-			if name != "" {
-				return name, rest
-			}
-		}
-	}
-	return def, line
 }
 
 // printEvents 把事件流渲染到终端：回答增量进 stdout（保持可管道化），

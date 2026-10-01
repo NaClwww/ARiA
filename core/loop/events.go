@@ -117,6 +117,25 @@ type AgentEndData struct {
 	Err    error
 }
 
+// HistoryMessage 报告事件是否携带一条「进入对话历史」的消息并取出它：
+// MessageEnd（assistant 消息）、ToolExecEnd（工具结果转 tool 消息，含被拒）、
+// UserMessageInjected（轮间注入的用户输入）。这是「哪些事件进历史」的
+// 唯一权威定义（docs/03 §5）——窗口结算与记忆 Pump 都经这里取数，新增
+// 携带消息的 Kind 时只改这里。AgentStart 的 InitialInput 是整包组装结果
+// （系统提示/压缩摘要混在其中），不是历史，别在此扩。core 只发值形态
+// （emit 调用点），指针形态不在此处理。
+func HistoryMessage(ev Event) (message.Message, bool) {
+	switch d := ev.Data.(type) {
+	case MessageEndData:
+		return d.Message, true
+	case ToolExecEndData:
+		return d.Result.ToMessage(), true
+	case UserMessageInjectedData:
+		return d.Message, true
+	}
+	return message.Message{}, false
+}
+
 // cloneEvent 给每订阅者一份独立快照，防止任一消费者篡改共享底层
 // （Blocks / RawMessage / 音视频字节）影响其他订阅者或持久化真值。
 func cloneEvent(ev Event) Event {

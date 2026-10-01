@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"aria/pkg/message"
 )
 
 // StdinPlug 是终端输入插头：一行 = 一句已说完的话（06 §2 插头契约，
@@ -23,7 +25,7 @@ func StdinPlug(r io.Reader, deliver func(text, speaker string), defUser string, 
 			close(quit)
 			return
 		}
-		speaker, utterance := SplitSpeaker(text, defUser)
+		speaker, utterance := message.SplitSpeaker(text, defUser)
 		if utterance == "" {
 			continue
 		}
@@ -35,17 +37,4 @@ func StdinPlug(r io.Reader, deliver func(text, speaker string), defUser string, 
 		return
 	}
 	fmt.Fprintln(os.Stderr, "（stdin EOF：ASR 模式常驻；退出用双击 Ctrl+C）")
-}
-
-// SplitSpeaker 解析「[名字] 内容」前缀；无前缀用默认说话人。
-func SplitSpeaker(line, def string) (string, string) {
-	if strings.HasPrefix(line, "[") {
-		if i := strings.Index(line, "]"); i > 0 && i <= 24 {
-			name, rest := strings.TrimSpace(line[1:i]), strings.TrimSpace(line[i+1:])
-			if name != "" {
-				return name, rest
-			}
-		}
-	}
-	return def, line
 }

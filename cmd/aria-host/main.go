@@ -57,28 +57,50 @@ import (
 )
 
 func main() {
-	var (
-		// 引导项：只能走 flag（config 路径本身 / 冒烟开关 / 秘密）。
-		fake         = flag.Bool("fake", false, "使用内置 echo provider（无网络，验证链路）")
-		configPath   = flag.String("config", "aria.toml", "配置文件路径（人写基准，启动时读一次）")
-		overridePath = flag.String("override", "aria.override.toml", "覆盖文件路径")
-		apiKey       = flag.String("api-key", "", "API key；空则按配置的 api_key_env 读环境变量")
+	// 引导项：只能走 flag（config 路径本身 / 冒烟开关 / 秘密）。
+	fake := flag.Bool("fake", false, "使用内置 echo provider（无网络，验证链路）")
+	configPath := flag.String("config", "aria.toml", "配置文件路径（人写基准，启动时读一次）")
+	overridePath := flag.String("override", "aria.override.toml", "覆盖文件路径")
+	apiKey := flag.String("api-key", "", "API key；空则按配置的 api_key_env 读环境变量")
 
-		// 装配项：基准在 aria.toml [host] 段，这里只做「本次运行」的显式
-		// 覆盖——默认零值 = 不覆盖，生效值一律以解析后的 h 为准。
-		backend     = flag.String("backend", "", "覆盖 [host] backend：TTS 后端根地址（非 gateway 模式下也是 ASR 地址）")
-		asrGateway  = flag.String("asr-gateway", "", "覆盖 [host] asr_gateway：asr-gateway WS 根地址（EPYC VM）；非空 = ASR 走网关（需 device；TTS 仍走 backend）")
-		device      = flag.String("device", "", "覆盖 [host] device：launcher 控制面根地址；空 = 本机 paplay")
-		lightColors = flag.String("light-colors", "", "覆盖 [host] light_colors：灯色 idle,listening,thinking（hex，逗号分隔）")
-		noASR       = flag.Bool("no-asr", false, "覆盖 [host] no_asr：停用 ASR 插头（纯终端开发）")
-		noStdin     = flag.Bool("no-stdin", false, "覆盖 [host] no_stdin：停用 stdin 插头（纯语音）")
-		noTTS       = flag.Bool("no-tts", false, "覆盖 [host] no_tts：停用 TTS 播放（只看文字）")
-		noInputGate = flag.Bool("no-input-gate", false, "覆盖 [host] no_input_gate：关闭「播放期间不接受新输入」闸门（半双工）")
-		noLight     = flag.Bool("no-light", false, "覆盖 [host] no_light：停用状态灯（会话状态 → 设备 RGB 指示灯，仅 device 模式）")
-		noMicMute   = flag.Bool("no-mic-mute", false, "覆盖 [host] no_mic_mute：停用播放期间闭耳（默认开：实际送播至排空期间丢 mic，之后保留 300ms 尾音缓冲）")
-		noVision    = flag.Bool("no-vision", false, "覆盖 [host] no_vision：停用视觉注入（默认开：摄像头当前帧每轮进上下文底部，仅 device 模式）")
-		speakTool   = flag.Bool("speak-tool", false, "覆盖 [host] speak_tool：TTS 改为 speak 工具（模型显式调用出声、正文不自动朗读）")
-	)
+	// 装配项：基准在 aria.toml [host] 段，flag 只做「本次运行」的显式覆盖
+	// ——默认零值 = 不覆盖，生效值一律以解析后的 h 为准。声明、帮助与写回
+	// 收进同一条表项（hostKnob）：新增 [host] 旋钮 = 表里加一行，不再散在
+	// flag 定义 / set 判断 / 赋值三处。
+	strKnob := func(name, help string, apply func(*config.Host, string)) hostKnob[string] {
+		return hostKnob[string]{name: name, apply: apply, val: flag.String(name, "", help)}
+	}
+	boolKnob := func(name, help string, apply func(*config.Host, bool)) hostKnob[bool] {
+		return hostKnob[bool]{name: name, apply: apply, val: flag.Bool(name, false, help)}
+	}
+	strKnobs := []hostKnob[string]{
+		strKnob("backend", "覆盖 [host] backend：TTS 后端根地址（非 gateway 模式下也是 ASR 地址）",
+			func(h *config.Host, v string) { h.Backend = v }),
+		strKnob("asr-gateway", "覆盖 [host] asr_gateway：asr-gateway WS 根地址（EPYC VM）；非空 = ASR 走网关（需 device；TTS 仍走 backend）",
+			func(h *config.Host, v string) { h.ASRGateway = v }),
+		strKnob("device", "覆盖 [host] device：launcher 控制面根地址；空 = 本机 paplay",
+			func(h *config.Host, v string) { h.Device = v }),
+		strKnob("light-colors", "覆盖 [host] light_colors：灯色 idle,listening,thinking（hex，逗号分隔）",
+			func(h *config.Host, v string) { h.LightColors = v }),
+	}
+	boolKnobs := []hostKnob[bool]{
+		boolKnob("no-asr", "覆盖 [host] no_asr：停用 ASR 插头（纯终端开发）",
+			func(h *config.Host, v bool) { h.NoASR = v }),
+		boolKnob("no-stdin", "覆盖 [host] no_stdin：停用 stdin 插头（纯语音）",
+			func(h *config.Host, v bool) { h.NoStdin = v }),
+		boolKnob("no-tts", "覆盖 [host] no_tts：停用 TTS 播放（只看文字）",
+			func(h *config.Host, v bool) { h.NoTTS = v }),
+		boolKnob("no-input-gate", "覆盖 [host] no_input_gate：关闭「播放期间不接受新输入」闸门（半双工）",
+			func(h *config.Host, v bool) { h.NoInputGate = v }),
+		boolKnob("no-light", "覆盖 [host] no_light：停用状态灯（会话状态 → 设备 RGB 指示灯，仅 device 模式）",
+			func(h *config.Host, v bool) { h.NoLight = v }),
+		boolKnob("no-mic-mute", "覆盖 [host] no_mic_mute：停用播放期间闭耳（默认开：实际送播至排空期间丢 mic，之后保留 300ms 尾音缓冲）",
+			func(h *config.Host, v bool) { h.NoMicMute = v }),
+		boolKnob("no-vision", "覆盖 [host] no_vision：停用视觉注入（默认开：摄像头当前帧每轮进上下文底部，仅 device 模式）",
+			func(h *config.Host, v bool) { h.NoVision = v }),
+		boolKnob("speak-tool", "覆盖 [host] speak_tool：TTS 改为 speak 工具（模型显式调用出声、正文不自动朗读）",
+			func(h *config.Host, v bool) { h.SpeakTool = v }),
+	}
 	flag.Parse()
 
 	// 显式给出的 flag 才参与覆盖：Visit 只报命令行真正出现的名字，零值
@@ -96,41 +118,11 @@ func main() {
 		os.Exit(2)
 	}
 	h := mgr.Effective().Host
-	if set["backend"] {
-		h.Backend = *backend
+	for _, k := range strKnobs {
+		k.applyExplicit(set, &h)
 	}
-	if set["asr-gateway"] {
-		h.ASRGateway = *asrGateway
-	}
-	if set["device"] {
-		h.Device = *device
-	}
-	if set["light-colors"] {
-		h.LightColors = *lightColors
-	}
-	if set["no-asr"] {
-		h.NoASR = *noASR
-	}
-	if set["no-stdin"] {
-		h.NoStdin = *noStdin
-	}
-	if set["no-tts"] {
-		h.NoTTS = *noTTS
-	}
-	if set["no-input-gate"] {
-		h.NoInputGate = *noInputGate
-	}
-	if set["no-light"] {
-		h.NoLight = *noLight
-	}
-	if set["no-mic-mute"] {
-		h.NoMicMute = *noMicMute
-	}
-	if set["no-vision"] {
-		h.NoVision = *noVision
-	}
-	if set["speak-tool"] {
-		h.SpeakTool = *speakTool
+	for _, k := range boolKnobs {
+		k.applyExplicit(set, &h)
 	}
 	if h.SpeakTool && h.NoTTS {
 		log.Error("speak_tool 需要 TTS 管线（不能同时给 no_tts）")
@@ -340,4 +332,19 @@ func main() {
 	// 阻塞到 /quit/EOF，然后逆序收尾：输入插头先停 → 消费者排干 → 灯/耳
 	// 资产回收 → 会话结算 → record 收口。
 	app.Run(quit)
+}
+
+// hostKnob 收编一个 [host] 装配项的「flag 声明 + 显式才写回」：构造时已把
+// flag 注册进默认 FlagSet，Parse 之后 applyExplicit 只对命令行真正出现的
+// 名字执行写回（零值默认不算覆盖——机器差异的基准永远在 aria.toml）。
+type hostKnob[T any] struct {
+	name  string
+	val   *T
+	apply func(h *config.Host, v T)
+}
+
+func (k hostKnob[T]) applyExplicit(set map[string]bool, h *config.Host) {
+	if set[k.name] {
+		k.apply(h, *k.val)
+	}
 }
