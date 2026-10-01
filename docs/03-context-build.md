@@ -41,7 +41,7 @@
 
 1. **ContextWindow 是一等可编程状态**：上层可以声明式地变更（注入/置顶/驱逐），变更在轮边界生效；窗口 ≠ 每轮的 transcript。v1 线性组装下窗口命令语义弱，**不做**（见 §5），随 M3 非线性窗口一起。
 2. **非线性规划是方向**：窗口内容按重要性竞争选择，而不是对话时间线滑窗（importance ≠ recency）；「选择非线性、呈现线性稳定」。
-3. **供给契约是 `ContextSource`**（定义见 04 §4）：读路 `Collect`（组装链上同步、快路径，超时降级为本轮无检索）；写路 `Observe`（该轮事件写入磁盘后异步驱动，幂等）；L1 会话全量原文由事件溯源写入磁盘，不经源契约；namespace 隔离必须做在存储层 WHERE。
+3. **供给契约是 `ContextSource`**（定义见 04 §4）：读路 `Collect`（组装链上同步、快路径，超时降级为本轮无检索）；写路 `Observe`（该轮事件写入磁盘后异步驱动，幂等）；L1 会话全量原文由事件溯源写入磁盘，不经源契约；namespace 隔离必须做在存储层 WHERE。写路的调用单位与时机修订中（2026-10-02：按压缩批次暂存、会话结束提交），见 [memory/options.md](memory/options.md)「写入与召回流程」。
 
 窗口 IO 一句话：**输入** = ContextSource 集合 + 压缩记忆 + 轮间窗口命令（v1 不做）；**输出** = 每轮组装链折叠成 `[]Message` 进 core 槽 1 → Provider 请求；窗口自身不产生对外输出，对外一律走事件订阅。
 
@@ -102,7 +102,7 @@ Host(语音识别中) → Speculate(base=transcript快照, 猜测输入)
 
 **Session** = 长寿命单例容器：压缩记忆 + ingress 状态（投机槽预留，v1 不接入）；`Input(ctx, msg) (RunResult, error)` 阻塞式，宿主经事件订阅拿增量（TTS 不等整句）。
 
-**会话切换**（2026-10-01 修订，取代原「不分会话」）：一个伴侣实例 = 一个长寿命 Session 容器，会话由 `Scope.SessionID` 标识。最近一轮结算后 `Config.IdleTimeout`（配置 `session.idle_timeout_s`，缺省 1800 s，0 = 不切换）内没有新输入时切换会话：切换前结算的近轮全部压缩进记忆（`Window.Flush`：不保留最近 K 轮，与上下文用量无关），压缩记忆带入新会话；之后的输入使用新的 `SessionID`（`<session.id>-<开始时刻>`，`agent.SessionIDAt`）。进程启动即开始新会话（v1 只写不恢复）。切换与按用量触发的压缩不并发：在途压缩先完成，`Flush` 要求的轮次随后压缩；切换后结算的轮次不在要求之内，保留原文。计时以 `Input` 开始为「有操作」，每轮结算后重新计时；到期回调与 `Input` 经同一互斥锁串行。多人共享记忆（群聊语义）；未来「私聊模式」作为 Assembler 召回规则实现，不推翻模型。
+**会话切换**（2026-10-01 修订，取代原「不分会话」；2026-10-02 改为不带入上一会话内容）：一个伴侣实例 = 一个长寿命 Session 容器，会话由 `Scope.SessionID` 标识。最近一轮结算后 `Config.IdleTimeout`（配置 `session.idle_timeout_s`，缺省 1800 s，0 = 不切换）内没有新输入时切换会话：之后的输入使用新的 `SessionID`（`<session.id>-<开始时刻>`，`agent.SessionIDAt`），窗口清空（`Window.Reset`：记忆、在途与近轮一并清除，在途压缩取消且结果丢弃），新会话不带入上一会话的摘要与原文；跨会话的衔接由长期记忆的召回承担（见 [memory/options.md](memory/options.md)「写入与召回流程」）。进程启动即开始新会话（v1 只写不恢复）。计时以 `Input` 开始为「有操作」，每轮结算后重新计时；到期回调与 `Input` 经同一互斥锁串行。多人共享记忆（群聊语义）；未来「私聊模式」作为 Assembler 召回规则实现，不推翻模型。
 
 **并发**：一 Session 同时只跑一轮（并发新输入由会话互斥串行）；轮间插话走 `Queue`，仅运行中接受（2026-09-28）。schedule/ 子包不建，G1 草稿维持。
 
@@ -137,7 +137,7 @@ Host(语音识别中) → Speculate(base=transcript快照, 猜测输入)
 
 | 包 | 职责 | 关键类型 |
 |---|---|---|
-| `runtime/window` | 每轮组装 + 间隙压缩 | `Window.Assemble/Settle/Flush`、`Compressor`、`KeepLast`（缺省回退）、`ProviderCompressor`（LLM 摘要） |
+| `runtime/window` | 每轮组装 + 间隙压缩 | `Window.Assemble/Settle/Reset`、`Compressor`、`KeepLast`（缺省回退）、`ProviderCompressor`（LLM 摘要） |
 | `runtime/persist` | durable 事件 → Store 写路（只写不恢复） | `Store`（窄接口，实现注入）、`Recorder.Consume` |
 | `runtime/artifact` | 大中间产物存放与读回（artifact+ref） | `Store`（窄接口）、`Memory`（默认实现）、`OpenTool`（`artifact_open`） |
 | `runtime/toolkit` | 工具装饰器（挂点 4/5） | `Truncate`（超长结果 → 预览+引用） |
