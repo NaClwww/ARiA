@@ -9,6 +9,7 @@
 - 提供官方 Go 客户端的只有 Hindsight（OpenAPI 生成）与 Memobase（2026-01-11 起无提交）；Zep 的 `zep-go` 只支持 Zep Cloud。
 - 全部公开评测为英文，未见普通话或家庭多说话人的长期记忆评测；LoCoMo 答案键经第三方审计有 6.4% 错误。
 - 多方对话评测 GroupMemBench 中，BM25 基线与多数记忆系统持平或更高。
+- 家庭语音助手（Alexa+、Gemini for Home、小爱、小度、天猫精灵）均未公开记忆与声纹的绑定方式及未识别说话人的记忆处理（§7）。
 
 ## 2. 记忆引擎
 
@@ -84,7 +85,7 @@
   来源：https://github.com/MemTensor/OmniMemEval/blob/main/docs/user_memory/results.md
 - 厂商自报（LoCoMo／LongMemEval-S）：Hindsight 92.0／94.6，Mem0 92.5／94.4（Platform，非开源版），Zep 94.7／90.2（Zep Cloud），EverOS 94.42（多轮检索）／94.00。自报值与上表复测值的差距说明分数受评测框架影响显著。
 - 争议：Zep 与 Mem0 的 LoCoMo 设置争议；Letta 以纯文件系统 agent 取得 LoCoMo 74.0；Supermemory 以 8 个提示变体任一正确计分；Maximem 复测 Mem0 得 57.5 与 73.8。https://blog.getzep.com/lies-damn-lies-statistics-is-mem0-really-sota-in-agent-memory/ ；https://www.letta.com/blog/benchmarking-ai-agent-memory
-- 中文数据集：DuLeMon（https://arxiv.org/abs/2203.05797 ）、PerLTQA（https://arxiv.org/abs/2402.16288 ）、MADial-Bench（双语，https://arxiv.org/abs/2409.15240 ）；TeleMem 自测的 ZH-4O 为中文多角色长对话评测。
+- 中文数据集：DuLeMon（https://arxiv.org/abs/2203.05797 ）、PerLTQA（摘要未说明语言，是否为中文未核实；https://arxiv.org/abs/2402.16288 ）、MADial-Bench（双语，https://arxiv.org/abs/2409.15240 ）；TeleMem 自测的 ZH-4O 为中文多角色长对话评测。
 
 ## 5. 多说话人与共享记忆研究（2026）
 
@@ -116,4 +117,64 @@
 
 ## 7. 伴侣与家庭语音助手
 
-调研进行中，结果返回后补充本节。
+来源标记：〔文档〕官方页面已读取；〔文档摘录〕官方页面，直接读取失败，内容取自搜索摘录；〔媒体〕新闻报道；〔第三方〕第三方博客或指南；〔未核实〕未能确认。
+
+### 7.1 国内助手
+
+| 产品 | 已公开的记忆功能 | 来源 |
+|---|---|---|
+| 豆包 | 2025-10 前后上线「显式记忆」测试版；据报道范围不含图片与文件，可开关、查看、删除〔媒体〕；缺省关闭、只提取姓名与职业等结构化事实〔未核实〕；未见音箱或按声纹记忆的说明 | https://www.aibase.com/zh/news/21891 |
+| Kimi | 独立训练的模型判定记忆内容；不存健康信息、密码、地址（用户明确要求时除外）；支持「记住…」「更正：」「忘掉…」指令；上限 50 条、每条 500 字；不用于训练，可关闭或清空〔文档〕 | https://www.kimi.com/en/help/features/memory-space |
+| 通义千问 | 2025-10-16 发布 Qwen Chat Memory，记录偏好、兴趣与过往交互，可查看、编辑、删除〔媒体〕；「记住…」写入用户记忆表并注入 system prompt〔未核实〕 | https://toolnavs.com/en/article/469-tongyi-qianwen-launches-quotqwen-chat-memoryquot-to-support-long-term-personalized-conversation-experience ；https://www.woshipm.com/operate/6281298.html |
+| DeepSeek 应用 | 未见官方用户记忆功能〔第三方〕；2026-01 的 Engram 为模型架构内的条件记忆，不属于用户记忆 | https://blog.memoryplugin.com/does-deepseek-have-memory/ ；https://news.cgtn.com/news/2026-01-13/DeepSeek-unveils-new-AI-architecture-to-slash-memory-requirements-1JUjzzdmDf2/p.html |
+| 小米小爱同学 | HyperOS 3「小爱记忆」（2026-04-20）以三指滑动记住屏幕内容〔媒体〕；未见音箱对话记忆或按声纹记忆的公开说明；社区项目 mi-gpt 在小爱音箱上实现长短期记忆，不区分说话人，已于 2026-04-04 归档 | https://www.ithome.com/0/941/292.htm ；https://github.com/idootop/mi-gpt |
+| 华为小艺 | 「小艺记忆」（应用 11.5.2.300 起改名「小艺帮记」）存重要日期、证件与卡片、地址、事件与订单、人物信息与偏好、计划与目标；对话、图片、屏幕识别、应用同步四种添加方式；事件记忆上限 1000 条，其余类型各 100 条〔文档摘录〕；未说明多用户或声纹绑定 | https://consumer.huawei.com/cn/support/content/zh-cn16010214/ |
+| 天猫精灵 | 宣传「持续学习家庭成员习惯」，机制与用户控制未见公开〔未核实〕 | https://post.smzdm.com/p/axkvnlzw/ |
+| 小度 | 2025-11-13 发布「超能小度」，提及「个性记忆」〔媒体〕；已公开的具体功能为语音备忘与摄像头 24 小时回看找物；是否按家庭成员区分未核实 | https://finance.sina.com.cn/roll/2025-11-14/doc-infxkhuy2990814.shtml ；https://www.leikeji.com/article/72862 |
+
+### 7.2 伴侣应用
+
+| 产品 | 机制 | 来源 |
+|---|---|---|
+| Character.AI | Chat Memories 固定信息上限 400 字符，全体用户可用；Pinned memories 与自动记忆限订阅用户〔文档〕；2026-05 的三层结构：用户编写的 Story Memory、对话中自动捕获的 Facts、Memory Usage 占用显示，每个对话最多 15 个 Pin〔第三方〕 | https://blog.character.ai/helping-characters-remember-what-matters-most/ ；https://www.roborhythms.com/character-ai-adds-chat-memories/ |
+| Replika | 分层记忆：Memory 标签页可见条目 + 基于对话模式的深层记忆；用户对正确回忆点赞以强化；可手动添加〔文档摘录〕 | https://help.replika.com/hc/en-us/articles/37208679176077-How-does-Replika-s-memory-work |
+| Nomi | 短期、中期、长期记忆之上设 Identity Core，由角色自行判定身份核心内容；Mind Map 2.0 展示记忆中人物、地点、话题的关联〔文档摘录〕 | https://nomi.ai/updates/introducing-the-nomi-identity-core-fostering-dynamic-and-authentic-identities/ ；https://nomi.ai/updates/mind-map-2-0-bringing-nomi-memory-into-view/ |
+| Kindroid | Journal 条目按关键短语触发（不区分大小写），上限 500 条，每条消息最多召回个人 3 条 + 全局 3 条；Cascaded Memory 为覆盖数百至数千条消息的中期层〔文档摘录〕 | https://kindroid.ai/docs/article/memory/ |
+| MiniMax 星野／Talkie | 应用记忆架构未公开 | https://ai-bot.cn/minimax-m2-her/ |
+| Pi | 登录用户跨平台记住 100 轮（2023-05 报道，数值取自搜索摘录）〔媒体〕 | https://gwern.net/doc/www/www.forbes.com/638e8c03d683fe876080f1f7d664ad4387b6bd55.html |
+
+### 7.3 家庭多用户语音助手
+
+| 产品 | 说话人识别 | 记忆与未识别说话人 | 来源 |
+|---|---|---|---|
+| Alexa+ | Voice ID 按说话人给出个性化响应；Echo Show 的 Visual ID 识别在场成员并投递针对该成员的提醒〔文档〕；家庭最多 2 名成人与 4 名儿童 profile，各有 Voice ID〔文档摘录〕 | 可记住家庭菜谱、重要日期、事实、饮食偏好，控制项位于 Alexa Privacy 面板〔文档〕；记忆按声纹 profile 还是按家庭存储，官方页面与 CNN 2026-01-13 报道均未说明；2019 开发者文档：声音未识别或用户退出时不下发 personId，技能改用账户级 userId〔文档〕 | https://www.aboutamazon.com/news/devices/new-alexa-generative-artificial-intelligence ；https://www.aboutamazon.com/news/devices/new-alexa-plus-amazon-devices ；https://developer.amazon.com/en-US/blogs/alexa/alexa-skills-kit/2019/10/recognize-voices-and-personalize-your-skills ；https://ktvz.com/money/cnn-business-consumer/2026/01/13/amazons-big-plan-to-beat-chatgpt-give-alexa-a-better-memory/ |
+| Gemini for Home | Voice Match 个性化日历、通勤、音乐〔文档〕 | 访客与未匹配声音使用第一位 Voice Match 用户的缺省音乐服务；回答过滤缺省为「对访客过滤」，已匹配的儿童始终过滤；管理员可把视频历史检索限定为已匹配用户；支持「记住…」式偏好〔文档〕；Gemini for Home 不读取用户此前对 Google Assistant 所说内容〔媒体〕 | https://support.google.com/googlehome/answer/7320960 ；https://support.google.com/googlehome/answer/16618650 ；https://www.thurrott.com/?p=328971 |
+| Apple HomePod／Siri | HomePod 最多识别 6 人，Personal Requests 需声音识别〔文档〕 | 未识别者可使用音乐、计时、天气，音乐经主用户账户播放且不改变主用户偏好；2026-06 的 Siri AI 经设备端 Spotlight 索引取个人上下文，未提及 HomePod 与多用户，中国区不提供〔文档〕 | https://support.apple.com/guide/homepod/apd1841a8f81/homepod ；https://www.apple.com/newsroom/2026/06/apple-introduces-siri-ai-a-profoundly-more-capable-and-personal-assistant/ |
+
+### 7.4 研究
+
+| 主题 | 研究 | 结论 | 来源 |
+|---|---|---|---|
+| 伴侣长期记忆 | MemoryBank／SiliconFriend（AAAI 2024） | 按经过时间与重要度更新记忆；保持率模型 R = e^(−t/S)（公式取自搜索摘录） | https://arxiv.org/abs/2305.10250 |
+| | RMM（ACL 2025） | 前瞻式多粒度摘要 + 强化学习调整检索，LongMemEval 提升 10% 以上 | https://arxiv.org/abs/2503.08026 |
+| | COMEDY（2024） | 单一模型完成记忆生成、压缩与使用；附中文数据 Dolphin | https://arxiv.org/abs/2402.11975 |
+| 多方归属 | SocialMemBench（2026-05） | 成员离开后的归属、群体规范与个人例外；开源记忆框架得分 0.12–0.18 | https://arxiv.org/abs/2605.17789 |
+| | GroupMemBench（2026-05） | 记忆写入后说话人结构丢失 | https://arxiv.org/abs/2605.14498 |
+| 人设一致性 | Persona drift（2024） | 8 轮内出现显著漂移 | https://arxiv.org/abs/2402.10962 |
+| | PersonaMem（2025） | 前沿模型准确率约 50% | https://arxiv.org/abs/2504.14225 |
+| 遗忘 | FadeMem（2026） | 按相关性、访问频率与时间调整指数衰减，存储减少 45% | https://arxiv.org/abs/2601.18642 |
+| | MOOM（2025） | 竞争-抑制式遗忘限制记忆增长；提出中文角色扮演数据 ZH-4O（平均 600 轮） | https://arxiv.org/abs/2509.11860 |
+| 共享记忆隐私 | CIMemories（ICLR 2026） | 模型在错误语境中透露已记住的属性，属性级违规最高 69% | https://arxiv.org/abs/2511.14937 |
+| | Collaborative Memory（ICML 2025） | 私有与共享两层，来源记录不可变，读取时按当前权限判定 | https://arxiv.org/abs/2505.18279 |
+| | Famigo（ICEIC 2026） | 家庭语音助手，私有与共享两个存储，自动识别用户，设备端语音处理 + 云端 RAG，延迟 2–3 s〔文档摘录〕 | https://scholarx.skku.edu/item/284001d9-5901-48f3-aa81-8496d316ef6d |
+| | MemOS 文档 | 每人一个 user_id；多人同一对话时 user_id 可为列表，按参与者分别记忆〔文档摘录〕 | https://memos-docs.openmem.net/memos_cloud/introduction/isolation_filters/ ；https://memos-docs.openmem.net/usecase/home_assistant/ |
+
+### 7.5 中文数据集补充
+
+- Dolphin（COMEDY）、ZH-4O（MOOM）、ChMapData（CoNLL 2025，https://arxiv.org/abs/2503.05150 ）、PAL-Set／PAL-Bench（AAAI 2026，https://arxiv.org/abs/2511.13410 ）、CharacterEval（1785 段对话、77 个角色，https://arxiv.org/abs/2401.01275 ）。
+- 以中英文检索，未找到家庭多说话人记忆或普通话口语记忆的中文评测。
+
+### 7.6 空白
+
+- Alexa+、Gemini for Home、小爱、小度、天猫精灵均未公开记忆如何绑定声纹，以及未识别说话人的记忆如何处理。
+- 已公开的访客行为只有两类：使用主账户的音乐设置，或给出过滤后的回答。
