@@ -11,7 +11,7 @@
 | `Tool.Def/Exec` | core/02 §5 | M1 | §3 内置工具 |
 | `Assembler.Assemble` | core/02 §4 | M1 | 恒等兜底；runtime/window 每轮组装（03 §5）在 core 槽 1 上折叠 |
 | `ToolSource.Name/Tools/Close` | 本文 §3 | M2 | §3 工具源；MCP 桥（M4）= 一种 ToolSource，实现时再细化 |
-| `ContextSource.Name/Collect/Observe` | runtime/03 §2 | M3 | §4 RAG 源 |
+| `ContextSource.Name/Collect/Observe` | runtime/03 §2 | M3 | §4 RAG 源；写路修订中，记忆服务改用独立接口（见 §4） |
 
 **插件可见的数据类型只有三个**：`Message`（含 Block/ToolCall/ToolResult/Usage）、`Episode`（一轮完整出入）、`Unit`（窗口候选单元：Kind/Content/Importance/Ref/Meta）。Window 内部图结构（版本、COW、访问计数）runtime 私有。
 
