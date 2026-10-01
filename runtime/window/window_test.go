@@ -1034,143 +1034,74 @@ func TestAssembleOmitsOldestRawOverLimit(t *testing.T) {
 	}
 }
 
-// ---------- 会话切换（Flush） ----------
+// ---------- 会话切换（Reset） ----------
 
-// Flush 把调用时刻的近轮全部压缩，不保留最近 K 轮，与预算无关（未设置预算）。
-func TestFlushCompressesAllRecentTurns(t *testing.T) {
+// Reset 清空记忆与近轮并返回被清除的原文；之后的组装只含新输入。
+func TestResetClearsWindowAndReturnsRaw(t *testing.T) {
 	rc := &recordingCompressor{out: []message.Message{message.NewUser("摘要")}}
 	w := New(rc, quiet())
-	w.SetKeepRecentTurns(2)
-	for _, n := range []string{"1", "2", "3"} {
-		w.Settle(context.Background(), qaTurn(n), 0)
-	}
+	w.SetKeepRecentTurns(1)
+	w.SetBudget(Budget{ContextWindow: 1000, MaxOutput: 100, Reserve: 200, Count: perMsg})
+	w.Settle(context.Background(), qaTurn("A"), 100)
+	w.Settle(context.Background(), qaTurn("B"), 100)
+	w.Settle(context.Background(), qaTurn("C"), 900) // 压缩 A、B，保留 C
 	w.Wait()
-	if n := rc.callCount(); n != 0 {
-		t.Fatalf("未设置预算，Flush 之前不应压缩，实际 %d 次", n)
+
+	if got := texts(w.Reset()); !equal(got, []string{"user:问C", "assistant:答C"}) {
+		t.Fatalf("应返回近轮原文 C：got %v", got)
 	}
-	w.Flush(context.Background())
-	w.Wait()
-	want := []string{"user:问1", "assistant:答1", "user:问2", "assistant:答2", "user:问3", "assistant:答3"}
-	if got := rc.seen(); !equal(got, want) {
-		t.Fatalf("应压缩全部 3 轮：want %v got %v", want, got)
-	}
-	if got := texts(w.Assemble(nil)); !equal(got, []string{"user:摘要"}) {
-		t.Fatalf("assemble: got %v", got)
+	if got := texts(w.Assemble([]message.Message{message.NewUser("新输入")})); !equal(got, []string{"user:新输入"}) {
+		t.Fatalf("Reset 后组装应只含新输入：got %v", got)
 	}
 }
 
-// 没有近轮时 Flush 不压缩。
-func TestFlushWithoutRecentIsNoop(t *testing.T) {
-	rc := &recordingCompressor{out: []message.Message{message.NewUser("摘要")}}
-	w := New(rc, quiet())
-	w.Flush(context.Background())
-	w.Wait()
-	if n := rc.callCount(); n != 0 {
-		t.Fatalf("无近轮不应压缩，实际 %d 次", n)
-	}
-}
-
-// 按用量的压缩在途时 Flush：在途批次（A、B）结束后接着压缩 Flush 时刻的近轮（C），
-// 使用 Flush 的 ctx；Flush 之后结算的 D 属于新会话，保留原文。
-func TestFlushDuringCompressionRunsAfterInFlight(t *testing.T) {
+// 压缩在途时 Reset：在途与近轮一并返回，在途压缩的结果丢弃；Reset 之后结算的 D 照常保留。
+func TestResetDiscardsInFlightCompressionResult(t *testing.T) {
 	bc := &blockingCompressor{gate: make(chan struct{}), entered: make(chan struct{}, 1),
 		out: []message.Message{message.NewUser("摘要")}}
 	w := New(bc, quiet())
 	w.SetKeepRecentTurns(1)
 	w.SetBudget(Budget{ContextWindow: 1000, MaxOutput: 100, Reserve: 200, Count: perMsg})
 	var mu sync.Mutex
-	var sids []string
-	w.SetOnCompress(func(ctx context.Context, _ loop.WindowCompressedData) {
-		sc, _ := ctxx.ScopeFrom(ctx)
+	var reports []loop.WindowCompressedData
+	w.SetOnCompress(func(_ context.Context, r loop.WindowCompressedData) {
 		mu.Lock()
-		sids = append(sids, sc.SessionID)
+		reports = append(reports, r)
 		mu.Unlock()
 	})
-	s1 := ctxx.WithScope(context.Background(), ctxx.Scope{SessionID: "s1"})
-	s2 := ctxx.WithScope(context.Background(), ctxx.Scope{SessionID: "s2"})
-	w.Settle(s1, qaTurn("A"), 100)
-	w.Settle(s1, qaTurn("B"), 100)
-	w.Settle(s1, qaTurn("C"), 900) // 剩余 100 < 预留 200：压缩 A、B，保留 C
-	<-bc.entered
-	w.Flush(s1)
-	w.Settle(s2, qaTurn("D"), 950)
-	close(bc.gate)
-	w.Wait()
-
-	passes := bc.allSeen()
-	want := [][]string{
-		{"user:问A", "assistant:答A", "user:问B", "assistant:答B"},
-		{"user:问C", "assistant:答C"},
-	}
-	if len(passes) != 2 || !equal(passes[0], want[0]) || !equal(passes[1], want[1]) {
-		t.Fatalf("压缩批次不符：want %v got %v", want, passes)
-	}
-	if got := texts(w.Assemble(nil)); !equal(got, []string{"user:摘要", "user:问D", "assistant:答D"}) {
-		t.Fatalf("assemble: got %v", got)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if !equal(sids, []string{"s1", "s1"}) {
-		t.Fatalf("两批压缩都应使用 s1 的 ctx，实际 %v", sids)
-	}
-}
-
-// failOnceCompressor 首次调用阻塞至 gate 关闭后返回错误，之后的调用返回 out；记录每批的本轮消息。
-type failOnceCompressor struct {
-	gate    chan struct{}
-	entered chan struct{}
-	out     []message.Message
-
-	mu     sync.Mutex
-	passes [][]string
-}
-
-func (c *failOnceCompressor) Compress(_ context.Context, _, turn []message.Message) ([]message.Message, error) {
-	c.mu.Lock()
-	first := len(c.passes) == 0
-	c.passes = append(c.passes, texts(turn))
-	c.mu.Unlock()
-	if first {
-		c.entered <- struct{}{}
-		<-c.gate
-		return nil, errors.New("boom")
-	}
-	return cloneAll(c.out), nil
-}
-
-func (c *failOnceCompressor) allSeen() [][]string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return append([][]string(nil), c.passes...)
-}
-
-// 在途批次失败时结束压缩循环，Flush 要求中尚未取走的轮次（C）保留，由下一次 Settle 发起压缩；
-// 该次 Settle 结算的 D 不在要求之内，保留原文。
-func TestFlushPendingAfterFailureRetriedOnNextSettle(t *testing.T) {
-	fc := &failOnceCompressor{gate: make(chan struct{}), entered: make(chan struct{}, 1),
-		out: []message.Message{message.NewUser("摘要")}}
-	w := New(fc, quiet())
-	w.SetKeepRecentTurns(1)
-	w.SetBudget(Budget{ContextWindow: 1000, MaxOutput: 100, Reserve: 200, Count: perMsg})
 	ctx := context.Background()
 	w.Settle(ctx, qaTurn("A"), 100)
 	w.Settle(ctx, qaTurn("B"), 100)
-	w.Settle(ctx, qaTurn("C"), 900) // 压缩 A、B（本批失败）
-	<-fc.entered
-	w.Flush(ctx)
-	close(fc.gate)
-	w.Wait()
-	if n := len(fc.allSeen()); n != 1 {
-		t.Fatalf("失败后不应在循环内继续压缩，实际 %d 批", n)
-	}
+	w.Settle(ctx, qaTurn("C"), 900) // 压缩 A、B（在途）
+	<-bc.entered
 
-	w.Settle(ctx, qaTurn("D"), 100) // 剩余 900 不低于预留：仅因 Flush 要求发起压缩
-	w.Wait()
-	passes := fc.allSeen()
-	if len(passes) != 2 || !equal(passes[1], []string{"user:问C", "assistant:答C"}) {
-		t.Fatalf("第 2 批应只压缩 C：got %v", passes)
+	want := []string{"user:问A", "assistant:答A", "user:问B", "assistant:答B", "user:问C", "assistant:答C"}
+	if got := texts(w.Reset()); !equal(got, want) {
+		t.Fatalf("应返回在途与近轮：want %v got %v", want, got)
 	}
-	if got := texts(w.Assemble(nil)); !equal(got, []string{"user:摘要", "user:问D", "assistant:答D"}) {
-		t.Fatalf("assemble: got %v", got)
+	w.Settle(ctx, qaTurn("D"), 100)
+	close(bc.gate)
+	w.Wait()
+
+	if got := texts(w.Assemble(nil)); !equal(got, []string{"user:问D", "assistant:答D"}) {
+		t.Fatalf("在途压缩结果应丢弃，只保留 D：got %v", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(reports) != 1 || !strings.Contains(reports[0].Err, "discarded") || reports[0].OutMessages != 0 {
+		t.Fatalf("报告应标明结果已丢弃：%+v", reports)
+	}
+}
+
+// 压缩在途时 Reset 取消压缩；压缩因取消而失败时，失败回退不把旧内容并回记忆。
+func TestResetCancelsCompressionWithoutFallback(t *testing.T) {
+	c := &ctxBlockingCompressor{entered: make(chan struct{})}
+	w := eagerWin(c)
+	w.Settle(context.Background(), qaTurn("A"), 0)
+	<-c.entered
+	w.Reset()
+	w.Wait()
+	if mem, recent := w.Snapshot(); len(mem) != 0 || len(recent) != 0 {
+		t.Fatalf("Reset 后窗口应为空：memory %v recent %v", texts(mem), texts(recent))
 	}
 }

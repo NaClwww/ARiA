@@ -7,7 +7,7 @@
 //
 // 压缩按上下文用量触发（见 Budget）：上下文剩余量低于预留量时，压缩触发时刻
 // 近轮中除最近 K 轮以外的轮次；压缩进行中结算的轮次不计入 K，保留原文。
-// 会话切换时由 Flush 触发：切换前结算的近轮全部压缩，不保留最近 K 轮。
+// 会话切换时由 Reset 清空记忆与近轮：新会话不带入上一会话的摘要与原文。
 package window
 
 import (
@@ -74,7 +74,7 @@ type Window struct {
 	keepTurns   int               // 压缩时保留原文的近轮数 K，见 SetKeepRecentTurns
 	budget      Budget            // 按用量触发压缩的预算，见 SetBudget
 	used        int               // 最近一次判定得到的上下文用量（token）
-	flushTurns  int               // recent 开头须全部压缩的轮数（Flush 设置；压缩取走后递减）
+	epoch       uint64            // Reset 次数：在途压缩据此判定结果是否仍属于当前窗口
 	compressing bool
 	pendingCtx  context.Context // 触发待压缩批次的 Settle 的 ctx：下一轮压缩换用它的身份
 	onCompress  func(context.Context, loop.WindowCompressedData)
@@ -104,7 +104,7 @@ func (w *Window) SetSystem(text string) {
 
 // SetOnCompress 注册压缩观测（装配期调用）：每次间隙压缩结束后（成功或
 // 失败）在压缩 goroutine 上同步回调，报告规模与结果；ctx 为该批压缩使用的 ctx
-// （值取自触发该批的 Settle 或 Flush，其 Scope 即该批内容所属的会话）。回调必须快、
+// （值取自触发该批的 Settle，其 Scope 即该批内容所属的会话）。回调必须快、
 // 不得再调窗口方法（会死锁）；nil 关闭。window_compressed 审计事件经此回调由 Session
 // 写入 Store——窗口本身不认识事件总线。
 func (w *Window) SetOnCompress(fn func(ctx context.Context, rep loop.WindowCompressedData)) {
@@ -140,18 +140,17 @@ func (w *Window) dueLocked() bool {
 	return b.ContextWindow > 0 && len(w.recentTurns) > 0 && b.ContextWindow-w.used < b.Reserve
 }
 
-// cutTurnsLocked 返回下一批压缩从 recent 开头取走的轮数（调用方持有 w.mu）：
-// 满足用量触发条件时取除最近 K 轮以外的轮次（近轮不超过 K 轮时全部取走），
-// 再与 Flush 要求的轮数取较大值；两个条件均不成立时为 0。
+// cutTurnsLocked 返回下一批压缩从 recent 开头取走的轮数（调用方持有 w.mu）：满足触发条件时
+// 取除最近 K 轮以外的轮次，近轮不超过 K 轮时全部取走；不满足时为 0。
 func (w *Window) cutTurnsLocked() int {
-	n := 0
-	if w.dueLocked() {
-		n = len(w.recentTurns) - w.keepTurns
-		if n <= 0 {
-			n = len(w.recentTurns)
-		}
+	if !w.dueLocked() {
+		return 0
 	}
-	return min(max(n, w.flushTurns), len(w.recentTurns))
+	n := len(w.recentTurns) - w.keepTurns
+	if n <= 0 {
+		n = len(w.recentTurns)
+	}
+	return n
 }
 
 // estimateLocked 按 budget.Count 估算当前上下文（system、记忆、在途与近轮）的 token 数（调用方持有 w.mu）。
@@ -268,7 +267,7 @@ func (w *Window) Settle(ctx context.Context, turn []message.Message, used int) {
 	default:
 		w.used = w.estimateLocked()
 	}
-	if w.cutTurnsLocked() == 0 { // 剩余量不低于预留量且无待执行的 Flush：继续以原文参与组装
+	if w.cutTurnsLocked() == 0 { // 剩余量不低于预留量：继续以原文参与组装
 		w.mu.Unlock()
 		return
 	}
@@ -276,25 +275,20 @@ func (w *Window) Settle(ctx context.Context, turn []message.Message, used int) {
 	w.mu.Unlock()
 }
 
-// Flush 把调用时刻的近轮全部压缩进记忆，不保留最近 K 轮，与上下文用量无关；用于会话切换。
-// 非阻塞：与 Settle 相同在后台压缩。压缩在途时记下要求的轮数，在途批次结束后接着压缩；
-// Flush 之后结算的轮次不在要求之内，保留原文。压缩失败时该批按失败回退并入记忆，要求中
-// 尚未取走的轮数保留，由下一次 Settle 重新发起。
-// ctx 的值（Scope/凭据/参数）用于这批压缩，应取自被压缩内容所属的会话。
-func (w *Window) Flush(ctx context.Context) {
+// Reset 清空记忆、在途与近轮（会话切换：新会话不带入上一会话的摘要与原文），返回被清除的
+// 原文（在途在前、近轮在后），供调用方另行处理。在途压缩被取消，其结果与失败回退一律丢弃；
+// Reset 之后结算的轮次照常参与组装与压缩。
+func (w *Window) Reset() []message.Message {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.closed || len(w.recentTurns) == 0 {
-		return
+	raw := append(cloneAll(w.inflight), cloneAll(w.recent)...)
+	w.memory, w.inflight, w.recent, w.recentTurns = nil, nil, nil, nil
+	w.used = 0
+	w.epoch++
+	if w.cancel != nil {
+		w.cancel()
 	}
-	w.flushTurns = len(w.recentTurns)
-	if w.compressing {
-		if w.pendingCtx == nil && ctx != nil {
-			w.pendingCtx = ctx
-		}
-		return
-	}
-	w.startLocked(ctx)
+	return raw
 }
 
 // startLocked 标记压缩在途并启动压缩 goroutine（调用方持有 w.mu）。
@@ -337,7 +331,7 @@ func (w *Window) compress(ctx context.Context) {
 			cctx, cancel := context.WithCancel(ctxx.Detached(ctx))
 			ctx, w.cancel = cctx, cancel
 		}
-		// 取走的轮数见 cutTurnsLocked；为 0 表示两个触发条件均已不成立
+		// 取走的轮数见 cutTurnsLocked；为 0 表示触发条件已不成立
 		// （例如压缩进行中 SetBudget 更换了预算），结束循环。
 		cutTurns := w.cutTurnsLocked()
 		if cutTurns == 0 {
@@ -345,7 +339,7 @@ func (w *Window) compress(ctx context.Context) {
 			w.mu.Unlock()
 			return
 		}
-		w.flushTurns = max(w.flushTurns-cutTurns, 0)
+		epoch := w.epoch
 		cut := 0
 		for _, n := range w.recentTurns[:cutTurns] {
 			cut += n
@@ -370,7 +364,12 @@ func (w *Window) compress(ctx context.Context) {
 		}
 
 		w.mu.Lock()
-		if err != nil {
+		switch {
+		case w.epoch != epoch:
+			// 压缩期间窗口已 Reset：本批属于已结束的会话，结果与失败回退一律丢弃。
+			report.Err = "window reset during compression, result discarded"
+			report.OutMessages, report.OutChars = 0, 0
+		case err != nil:
 			// 压缩失败不丢内容：退回未压缩形态继续累积，下一轮照常组装。
 			// 原始消息超过 fallbackCap 才裁剪（防止压缩持续失败导致无界增长）。
 			w.log.Warn("window: compress failed, keeping raw messages", "err", err)
@@ -384,13 +383,13 @@ func (w *Window) compress(ctx context.Context) {
 			w.memory = mem
 			report.Err = err.Error()
 			report.OutMessages, report.OutChars = len(mem), charsOf(mem)
-		} else {
+		default:
 			w.memory = cloneAll(out) // 不持有 Compressor 的切片
 		}
 		w.inflight = nil
-		// 成功：按压缩后的内容重新估算用量，仍满足触发条件（近轮仍过长、压缩期间又有新结算，
-		// 或 Flush 要求的轮数未取完）时继续压缩。失败：结束，由下一次 Settle 重新判定，
-		// 不在此处连续重试。结束时待压缩批次的 ctx 一并清除，下一次由触发压缩的 Settle 或 Flush 提供 ctx。
+		// 成功：按压缩后的内容重新估算用量，仍满足触发条件（近轮仍过长，或压缩期间又有新结算）
+		// 时继续压缩。失败：结束，由下一次 Settle 重新判定，不在此处连续重试。
+		// 结束时待压缩批次的 ctx 一并清除，下一次由触发压缩的 Settle 提供 ctx。
 		if err == nil && w.budget.ContextWindow > 0 {
 			w.used = w.estimateLocked()
 		}

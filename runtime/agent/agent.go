@@ -5,8 +5,8 @@
 // 尚未接入：ingress 成轮（随语音，03 §6）、小轮/抢话（03 §7）、投机（05 G0）。
 //
 // 会话切换：一个伴侣实例通常只建一个 Session（容器），从启动活到关闭；最近一轮结算后
-// Config.IdleTimeout 内没有新输入时切换到新的会话标识（Scope.SessionID），切换前的近轮
-// 全部压缩进记忆，压缩记忆带入新会话。
+// Config.IdleTimeout 内没有新输入时切换到新的会话标识（Scope.SessionID）并清空窗口，
+// 新会话不带入上一会话的摘要与原文。
 package agent
 
 import (
@@ -55,8 +55,8 @@ type Config struct {
 	Compact CompactBudget
 
 	// IdleTimeout 是会话切换的无操作时长：最近一轮结算后 IdleTimeout 内没有新的 Input 时，
-	// 当前会话结束（近轮全部压缩进记忆，见 window.Flush），之后的输入使用新的 Scope.SessionID。
-	// 0 = 不切换。
+	// 当前会话结束（窗口清空，见 window.Reset；新会话不带入上一会话的摘要与原文），
+	// 之后的输入使用新的 Scope.SessionID。0 = 不切换。
 	IdleTimeout time.Duration
 
 	// NewSessionID 生成会话切换后的会话标识，参数为切换时刻；
@@ -388,7 +388,6 @@ type Session struct {
 	newID        func(time.Time) string // 会话切换后的会话标识生成
 	idleTimer    *time.Timer            // 无操作计时：每轮结算时启动，Input 开始时停止
 	idleGen      uint64                 // 计时代号：每次启动或停止递增，到期回调据此判定是否作废
-	lastCtx      context.Context        // 当前会话最近一轮的 run ctx（会话切换的压缩使用其身份）
 	sessionTurns int                    // 当前会话已结算的轮数
 	runEnd       chan struct{}          // 本轮已结算的信号
 	err          error                  // 首个后台错误
@@ -690,7 +689,6 @@ func (s *Session) settle() {
 	}
 	s.win.Settle(ctx, turn, used)
 	s.mu.Lock()
-	s.lastCtx = ctx
 	s.sessionTurns++
 	s.armIdleLocked()
 	s.mu.Unlock()
@@ -728,8 +726,8 @@ func (s *Session) armIdleLocked() {
 
 // onIdle 是无操作计时到期的回调。持 runMu 与 Input 互斥：在途轮次结束后才执行，期间开始的
 // Input 已使计时代号改变，回调随之作废。代号未变且当前会话有已结算的轮次时切换会话：
-// 近轮全部压缩进记忆（window.Flush，使用最近一轮 run ctx 的身份，即切换前的会话），
-// 之后的输入使用新的 SessionID。切换由 s.log 输出一条 Info 日志 agent: session switched。
+// 改用新的 SessionID，并清空窗口（window.Reset，新会话不带入上一会话的摘要与原文）。
+// 切换由 s.log 输出一条 Info 日志 agent: session switched，dropped_messages 为清除的原文条数。
 func (s *Session) onIdle(gen uint64) {
 	s.runMu.Lock()
 	defer s.runMu.Unlock()
@@ -742,8 +740,7 @@ func (s *Session) onIdle(gen uint64) {
 		s.mu.Unlock()
 		return
 	}
-	prevScope, ctx := s.scope, s.lastCtx
-	prev := prevScope.SessionID
+	prev := s.scope.SessionID
 	next := s.newID(now)
 	if next == "" || next == prev {
 		s.log.Warn("agent: NewSessionID returned an empty or unchanged id, SessionIDAt used",
@@ -752,16 +749,12 @@ func (s *Session) onIdle(gen uint64) {
 	}
 	s.scope.SessionID = next
 	s.sessionTurns = 0
-	s.lastCtx = nil
 	s.idleTimer = nil
 	idle := s.idle
 	s.mu.Unlock()
 
-	if ctx == nil {
-		ctx = ctxx.WithScope(s.ctx, prevScope)
-	}
-	s.win.Flush(ctx)
-	s.log.Info("agent: session switched", "session", prev, "next", next, "idle", idle)
+	dropped := len(s.win.Reset())
+	s.log.Info("agent: session switched", "session", prev, "next", next, "idle", idle, "dropped_messages", dropped)
 }
 
 // budget 按本轮 ctx 的模型与输出上限计算窗口预算。Provider 报告窗口未知时返回零值

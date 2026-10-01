@@ -86,7 +86,7 @@ type Session struct {
 	ID          string // 会话标识前缀：实际会话标识为 <ID>-<会话开始时刻>，见 agent.SessionIDAt
 	DefaultUser string
 	// IdleTimeoutS 是会话切换的无操作时长（秒）：最近一轮结束后该时长内没有新输入时，
-	// 近轮全部压缩进记忆，之后的输入进入新会话。0 = 不切换。
+	// 上下文清空，之后的输入进入新会话（不带入上一会话的摘要与原文）。0 = 不切换。
 	IdleTimeoutS int
 }
 

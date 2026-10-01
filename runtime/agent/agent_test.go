@@ -1472,31 +1472,26 @@ func TestSessionIDAt(t *testing.T) {
 	}
 }
 
-// 最近一轮结算后 IdleTimeout 内无输入：近轮全部压缩进记忆（不保留 K 轮、窗口未知也压缩），
-// 之后的输入使用新的 SessionID；压缩事件记在切换前的会话下。
+// 最近一轮结算后 IdleTimeout 内无输入：切换为新的 SessionID 并清空窗口，不压缩、不带入上一会话的内容；
+// 切换后的请求只含新输入。
 func TestSessionSwitchesAfterIdle(t *testing.T) {
 	cc := &countingCompressor{}
 	st := &sidStore{}
 	sp := &scopeProbeProvider{inner: provider.NewFake(
 		provider.FakeStep{Text: []string{"一"}}, provider.FakeStep{Text: []string{"二"}})}
-	s, _ := newTestSession(t, Config{
-		Provider:        sp,
-		Compressor:      cc,
-		KeepRecentTurns: 2,
-		Store:           st,
-		IdleTimeout:     20 * time.Millisecond,
-		NewSessionID:    func(time.Time) string { return "s2" },
+	s, rp := newTestSession(t, Config{
+		Provider:     sp,
+		Compressor:   cc,
+		Store:        st,
+		IdleTimeout:  20 * time.Millisecond,
+		NewSessionID: func(time.Time) string { return "s2" },
 	})
 	if _, err := s.Input(context.Background(), message.NewUser("第一轮")); err != nil {
 		t.Fatal(err)
 	}
 	waitUntil(t, "会话切换为 s2", func() bool { return s.SessionID() == "s2" })
-	s.WaitCompress()
-	if n := cc.calls(); n != 1 {
-		t.Fatalf("切换时应压缩 1 次，实际 %d 次", n)
-	}
-	if mem, recent := s.History(); len(recent) != 0 || len(mem) != 2 {
-		t.Fatalf("近轮应全部进入记忆：memory %v recent %v", rendered(mem), rendered(recent))
+	if mem, recent := s.History(); len(mem) != 0 || len(recent) != 0 {
+		t.Fatalf("切换后窗口应为空：memory %v recent %v", rendered(mem), rendered(recent))
 	}
 	if _, err := s.Input(context.Background(), message.NewUser("第二轮")); err != nil {
 		t.Fatal(err)
@@ -1504,8 +1499,14 @@ func TestSessionSwitchesAfterIdle(t *testing.T) {
 	if got := sp.lastScope().SessionID; got != "s2" {
 		t.Fatalf("切换后的输入应使用 s2，实际 %s", got)
 	}
+	if got := rendered(rp.at(1).Messages); len(got) != 1 || got[0] != "user:第二轮" {
+		t.Fatalf("切换后的请求应只含新输入：%v", got)
+	}
+	if n := cc.calls(); n != 0 {
+		t.Fatalf("会话切换不应压缩，实际 %d 次", n)
+	}
 	_ = s.Close()
-	for _, e := range []string{"s1:agent_start", "s1:window_compressed", "s2:agent_start"} {
+	for _, e := range []string{"s1:agent_start", "s2:agent_start"} {
 		if !st.has(e) {
 			t.Fatalf("缺少写入记录 %s：%v", e, st.got)
 		}
