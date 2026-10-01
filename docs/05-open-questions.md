@@ -30,9 +30,9 @@
 **C1 · 压缩的话题边界检测 `[M4]`** —— LLM 判定 vs 启发式（轮次间隔/工具调用模式）vs 混合。ingress 的**话题判终**（03 §6，v1 纯规则）是它的输入信号之一，两者需合流。
 建议：混合——启发式粗切 + LLM 修边（省钱且稳定）。
 
-**C2 · Distiller 冲突解决 `[M4]`** —— supersede 的具体规则、置信度衰减曲线、何种冲突保留双方+时间戳。
+**C2 · ~~Distiller 冲突解决~~ `[已收口 2026-10-01]`** —— 引擎选型接入 Hindsight（同日，见 [discussions/2026-10-01-memory-design.md](discussions/2026-10-01-memory-design.md) §11）后，提炼与冲突消解由其内部 consolidation 承担，ARiA 不再实现 Distiller；自建 append-only 方案作为被否备选存档于该记录 §6。
 
-**C3 · 评测集建设 `[M3]`** —— golden 集的来源与格式、CI 阈值、防回归劣化的门禁强度。
+**C3 · 评测集建设 `[M3]`** —— golden 集的来源与格式、CI 阈值、防回归劣化的门禁强度。**2026-10-01**：首批 golden 案例随记忆设计定稿（五道中文验证题：过时偏好 / 归属错认 / 跨词面召回 / 工具失败不落事实 / 重启与噪声，见 [discussions/2026-10-01-memory-design.md](discussions/2026-10-01-memory-design.md) §10）；格式与 CI 门禁仍开放。
 
 **C4 · 两段式压缩 `[待拍板]`** —— 压缩零件现在只有「LLM 摘要」一种；**两段式**（软摘要 + 不可被 LLM 改写的**硬台账**：从 durable 事件生成动作记录，压缩时「干过的事」不丢失）已提案并在 pi 的 compact 上对标过（pi 的 Files 段是 LLM 写在摘要里的，非独立台账——本方案更强）。待定两点：① **台账记什么**（全部工具调用 / 宿主标记的副作用工具 / 宿主提取函数）② **保留策略**（印象中倾向：副作用条目永久 + 只读条目保留最近 N）。实现形态 = 组装层第三个零件 `twopart`（03 §5 零件位①），不动骨架；拍板后随压缩零件注册表一起做。
 
@@ -66,7 +66,7 @@
 
 **G1 · runtime 并发调度 `[M2 不再阻塞]`** —— 2026-09-11 定稿：v1 一 Session 同时只跑一轮，并发新输入由会话互斥串行（排队在 `Input` 上），轮间插话走 `Queue`（仅运行中接受），**schedule/ 子包不建**，M2 不被调度设计阻塞（03 §5）。完整草案（actor 单写者 / 多维准入 / 后台任务 / 限流 / 关机）仍在 [notes/concurrency-draft.md](notes/concurrency-draft.md)，原则方向大概率保留，有真实并发场景再回来定稿。**附一条待并入**（2026-09-14 审查发现；2026-09-28 已收紧）：`Loop.Queue` 现与收敛判定同锁互斥、Run 返回即拒绝（`ErrNoActiveRun`），收敛/打断路径不再产生历史顺序反转；仅剩「错误收场前瞬间入队」的固有竞态（消息不丢、顺序后移），彻底消除仍需 Run 入口把积压并入 InitialInput，与调度设计同批定。
 
-**G2 · ContextWindow 与非线性 Planner 细节 `[M3 前]`** —— 草案 [notes/context-planning-draft.md](notes/context-planning-draft.md)（Unit 分级、打分公式、L0-L3、pull 工具、context.why、评测、thought 块入窗默认策略）。已定共识：窗口是一等可编程状态、选择非线性呈现线性稳定、ContextSource 契约（03 §2）、**v1 每轮组装模型**（压缩记忆+当前感知+新输入 + 间隙压缩，03 §5）。
+**G2 · ContextWindow 与非线性 Planner 细节 `[M3 前]`** —— 草案 [notes/context-planning-draft.md](notes/context-planning-draft.md)（Unit 分级、打分公式、L0-L3、pull 工具、context.why、评测、thought 块入窗默认策略）。已定共识：窗口是一等可编程状态、选择非线性呈现线性稳定、ContextSource 契约（03 §2）、**v1 每轮组装模型**（压缩记忆+当前感知+新输入 + 间隙压缩，03 §5）。**2026-10-01**：线性 v1 的记忆读写接线已定稿（03 §5 零件位③、04 §4 默认源 = Hindsight 适配器、[discussions/2026-10-01-memory-design.md](discussions/2026-10-01-memory-design.md)）——pull（`memory_recall`）先行，push Collect 按评测节奏放开；非线性 Planner、浮现提名进打分竞争（2026-08-27 §12 层2）仍按本条草稿重论。
 
 **G3 · hook 挂点两问 `[M2 实现期]`** —— ① 挂点 2/4（LLM 响应变换、工具结果变换）用装饰器表达还是升格 core 一等槽（倾向先装饰器，B→C 升级不破坏契约）；② tool hook 具体场景盘点：是否有挂点全景表（03 §3）之外的需求。runtime 生命周期事件词汇补全在此项——注意「不分会话」（03 §5）下无 session created/resumed/closed 生命周期，词汇应改为话题级（topic ended、window compacted）与任务级（task started/failed）。
 

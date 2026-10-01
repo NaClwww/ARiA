@@ -96,7 +96,7 @@ Session.Input ─▶ 组装层 window ─▶ core 飞轮 ─▶ 事件流 ─▶
 ```
 
 已实现：pkg + core（M1）、runtime 主线三包 + artifact/toolkit（M2）、JSONL 落盘、终端薄壳 `cmd/aria-demo`、配置分层 `internal/config`。
-未实现：`cmd/aria-web` 面板、压缩零件注册表与热切换、ASR 插头、认主（插件层协商）、打断/小轮（03 §7）。
+未实现：`cmd/aria-web` 面板、压缩零件注册表与热切换、ASR 插头、认主（插件层协商）、打断/小轮（03 §7）、长期记忆源（设计定稿 2026-10-01，见 [discussions/2026-10-01-memory-design.md](discussions/2026-10-01-memory-design.md)）。
 
 **runtime 并发（2026-09-11 定稿）**：v1 一 Session 同时只跑一轮，并发新输入由会话互斥串行、轮间插话走 `Queue`（仅运行中接受，2026-09-28）——**不建 schedule/ 子包，M2 不被调度设计阻塞**。notes/concurrency-draft.md 的完整草案（actor 单写者 / 多维准入 / 后台任务 / 限流）仍是草稿，原则方向大概率保留，有真实并发场景再回来定稿（05 G1）。
 

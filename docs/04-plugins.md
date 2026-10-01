@@ -34,7 +34,7 @@ type ToolSource interface {
 }
 ```
 
-- **builtin 源**（M2）：`web_search`、`web_fetch`、`shell`（超时+输出截断）、`fs_read/write`；**memory 源**（M4）：`memory.recall` / `history.load`——pull 路工具，属未定稿草稿（notes/context-planning-draft.md，M4 前定）。`artifact_open` 已由 runtime 提供（03 §5 工具结果截断），不再属于 memory 源。
+- **builtin 源**（M2）：`web_search`、`web_fetch`、`shell`（超时+输出截断）、`fs_read/write`；**memory 源**（M3）：`memory_recall`（+ 将来 `history_load`）——pull 路工具，与源的 Collect 共用同一检索入口。**命名从草稿的 `memory.recall` 改平（2026-10-01）**：core `validToolName` 只认 ASCII 字母/数字/`_`/`-`、禁点号（部分网关严格校验），`artifact_open` 是同款先例；设计定稿见 [discussions/2026-10-01-memory-design.md](discussions/2026-10-01-memory-design.md)。`artifact_open` 已由 runtime 提供（03 §5 工具结果截断），不再属于 memory 源。
 - Registry：接受多个 ToolSource，工具名命名空间化防冲突，支持运行中 refresh（invalidation 后重 list）；
 - 工具实现义务：尊重 ctx 取消（长任务返回部分结果）；结果走 content blocks（可带 image 等）；错误返回 `ToolResult{IsError:true}`（是内容不是故障）；经 ToolGuard 审批后执行（core 保证）。
 - **超长结果由 runtime 统一处理**：Agent 装配时对工具套上 `toolkit.Truncate`（03 §5），全文进 artifact、只把预览+引用喂回模型——插件只需如实返回结果，不必自己截断（`shell` 之类的内部截断仍可保留，属工具自身语义）。
@@ -51,8 +51,8 @@ type ContextSource interface {
 }
 ```
 
-- **调用方是 runtime**（03 §5）：Collect 在每轮组装链上同步驱动；Observe 在轮次落盘后异步驱动（幂等；重试/死信细节随并发调度草稿，有需要再定）；
-- **默认实现 = SQLite 记忆源**（modernc.org/sqlite，纯 Go）：semantic store + FTS5 检索（namespace 进 WHERE 硬隔离；三期 sqlite-vec 向量 + 混合召回 + rerank，只换内部检索，契约不变）；蒸馏是**源内部管线**（构造注入 Provider，episode → 候选事实 → 去重/supersede → 内部写入），策略走配置——换存储实现 ≠ 换蒸馏；
+- **调用方是 runtime**（03 §5）：Collect 在每轮组装链上同步驱动（超时/容量由 runtime 统一包装，失败降级为本轮无检索）；Observe 在**该轮 durable 事件落盘成功后**异步驱动（2026-10-01 定稿：收到 agent_end ≠ 已落盘，须落盘确认再提炼——Recorder 写成功钩子驱动，幂等锚点 = RunID；机制见 [discussions/2026-10-01-memory-design.md](discussions/2026-10-01-memory-design.md) §4）；
+- **默认实现 = Hindsight 适配器**（`plugins/memory/hindsight`，2026-10-01 拍板）：接入自托管 [vectorize-io/hindsight](https://github.com/vectorize-io/hindsight)（MIT，retain/recall/reflect）——Observe→`retain`、Collect→`recall`、`memory_recall`→`recall`，bank = Namespace 硬隔离；提炼、冲突消解（其内部 consolidation）、四路检索（语义∥BM25∥图∥时间 + RRF + 重排）全部由服务承担。**中文三件套必须显式配置**（默认全不适合中文）：外置 PG + pgroonga（bigram；native tsvector 中文无效）、本地 `BAAI/bge-m3` embedding、`bge-reranker-v2-m3` 重排；LLM provider 原生支持 deepseek/zai 或任意 OpenAI 兼容端点。适配器侧保留 run 幂等台账（retain 不承诺幂等，Pump 为至少一次投递）。选型调研、适配器规格、被否的自建 SQLite 方案存档见 [discussions/2026-10-01-memory-design.md](discussions/2026-10-01-memory-design.md) §11/§6；
 - **RAG 知识库 = 另一个 ContextSource**：corpus 建索引走 Batch 任务写自己的存储，Collect 只读；
 - **L1 会话全量原文不在此契约**：由 runtime 事件溯源落盘（runtime/persist，v1 只写不恢复）；`history.load` 是 M4 pull 工具，直读 L1。
 
@@ -76,7 +76,7 @@ Setup: ctxx(Scope/Trace/Budget) → Providers(openai…) → ToolSources(builtin
 |---|---|---|
 | `golang.org/x/sync`（semaphore, errgroup） | 准入信号量、fan-out | runtime |
 | `golang.org/x/time/rate` | RPM/TPM 限流 | runtime |
-| `modernc.org/sqlite` | 存储（无 CGO） | plugins/memory |
+| `github.com/vectorize-io/hindsight/hindsight-clients/go` | 记忆引擎客户端（自托管 Hindsight 服务，OpenAPI 生成） | plugins/memory |
 | `modelcontextprotocol/go-sdk` | MCP 客户端 | plugins/tool/mcp |
 | 各 provider 官方 Go SDK（按需）或自写 HTTP | 适配 | plugins/provider |
 
