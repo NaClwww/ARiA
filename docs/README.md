@@ -62,7 +62,7 @@ pkg ──── agent-loop（agent-core）──── context-build（runtime�
 | pkg | [01-pkg.md](01-pkg.md) | ctx 传播基础件 + 规范消息模型 | 零依赖 |
 | agent-core | [02-agent-core.md](02-agent-core.md) | agent loop 飞轮、事件总线、steering、core 接口 | 只依赖 pkg |
 | context-build（runtime） | [03-context-build.md](03-context-build.md) | 插件中介、窗口组装（每轮压缩+感知叠加）、运行时结构（Agent/Session）、ingress 成轮、小轮垫话、扩展机制；投机暂缓（03 §4）、非线性规划在 notes/ 草稿 | 依赖 core+pkg；只经契约消费插件 |
-| plugins | [04-plugins.md](04-plugins.md) | provider 适配器、工具源、MCP 桥、记忆实现、依赖清单 | 实现 core/runtime 契约，不反向依赖 |
+| plugins | [04-plugins.md](04-plugins.md) | provider 适配器、工具源、MCP 桥、依赖清单 | 实现 core/runtime 契约，不反向依赖 |
 | 宿主薄壳 | [06-host-shell.md](06-host-shell.md) | 薄壳三职责、输入插头契约、配置分层与操作面板（aria-web） | 消费 runtime/core 公开 API，不反向依赖 |
 | 未决 | [05-open-questions.md](05-open-questions.md) | 尚未讨论完的问题清单（收敛中） | —— |
 
@@ -96,7 +96,7 @@ Session.Input ─▶ 组装层 window ─▶ core 飞轮 ─▶ 事件流 ─▶
 ```
 
 已实现：pkg + core（M1）、runtime 主线三包 + artifact/toolkit（M2）、JSONL 落盘、终端薄壳 `cmd/aria-demo`、配置分层 `internal/config`。
-未实现：`cmd/aria-web` 面板、压缩零件注册表与热切换、ASR 插头、认主（插件层协商）、打断/小轮（03 §7）、长期记忆源（设计定稿 2026-10-01，见 [discussions/2026-10-01-memory-design.md](discussions/2026-10-01-memory-design.md)）。
+未实现：`cmd/aria-web` 面板、压缩零件注册表与热切换、ASR 插头、认主（插件层协商）、打断/小轮（03 §7）。
 
 **runtime 并发（2026-09-11 定稿）**：v1 一 Session 同时只跑一轮，并发新输入由会话互斥串行、轮间插话走 `Queue`（仅运行中接受，2026-09-28）——**不建 schedule/ 子包，M2 不被调度设计阻塞**。notes/concurrency-draft.md 的完整草案（actor 单写者 / 多维准入 / 后台任务 / 限流）仍是草稿，原则方向大概率保留，有真实并发场景再回来定稿（05 G1）。
 
