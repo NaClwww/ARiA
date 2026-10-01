@@ -102,19 +102,13 @@ func FollowGate(gate GateState, mute MuteSink, unmuteHold time.Duration) (cancel
 		wake: make(chan struct{}, 1),
 		done: make(chan struct{}),
 	}
-	un := gate.Observe(func(active bool) {
-		b.mu.Lock()
-		b.active = active
-		b.mu.Unlock()
-		select { // 唤醒可塌缩成一次：状态每轮重读，不丢语义
+	// 回调只发唤醒信号；run 每次以 gate.Active() 判定闭耳/开耳，通知乱序不影响结果。
+	un := gate.Observe(func() {
+		select {
 		case b.wake <- struct{}{}:
 		default:
 		}
 	})
-	// 对齐订阅前的现值：注册后发生的迁移已走回调，这里覆盖为最新的闸门真值。
-	b.mu.Lock()
-	b.active = gate.Active()
-	b.mu.Unlock()
 	go b.run()
 	var once sync.Once
 	return func() {
@@ -133,17 +127,11 @@ type muteBridge struct {
 	hold time.Duration
 	wake chan struct{}
 	done chan struct{}
-
-	mu     sync.Mutex
-	active bool
 }
 
 func (b *muteBridge) run() {
 	for {
-		b.mu.Lock()
-		active := b.active
-		b.mu.Unlock()
-		if active {
+		if b.gate.Active() {
 			b.mute.Set(true)
 		} else {
 			t := time.NewTimer(b.hold)

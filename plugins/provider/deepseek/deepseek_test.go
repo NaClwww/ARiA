@@ -176,18 +176,17 @@ func TestDeepseekThinkingToolLoopEndToEnd(t *testing.T) {
 	}
 }
 
-// 连续 toolcall 的回放形态：第二轮请求里 assistant 带 tool_calls、**不带**
-// reasoning_content（思维链只产出不回传），工具结果以 role=tool 应答。
-func TestDeepseekReplayStripsReasoning(t *testing.T) {
+// 连续 toolcall 的回放形态：第二轮请求里 assistant 带 tool_calls 与上一轮的
+// reasoning_content（请求带 tools 时官方要求完整回传，缺失返回 400），
+// 工具结果以 role=tool 应答；user 消息不带 reasoning_content。
+func TestDeepseekReplayCarriesReasoning(t *testing.T) {
 	_, _, srv := runThinkingToolLoop(t)
 	raw := srv.body(1)
-	if strings.Contains(string(raw), "reasoning_content") {
-		t.Fatalf("回传请求不应包含 reasoning_content: %s", raw)
-	}
 	var req struct {
 		Messages []struct {
-			Role      string `json:"role"`
-			ToolCalls []struct {
+			Role             string `json:"role"`
+			ReasoningContent string `json:"reasoning_content"`
+			ToolCalls        []struct {
 				ID       string `json:"id"`
 				Function struct {
 					Name      string `json:"name"`
@@ -209,9 +208,29 @@ func TestDeepseekReplayStripsReasoning(t *testing.T) {
 		a.ToolCalls[0].Function.Arguments != `{"city":"北京"}` {
 		t.Fatalf("assistant 回放: %+v", a)
 	}
+	if a.ReasoningContent != "用户问天气。需要调用工具。" {
+		t.Fatalf("assistant 回放须带上一轮 reasoning_content，得到 %q", a.ReasoningContent)
+	}
+	if u := req.Messages[0]; u.Role != "user" || u.ReasoningContent != "" {
+		t.Fatalf("user 消息不应带 reasoning_content: %+v", u)
+	}
 	tr := req.Messages[2]
 	if tr.Role != "tool" || tr.ToolCallID != "call_x" {
 		t.Fatalf("tool 结果应答: %+v", tr)
+	}
+}
+
+// 不带 tools 的请求不发送 reasoning_content（服务端忽略该字段，例如压缩摘要请求）。
+func TestDeepseekOmitsReasoningWithoutTools(t *testing.T) {
+	assistant := message.Message{Role: message.RoleAssistant, Blocks: []message.Block{
+		message.ThoughtBlock{Text: "思考过程"}, message.TextBlock{Text: "回答"}}}
+	body, _, err := streamOnce(t, Config{APIKey: "k"}, provider.Request{
+		Messages: []message.Message{message.NewUser("问"), assistant, message.NewUser("再问")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "reasoning_content") {
+		t.Fatalf("不带 tools 的请求不应包含 reasoning_content: %s", body)
 	}
 }
 
@@ -651,7 +670,7 @@ func TestDeepseekUnexpectedEOF(t *testing.T) {
 
 // 设置 DEEPSEEK_API_KEY（必填）、DEEPSEEK_MODEL（可选，默认 deepseek-flash）
 // 后运行：  DEEPSEEK_API_KEY=sk-xx go test -run TestLive -v
-// 验证点：思考流（reasoning_content）+ 工具调用 + 连续轮次的思维链不回传。
+// 验证点：思考流（reasoning_content）+ 工具调用 + 连续轮次回传 reasoning_content 后服务端不返回 400。
 func TestLiveDeepseek(t *testing.T) {
 	key := os.Getenv("DEEPSEEK_API_KEY")
 	if key == "" {

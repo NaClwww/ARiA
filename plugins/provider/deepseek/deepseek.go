@@ -19,9 +19,10 @@
 //   - 流式 usage 挂在末块（finish_reason 非 null 那块），不单独成块；
 //   - finish_reason 自家值：content_filter（内容被过滤）/
 //     insufficient_system_resource（资源不足）/ aborted（服务端中止）；
-//   - 连续 toolcall：思考模式每轮响应都先出 reasoning_content 再出
-//     content/tool_calls，喂回工具结果后下一轮重新思考——reasoning 只产出
-//     不回传（toWire 剥除 ThoughtBlock），多轮由 core 飞轮驱动。
+//   - 连续 toolcall：思考模式每轮响应先输出 reasoning_content 再输出
+//     content/tool_calls。请求带 tools 时，后续全部请求须完整回传历史
+//     assistant 消息的 reasoning_content（含此前用户问题的轮次），缺失时
+//     服务端返回 400；toWire 把 assistant 的 ThoughtBlock 写入 reasoning_content。
 //
 // 关键义务（02 §5，与 openai 适配器同）：ctx 取消时必须以
 // MessageComplete{Interrupted:true} 收尾返回已收内容；残缺 tool calls 丢弃。
@@ -361,8 +362,9 @@ func (a *Adapter) buildRequest(req provider.Request, uid string) ([]byte, error)
 	}
 
 	msgs := make([]wireMessage, 0, len(req.Messages))
+	withReasoning := len(req.Tools) > 0
 	for _, m := range req.Messages {
-		w, err := toWire(m)
+		w, err := toWire(m, withReasoning)
 		if err != nil {
 			return nil, err
 		}
@@ -445,14 +447,17 @@ func imageURL(b message.ImageBlock) (string, error) {
 	return "", errors.New("deepseek: ImageBlock 既无 URL 也无 Data")
 }
 
-// toWire 转换单条消息。ThoughtBlock 剥除——DeepSeek 语义：reasoning_content
-// 只产出、不回放（回传会被拒收或无视；官方对「思维链作为输入」只开了 Beta
-// 前缀续写，常规多轮一律剥除）。连续 toolcall 的回放形态：assistant 带
-// tool_calls（不带 reasoning），工具结果以 role=tool + tool_call_id 应答。
-func toWire(m message.Message) (wireMessage, error) {
+// toWire 转换单条消息。withReasoning（请求带 tools）为 true 时，assistant 的 ThoughtBlock
+// 写入 reasoning_content：官方要求此类请求完整回传，缺失返回 400；不带 tools 时服务端
+// 忽略该字段，不发送。system/user 消息中的 ThoughtBlock 剥除。工具结果以 role=tool +
+// tool_call_id 应答。
+func toWire(m message.Message, withReasoning bool) (wireMessage, error) {
 	switch m.Role {
 	case message.RoleAssistant:
 		w := wireMessage{Role: "assistant", Content: m.Text()}
+		if withReasoning {
+			w.ReasoningContent = m.Thought()
+		}
 		for _, tc := range m.ToolCalls {
 			args := string(tc.Args)
 			if args == "" {
@@ -550,7 +555,8 @@ type wireMessage struct {
 	Content    any            `json:"content,omitempty"`
 	ToolCalls  []wireToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string         `json:"tool_call_id,omitempty"`
-	// 刻意没有 reasoning_content：思维链不回传（见 toWire）。
+	// ReasoningContent 只用于 assistant 消息，取值见 toWire。
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 type wirePart struct {

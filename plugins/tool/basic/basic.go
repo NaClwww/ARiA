@@ -301,6 +301,12 @@ func randomTool() textTool {
 			if in.Min > in.Max {
 				return "", fmt.Errorf("random: min(%d) 大于 max(%d)", in.Min, in.Max)
 			}
+			// 区间宽度按 uint64 计算（Min≤Max 时补码相减即宽度），Max-Min+1 在 int 下可溢出为 0 或负数，
+			// 使 rand.Intn panic；宽度达到 MaxInt64 时 Int63n 的参数无法表示，返回错误结果。
+			span := uint64(in.Max) - uint64(in.Min)
+			if span >= math.MaxInt64 {
+				return "", fmt.Errorf("random: 区间过大（max-min 须小于 %d）", int64(math.MaxInt64))
+			}
 			if in.Count <= 0 {
 				in.Count = 1
 			}
@@ -309,7 +315,7 @@ func randomTool() textTool {
 			}
 			parts := make([]string, in.Count)
 			for i := range parts {
-				parts[i] = fmt.Sprint(in.Min + rand.Intn(in.Max-in.Min+1))
+				parts[i] = fmt.Sprint(int64(in.Min) + rand.Int63n(int64(span)+1))
 			}
 			return strings.Join(parts, "、"), nil
 		},

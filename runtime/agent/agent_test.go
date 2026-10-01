@@ -441,6 +441,22 @@ func TestInputScopeUserIDOverridesButSessionIsAnchored(t *testing.T) {
 	}
 }
 
+// 宿主 ctx 只带 UserID、不带 SessionID（aria-host Sink 与 aria-demo 的用法）：
+// 说话人覆盖照常生效，SessionID 仍由会话锚定。
+func TestInputScopeUserIDOverrideWithoutSessionID(t *testing.T) {
+	sp := &scopeProbeProvider{inner: provider.NewFake(provider.FakeStep{Text: []string{"ok"}})}
+	s, _ := newTestSession(t, Config{Provider: sp, Compressor: window.KeepLast(100)})
+
+	host := ctxx.WithScope(context.Background(), ctxx.Scope{UserID: "speaker-c"})
+	if _, err := s.Input(host, message.NewUser("hi")); err != nil {
+		t.Fatal(err)
+	}
+	got := sp.lastScope()
+	if got.UserID != "speaker-c" || got.SessionID != "s1" {
+		t.Fatalf("want UserID=speaker-c SessionID=s1, got %+v", got)
+	}
+}
+
 // 落盘失败必须能被宿主看见（而不是静默吞掉），且失败消费者要摘除订阅。
 func TestPersistFailureSurfacesViaErr(t *testing.T) {
 	s, _ := newTestSession(t, Config{

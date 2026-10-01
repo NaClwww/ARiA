@@ -47,6 +47,7 @@ default_user = "user"
 [compress]
 strategy = "provider"           # provider（调 LLM 压成摘要）| keeplast（不调 LLM，只留最近 N 条）
 keep_last_n = 0                 # strategy = "keeplast" 时的条数；0 = 引擎默认
+keep_recent_turns = 2           # 保留原文的近轮数 K（两种策略通用）：近轮达到 2K 轮时压缩较早的轮次；0 = 每轮全部压缩
 # 将来会有第三个策略 twopart（软摘要 + 硬台账），届时这里加个名字即可
 # model = ""                    # provider 策略的模型覆盖；空 = 跟随 provider.model
 # instruction = ""              # provider 策略的提示词覆盖；空 = 默认提示词

@@ -205,7 +205,7 @@ func (l *Loop) Run(parent context.Context, input []message.Message) (RunResult, 
 		if end, err := l.preFlight(parent); end != "" {
 			return l.finish(end, turns, total, err)
 		}
-		l.drainQueue() // 错误路径滞留的入队消息在此排空（Queue 已拒空闲入队）
+		l.drainQueue() // 上一轮收敛判定时到达的积压消息在此注入
 		// 轮间 Interrupt 且无新输入：直接收敛为 EndInterrupted。
 		// sealQuiet 与 Queue 的入队同锁互斥：收敛判定即封口，不存在
 		// 「已判空、未返回」间被入队挤入的缝隙。
@@ -234,9 +234,6 @@ func (l *Loop) Run(parent context.Context, input []message.Message) (RunResult, 
 			l.execCalls(runCtx, msg.ToolCalls)
 		}
 		injected := l.drainQueue()
-		if injected > 0 {
-			l.stopRequested = false // steering 送达：插话优先于模型收尾，回答后可再停
-		}
 		l.emit(KindTurnEnd, TurnEndData{Turn: l.turn, Usage: usage})
 
 		// 恢复点先查 parent（02 §6）：Interrupt（转向）≠ parent 取消（关机）
@@ -498,7 +495,7 @@ func (l *Loop) execTool(ctx context.Context, tc message.ToolCall) message.ToolRe
 		defer cancel()
 	}
 
-	res := t.Exec(tctx, tc.Clone()).Clone()
+	res := safeExec(tctx, t, tc)
 	if res.CallID == "" {
 		res.CallID = tc.ID
 	}
@@ -517,7 +514,7 @@ func (l *Loop) execTool(ctx context.Context, tc message.ToolCall) message.ToolRe
 }
 
 // drainQueue 把队列输入注入为 user 消息，返回注入条数。
-// 注入即「转向已交付」：interrupt 标记随之清除，下一轮正常回答新输入。
+// 注入即「转向已交付」：interrupt 与 stopRequested 随之清除，下一轮正常回答新输入。
 func (l *Loop) drainQueue() int {
 	n := 0
 	for {
@@ -526,6 +523,7 @@ func (l *Loop) drainQueue() int {
 			l.mu.Unlock()
 			if n > 0 {
 				l.interrupt.Store(false)
+				l.stopRequested = false // 插话优先于模型收尾：回答插话后模型可再次调用 Stopper
 			}
 			return n
 		}
@@ -594,7 +592,14 @@ func (l *Loop) partialAssistant(msgID string, text, thought *strings.Builder) me
 	return m
 }
 
+// finish 是 Run 的唯一出口。错误、取消、轮次上限与预算上限出口不经 sealQuiet，
+// 在此统一封口：已被 Queue 接受的消息注入 transcript 并发出 UserMessageInjected，
+// 先于 AgentEnd 进入结算，下一次 Run 不再接收残留消息。
 func (l *Loop) finish(end EndReason, turns int, total message.Usage, err error) (RunResult, error) {
+	l.mu.Lock()
+	l.sealed = true
+	l.mu.Unlock()
+	l.drainQueue()
 	res := RunResult{RunID: l.runID, EndReason: end, Turns: turns, Usage: total}
 	l.emit(KindAgentEnd, AgentEndData{Result: res, Err: err})
 	if err != nil {
@@ -633,6 +638,17 @@ func (l *Loop) waitRetry(ctx context.Context, attempt int) bool {
 			}
 		}
 	}
+}
+
+// safeExec 执行工具并捕获 panic：panic 转为 IsError 结果返回模型，宿主进程继续运行。
+func safeExec(ctx context.Context, t tool.Tool, tc message.ToolCall) (res message.ToolResult) {
+	defer func() {
+		if r := recover(); r != nil {
+			res = message.ToolResult{CallID: tc.ID, IsError: true,
+				Blocks: []message.Block{message.TextBlock{Text: fmt.Sprintf("[tool panic] %v", r)}}}
+		}
+	}()
+	return t.Exec(ctx, tc.Clone()).Clone()
 }
 
 func aborted(callID string) message.ToolResult {

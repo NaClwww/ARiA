@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 
 	"aria/core/loop"
@@ -44,8 +45,9 @@ type Window struct {
 	memory      []message.Message // 已压缩的记忆
 	inflight    []message.Message // 正被压缩的消息：仍参与组装，压完才被替换
 	recent      []message.Message // 尚未压缩的近轮（此前输入与产出）
+	recentTurns []int             // recent 中各轮的消息条数，按结算顺序；按轮切分压缩范围用
+	keepTurns   int               // 保留原文的近轮数 K，见 SetKeepRecentTurns
 	compressing bool
-	pending     bool
 	pendingCtx  context.Context // 触发待压缩批次的 Settle 的 ctx：下一轮压缩换用它的身份
 	onCompress  func(loop.WindowCompressedData)
 	closed      bool
@@ -80,6 +82,25 @@ func (w *Window) SetOnCompress(fn func(loop.WindowCompressedData)) {
 	w.mu.Lock()
 	w.onCompress = fn
 	w.mu.Unlock()
+}
+
+// SetKeepRecentTurns 设置保留原文的近轮数 K（负数按 0 处理；运行期调用时自下一次 Settle 起按新值判定）：
+//   - K = 0：每轮结算后把全部近轮交给压缩；
+//   - K > 0：近轮累计达到 2K 轮时触发压缩，只压缩较早的轮次，最近 K 轮保持原文。
+//
+// 压缩以轮为单位切分，一轮内的工具调用与结果不会被拆开。
+func (w *Window) SetKeepRecentTurns(k int) {
+	if k < 0 {
+		k = 0
+	}
+	w.mu.Lock()
+	w.keepTurns = k
+	w.mu.Unlock()
+}
+
+// dueLocked 报告近轮是否达到压缩触发条件（调用方持有 w.mu）：近轮数不少于 max(1, 2K)。
+func (w *Window) dueLocked() bool {
+	return len(w.recentTurns) >= max(1, 2*w.keepTurns)
 }
 
 // SetCompressor 热替换压缩策略（03 §5 组装层的零件位；配置点菜 / 网页面板）。
@@ -132,15 +153,19 @@ func (w *Window) Settle(ctx context.Context, turn []message.Message) {
 		return
 	}
 	w.recent = append(w.recent, cloneAll(turn)...)
+	w.recentTurns = append(w.recentTurns, len(turn))
 	if w.compressing {
 		// 压缩在途：只标脏。当前这轮压完后会用最新内容再压一次，
 		// 期间多次 Settle 被合并（避免并发压缩互相覆盖）。记下触发本批的
 		// ctx——下一轮压缩的身份（Scope/凭据/参数）属于这批内容的主人，
 		// 不能沿用上一轮的（2026-09-28 审查：B 的内容曾以 A 的 UserID 压缩）。
-		w.pending = true
 		if w.pendingCtx == nil && ctx != nil {
 			w.pendingCtx = ctx
 		}
+		w.mu.Unlock()
+		return
+	}
+	if !w.dueLocked() { // 近轮未达到 2K 轮：继续以原文参与组装
 		w.mu.Unlock()
 		return
 	}
@@ -173,8 +198,16 @@ func (w *Window) compress(ctx context.Context) {
 			cctx, cancel := context.WithCancel(ctxx.Detached(ctx))
 			ctx, w.cancel = cctx, cancel
 		}
-		mem, turn := cloneAll(w.memory), cloneAll(w.recent)
-		w.recent, w.pending = nil, false
+		// 只取较早的轮次：保留最近 keepTurns 轮原文。触发时 dueLocked 保证 cutTurns ≥ 1；
+		// SetKeepRecentTurns 在触发与快照之间调大 K 时按 0 截取。
+		cutTurns := max(len(w.recentTurns)-w.keepTurns, 0)
+		cut := 0
+		for _, n := range w.recentTurns[:cutTurns] {
+			cut += n
+		}
+		mem, turn := cloneAll(w.memory), cloneAll(w.recent[:cut])
+		w.recent = slices.Clone(w.recent[cut:]) // recent 只由窗口持有：浅拷贝即可释放旧底层数组
+		w.recentTurns = slices.Clone(w.recentTurns[cutTurns:])
 		w.inflight = turn
 		comp := w.compressor // 持锁取出：SetCompressor 可能并发替换字段
 		onCompress := w.onCompress
@@ -210,8 +243,11 @@ func (w *Window) compress(ctx context.Context) {
 			w.memory = cloneAll(out) // 不持有 Compressor 的切片
 		}
 		w.inflight = nil
-		done := !w.pending || w.closed
+		// 切分后近轮恰为 K 轮：只有压缩期间的新结算能使近轮再次达到触发条件，此时继续压缩；
+		// 否则结束，待压缩批次的 ctx 一并清除，下一次由触发压缩的 Settle 提供 ctx。
+		done := w.closed || !w.dueLocked()
 		if done {
+			w.pendingCtx = nil
 			w.compressing = false
 			w.cancel = nil
 			if w.compDone != nil {

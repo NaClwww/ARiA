@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -149,9 +150,8 @@ func TestQueueRejectedWhenIdle(t *testing.T) {
 	}
 }
 
-// 错误收场前挤进队列的消息（入队成功后本轮失败）由下一次 Run 在起点排空：
-// 新输入在前、滞留消息在后。这是 06 §2 记录的既知残留顺序，作为安全网
-// 保留；Queue API 本身不再主动产生这种状态。
+// 白盒构造的残留队列由下一次 Run 在起点注入：新输入在前、残留消息在后。
+// 各出口已在 finish 统一封口并注入，正常路径不产生残留；本用例只验证起点注入逻辑。
 func TestStrandedQueueDrainedAtNextRunStart(t *testing.T) {
 	fake := provider.NewFake(provider.FakeStep{Text: []string{"好的。"}})
 	l, _ := New(Config{Provider: fake})
@@ -170,6 +170,85 @@ func TestStrandedQueueDrainedAtNextRunStart(t *testing.T) {
 		message.NewAssistant("好的。"),
 	}
 	assertSameMessages(t, want, rebuild(events))
+}
+
+// 本轮内已被 Queue 接受的消息在错误出口由 finish 注入：UserMessageInjected 先于
+// AgentEnd 发出，Run 返回后 Queue 拒收，下一次 Run 的 transcript 不再含该消息。
+func TestQueuedMessageInjectedOnErrorExit(t *testing.T) {
+	var l *Loop
+	var calls atomic.Int32
+	probe := probeFunc(func(ctx context.Context, req provider.Request) (<-chan provider.StreamEvent, error) {
+		ch := make(chan provider.StreamEvent, 1)
+		if calls.Add(1) == 1 {
+			if err := l.Queue(message.NewUser("等一下")); err != nil {
+				t.Errorf("运行中 Queue 应被接受：%v", err)
+			}
+			ch <- provider.ErrorEvent{Err: errors.New("bad request")}
+		} else {
+			ch <- provider.MessageComplete{Message: message.NewAssistant("好的。")}
+		}
+		close(ch)
+		return ch, nil
+	})
+	l, _ = New(Config{Provider: probe})
+	ch, cancel := l.Subscribe(1024)
+
+	res, err := l.Run(testCtx(), []message.Message{message.NewUser("开场")})
+	assertEnd(t, res, err, EndError)
+	if err := l.Queue(message.NewUser("迟到")); err == nil {
+		t.Fatal("Run 返回后 Queue 应被拒绝")
+	}
+	res, err = l.Run(testCtx(), []message.Message{message.NewUser("第二轮")})
+	assertEnd(t, res, err, EndDone)
+
+	events := drain(ch, cancel)
+	var order []Kind
+	for _, ev := range events {
+		if ev.Kind == KindUserMessageInjected || ev.Kind == KindAgentEnd {
+			order = append(order, ev.Kind)
+		}
+	}
+	if wantOrder := []Kind{KindUserMessageInjected, KindAgentEnd, KindAgentEnd}; !slices.Equal(order, wantOrder) {
+		t.Fatalf("事件顺序：want %v got %v", wantOrder, order)
+	}
+	assertSameMessages(t, []message.Message{
+		message.NewUser("开场"),
+		message.NewUser("等一下"),
+		message.NewUser("第二轮"),
+		message.NewAssistant("好的。"),
+	}, rebuild(events))
+}
+
+// 工具 panic 转为 IsError 结果返回模型，Run 照常续轮收敛。
+func TestToolPanicBecomesErrorResult(t *testing.T) {
+	fake := provider.NewFake(
+		provider.FakeStep{Calls: []message.ToolCall{{ID: "c1", Name: "boom"}}},
+		provider.FakeStep{Text: []string{"工具出错了。"}},
+	)
+	l, err := New(Config{Provider: fake, Tools: []tool.Tool{panicTool{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, cancel := l.Subscribe(1024)
+	res, err := l.Run(testCtx(), []message.Message{message.NewUser("试试")})
+	assertEnd(t, res, err, EndDone)
+	// transcript：[user, assistant(tool_calls), tool 结果, assistant]
+	got := rebuild(drain(ch, cancel))
+	if len(got) != 4 {
+		t.Fatalf("transcript: %+v", got)
+	}
+	if tr := got[2]; tr.Role != message.RoleTool || tr.ToolCallID != "c1" || !tr.IsError ||
+		!strings.Contains(tr.Text(), "boom") {
+		t.Fatalf("panic 应转为 IsError 结果：%+v", tr)
+	}
+}
+
+// panicTool 的 Exec 恒定 panic。
+type panicTool struct{}
+
+func (panicTool) Def() tool.Def { return tool.Def{Name: "boom"} }
+func (panicTool) Exec(context.Context, tool.Call) tool.Result {
+	panic("boom")
 }
 
 // 轮间注入：首轮无工具调用但队列有输入 → 续轮回答。

@@ -74,6 +74,21 @@ func TestRandomBounded(t *testing.T) {
 	if _, isErr := runTool(t, tl, `{"min":9,"max":3}`); !isErr {
 		t.Error("min>max 应报错")
 	}
+	// 区间宽度达到 int64 上限：返回错误结果，不得 panic。
+	if _, isErr := runTool(t, tl, `{"min":0,"max":9223372036854775807}`); !isErr {
+		t.Error("max-min 达到 MaxInt64 应报错")
+	}
+	if _, isErr := runTool(t, tl, `{"min":-9223372036854775808,"max":9223372036854775807}`); !isErr {
+		t.Error("全 int64 区间应报错")
+	}
+	// 跨零的大区间（宽度小于 MaxInt64）正常取值。
+	got, isErr := runTool(t, tl, `{"min":-2305843009213693952,"max":2305843009213693952}`)
+	if isErr {
+		t.Fatalf("宽度小于 MaxInt64 的区间不应报错: %s", got)
+	}
+	if n, err := strconv.ParseInt(got, 10, 64); err != nil || n < -2305843009213693952 || n > 2305843009213693952 {
+		t.Fatalf("random 越界: %q", got)
+	}
 }
 
 func TestNow(t *testing.T) {

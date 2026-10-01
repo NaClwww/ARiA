@@ -824,3 +824,86 @@ func TestOnCompressReportsSuccessAndFailure(t *testing.T) {
 		t.Fatalf("失败报告不符: %+v", got)
 	}
 }
+
+// ---------- 保留近轮原文（SetKeepRecentTurns） ----------
+
+func qaTurn(n string) []message.Message {
+	return []message.Message{message.NewUser("问" + n), message.NewAssistant("答" + n)}
+}
+
+// K=2：前 3 轮结算不触发压缩；第 4 轮结算后只压缩较早的 2 轮，最近 2 轮保持原文，
+// 组装顺序为 记忆 → 近轮原文 → 新输入。
+func TestKeepRecentTurnsCompressesOnlyOlderTurns(t *testing.T) {
+	rc := &recordingCompressor{out: []message.Message{message.NewUser("摘要")}}
+	w := New(rc, quiet())
+	w.SetKeepRecentTurns(2)
+	for _, n := range []string{"1", "2", "3"} {
+		w.Settle(context.Background(), qaTurn(n))
+		w.Wait()
+	}
+	if got := rc.seen(); len(got) != 0 {
+		t.Fatalf("近轮未达到 4 轮不应压缩，压缩器收到 %v", got)
+	}
+	w.Settle(context.Background(), qaTurn("4"))
+	w.Wait()
+	wantSeen := []string{"user:问1", "assistant:答1", "user:问2", "assistant:答2"}
+	if got := rc.seen(); !equal(got, wantSeen) {
+		t.Fatalf("应只压缩较早的 2 轮：want %v got %v", wantSeen, got)
+	}
+	got := texts(w.Assemble([]message.Message{message.NewUser("新输入")}))
+	want := []string{"user:摘要", "user:问3", "assistant:答3", "user:问4", "assistant:答4", "user:新输入"}
+	if !equal(got, want) {
+		t.Fatalf("assemble: want %v got %v", want, got)
+	}
+}
+
+// K=1：压缩在途时到达的结算使近轮再次达到 2K 轮，压缩结束后按新的切分继续压缩。
+func TestKeepRecentTurnsPendingBatchDue(t *testing.T) {
+	bc := &blockingCompressor{gate: make(chan struct{}), entered: make(chan struct{}, 1),
+		out: []message.Message{message.NewUser("摘要")}}
+	w := New(bc, quiet())
+	w.SetKeepRecentTurns(1)
+	ctx := context.Background()
+	w.Settle(ctx, qaTurn("1")) // 1 轮：不触发
+	w.Settle(ctx, qaTurn("2")) // 2 轮：压缩第 1 轮
+	<-bc.entered
+	w.Settle(ctx, qaTurn("3")) // 压缩在途：标记待压缩
+	close(bc.gate)
+	w.Wait()
+
+	passes := bc.allSeen()
+	if len(passes) != 2 || !equal(passes[0], []string{"user:问1", "assistant:答1"}) ||
+		!equal(passes[1], []string{"user:问2", "assistant:答2"}) {
+		t.Fatalf("压缩批次不符：%v", passes)
+	}
+	got := texts(w.Assemble(nil))
+	want := []string{"user:摘要", "user:问3", "assistant:答3"}
+	if !equal(got, want) {
+		t.Fatalf("assemble: want %v got %v", want, got)
+	}
+}
+
+// K=2：压缩在途时到达的结算未使近轮达到 2K 轮，压缩结束后不再继续，近轮保持原文。
+func TestKeepRecentTurnsPendingBatchNotDue(t *testing.T) {
+	bc := &blockingCompressor{gate: make(chan struct{}), entered: make(chan struct{}, 1),
+		out: []message.Message{message.NewUser("摘要")}}
+	w := New(bc, quiet())
+	w.SetKeepRecentTurns(2)
+	ctx := context.Background()
+	for _, n := range []string{"1", "2", "3", "4"} {
+		w.Settle(ctx, qaTurn(n))
+	}
+	<-bc.entered
+	w.Settle(ctx, qaTurn("5")) // 压缩在途：近轮为 3、4、5 共 3 轮，未达到 4 轮
+	close(bc.gate)
+	w.Wait()
+
+	if passes := bc.allSeen(); len(passes) != 1 {
+		t.Fatalf("应只压缩一次：%v", passes)
+	}
+	got := texts(w.Assemble(nil))
+	want := []string{"user:摘要", "user:问3", "assistant:答3", "user:问4", "assistant:答4", "user:问5", "assistant:答5"}
+	if !equal(got, want) {
+		t.Fatalf("assemble: want %v got %v", want, got)
+	}
+}

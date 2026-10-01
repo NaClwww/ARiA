@@ -1,11 +1,21 @@
 // Package jsonl 是 persist.Store 的 JSON Lines 文件实现（demo 级，docs/03 §1）：
 // 每行一个事件 envelope，data 按 Kind 定形。写路完整；读路/重放随恢复需求再做
 // （v1 只写不恢复）——格式带版本号字段，届时写迁移而非一次性格式。
+//
+// 格式版本 2：agent_start 的 initial_input 按内容去重。每个元素是以下两种之一：
+//   - 完整消息，带 "hash" 字段（消息 JSON 的 SHA-256 前 16 字节，hex）；
+//   - {"ref":"<hash>"}，指向本文件中位于其前方、hash 相同的最近一条完整消息。
+//
+// 比较基准是同一会话上一条 agent_start 的 initial_input（同一行内的重复同样写 ref）。
+// 组装上下文是滑动窗口（system + 记忆 + 近轮 + 新输入），重复内容只出现在相邻两次组装之间；
+// Store 实例新建（进程重启、重新打开文件）后各会话的首条 agent_start 写全文。
 package jsonl
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -19,7 +29,8 @@ import (
 )
 
 // FormatVersion 是行格式的版本号（F2：第一天带上，免得日后写一次性迁移）。
-const FormatVersion = 1
+// 版本 2 起 agent_start 的 initial_input 元素可为 {"ref":hash}，见包注释。
+const FormatVersion = 2
 
 // Store 把事件按行追加进单个文件；多会话共用一个文件，session 字段区分。
 // 并发安全：Append 可能来自不同会话的 Recorder。
@@ -27,6 +38,9 @@ type Store struct {
 	mu   sync.Mutex
 	f    *os.File
 	path string
+	// prev 按会话记录上一条 agent_start 的 initial_input hash 集合，写入成功后整体替换；
+	// 占用为每会话一个上下文的消息数。
+	prev map[string]map[[16]byte]struct{}
 }
 
 // New 打开（或创建）path 的追加句柄；父目录自动创建。
@@ -40,7 +54,7 @@ func New(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("jsonl: open: %w", err)
 	}
-	return &Store{f: f, path: path}, nil
+	return &Store{f: f, path: path, prev: map[string]map[[16]byte]struct{}{}}, nil
 }
 
 // Path 返回落盘文件路径。
@@ -48,11 +62,76 @@ func (s *Store) Path() string { return s.path }
 
 // Append 写一个事件。一次 Write 一整行——行完整性靠单次写调用保证
 // （同文件多写者由锁串行化；OS 级 append 原子性对 4KB 内行足够）。
+// 编码在锁外完成；agent_start 的去重判定需读取会话基准，见 appendAgentStart。
 func (s *Store) Append(_ context.Context, sessionID string, ev loop.Event) error {
+	if d, ok := agentStartOf(ev); ok {
+		return s.appendAgentStart(sessionID, ev, d)
+	}
 	data, err := marshalData(ev)
 	if err != nil {
 		return fmt.Errorf("jsonl: encode %s: %w", ev.Kind, err)
 	}
+	line, err := envelopeLine(sessionID, ev, data)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.writeLocked(line)
+}
+
+// appendAgentStart 写 agent_start：各条 initial_input 消息在锁外定形并计算 hash；锁内与该会话
+// 上一条 agent_start 的 hash 集合及本行靠前元素比较，已出现的写 ref，其余写全文；
+// 写入成功后以本行的 hash 集合替换该会话的比较基准。
+func (s *Store) appendAgentStart(sessionID string, ev loop.Event, d loop.AgentStartData) error {
+	msgs, err := hashMessages(d.InitialInput)
+	if err != nil {
+		return fmt.Errorf("jsonl: encode %s: %w", ev.Kind, err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prev := s.prev[sessionID]
+	cur := make(map[[16]byte]struct{}, len(msgs))
+	var inputs []json.RawMessage
+	for _, m := range msgs {
+		_, inPrev := prev[m.hash]
+		_, inLine := cur[m.hash]
+		if inPrev || inLine {
+			inputs = append(inputs, m.ref())
+		} else {
+			inputs = append(inputs, m.full())
+		}
+		cur[m.hash] = struct{}{}
+	}
+	data, err := marshal(struct {
+		Scope        wireScope         `json:"scope"`
+		InitialInput []json.RawMessage `json:"initial_input,omitempty"`
+	}{wireScopeOf(d.Scope), inputs})
+	if err != nil {
+		return fmt.Errorf("jsonl: encode %s: %w", ev.Kind, err)
+	}
+	line, err := envelopeLine(sessionID, ev, data)
+	if err != nil {
+		return err
+	}
+	if err := s.writeLocked(line); err != nil {
+		return err
+	}
+	s.prev[sessionID] = cur
+	return nil
+}
+
+// writeLocked 以单次 Write 写入一整行（调用方持有 s.mu）。
+func (s *Store) writeLocked(line []byte) error {
+	if _, err := s.f.Write(line); err != nil {
+		return fmt.Errorf("jsonl: write: %w", err)
+	}
+	return nil
+}
+
+// envelopeLine 编码一行 envelope（含行尾换行符）。
+func envelopeLine(sessionID string, ev loop.Event, data json.RawMessage) ([]byte, error) {
 	line, err := json.Marshal(envelope{
 		V:       FormatVersion,
 		Session: sessionID,
@@ -63,14 +142,56 @@ func (s *Store) Append(_ context.Context, sessionID string, ev loop.Event) error
 		Data:    data,
 	})
 	if err != nil {
-		return fmt.Errorf("jsonl: encode envelope: %w", err)
+		return nil, fmt.Errorf("jsonl: encode envelope: %w", err)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, err := s.f.Write(append(line, '\n')); err != nil {
-		return fmt.Errorf("jsonl: write: %w", err)
+	return append(line, '\n'), nil
+}
+
+// agentStartOf 取出 agent_start 载荷（值与指针形态，nil 指针按非 agent_start 处理）。
+func agentStartOf(ev loop.Event) (loop.AgentStartData, bool) {
+	switch d := ev.Data.(type) {
+	case loop.AgentStartData:
+		return d, true
+	case *loop.AgentStartData:
+		if d != nil {
+			return *d, true
+		}
 	}
-	return nil
+	return loop.AgentStartData{}, false
+}
+
+// hashedMessage 是定形后的 initial_input 消息：body 为消息 JSON，hash 为其 SHA-256 前 16 字节。
+type hashedMessage struct {
+	body []byte
+	hash [16]byte
+}
+
+// hashMessages 逐条定形 initial_input 并计算 hash。
+func hashMessages(ms []message.Message) ([]hashedMessage, error) {
+	out := make([]hashedMessage, 0, len(ms))
+	for _, m := range ms {
+		w, err := messageOf(m)
+		if err != nil {
+			return nil, err
+		}
+		body, err := json.Marshal(w)
+		if err != nil {
+			return nil, err
+		}
+		sum := sha256.Sum256(body)
+		out = append(out, hashedMessage{body: body, hash: [16]byte(sum[:16])})
+	}
+	return out, nil
+}
+
+// full 返回带 hash 字段的全文：在 body 的左花括号之后插入 "hash" 字段（body 恒含 role 字段，非空对象）。
+func (m hashedMessage) full() json.RawMessage {
+	return json.RawMessage(`{"hash":"` + hex.EncodeToString(m.hash[:]) + `",` + string(m.body[1:]))
+}
+
+// ref 返回指向同 hash 完整消息的引用元素。
+func (m hashedMessage) ref() json.RawMessage {
+	return json.RawMessage(`{"ref":"` + hex.EncodeToString(m.hash[:]) + `"}`)
 }
 
 // Close 关闭文件句柄。
@@ -130,19 +251,9 @@ type wireRunResult struct {
 }
 
 // marshalData 按 Kind 把 Data 载荷定形；未知 Kind 写 null（不静默丢事件）。
+// agent_start 由 appendAgentStart 处理（去重规则见包注释）。
 func marshalData(ev loop.Event) (json.RawMessage, error) {
 	switch d := ev.Data.(type) {
-	case loop.AgentStartData:
-		inputs, err := messagesOf(d.InitialInput)
-		if err != nil {
-			return nil, err
-		}
-		return marshal(struct {
-			Scope        wireScope     `json:"scope"`
-			InitialInput []wireMessage `json:"initial_input,omitempty"`
-		}{wireScopeOf(d.Scope), inputs})
-	case *loop.AgentStartData:
-		return marshalData(loop.Event{Kind: ev.Kind, Data: *d})
 	case loop.UserMessageInjectedData:
 		w, err := messageOf(d.Message)
 		if err != nil {
@@ -254,21 +365,6 @@ func messageOf(m message.Message) (wireMessage, error) {
 		w.Blocks = append(w.Blocks, raw)
 	}
 	return w, nil
-}
-
-func messagesOf(ms []message.Message) ([]wireMessage, error) {
-	if len(ms) == 0 {
-		return nil, nil
-	}
-	out := make([]wireMessage, len(ms))
-	for i, m := range ms {
-		w, err := messageOf(m)
-		if err != nil {
-			return nil, err
-		}
-		out[i] = w
-	}
-	return out, nil
 }
 
 func toolResultOf(r message.ToolResult) (wireToolResult, error) {

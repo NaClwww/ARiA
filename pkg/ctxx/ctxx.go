@@ -33,8 +33,15 @@ func WithScope(ctx context.Context, s Scope) context.Context {
 
 // ScopeFrom 返回 false 即 Scope 缺失，调用方必须拒绝执行（R4 fail-closed）。
 func ScopeFrom(ctx context.Context) (Scope, bool) {
-	s, ok := ctx.Value(scopeKey{}).(Scope)
+	s, ok := ScopeOverrideFrom(ctx)
 	return s, ok && s.Valid()
+}
+
+// ScopeOverrideFrom 返回 ctx 中存放的 Scope 值，不做 Valid 判定（SessionID 可为空）。
+// 只用于读取覆盖字段（单次 Input 的 UserID/AgentID）；执行前的 fail-closed 判定仍用 ScopeFrom。
+func ScopeOverrideFrom(ctx context.Context) (Scope, bool) {
+	s, ok := ctx.Value(scopeKey{}).(Scope)
+	return s, ok
 }
 
 // ---------- Trace ----------

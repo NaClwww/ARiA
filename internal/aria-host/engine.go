@@ -163,15 +163,16 @@ func NewEngine(opts Options) (*Engine, error) {
 	}
 
 	ag, err := agent.New(agent.Config{
-		Provider:     prov,
-		Tools:        tools,
-		Compressor:   compressor,
-		Assembler:    vision,
-		Store:        store,
-		SystemPrompt: systemPrompt,
-		MaxTurns:     cfg.Limits.MaxTurns,
-		ToolTimeout:  time.Duration(cfg.Limits.ToolTimeoutMS) * time.Millisecond,
-		Logger:       log,
+		Provider:        prov,
+		Tools:           tools,
+		Compressor:      compressor,
+		KeepRecentTurns: cfg.Compress.KeepRecentTurns,
+		Assembler:       vision,
+		Store:           store,
+		SystemPrompt:    systemPrompt,
+		MaxTurns:        cfg.Limits.MaxTurns,
+		ToolTimeout:     time.Duration(cfg.Limits.ToolTimeoutMS) * time.Millisecond,
+		Logger:          log,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("agent 装配失败: %w", err)

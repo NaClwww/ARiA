@@ -87,6 +87,9 @@ type holdSink struct {
 	ended    bool // end() 先于 release 到达：建好 inner 后补投
 	buf      bytes.Buffer
 	inner    audioSink
+	// pending 是已 begin、正在补写缓冲的真 sink：补写期间 inner 保持 nil，write 继续写入 buf、
+	// end 只记入 ended，缓冲清空后在锁内切换为 inner，保证写入顺序与 end 位置；stop 同时作用于 pending。
+	pending audioSink
 
 	readyCh   chan struct{} // inner 建好且缓冲灌完，或已死：waitDrain 的等待点
 	readyOnce sync.Once
@@ -165,6 +168,9 @@ func (h *holdSink) stop() {
 	}
 	h.stopped = true
 	inner := h.inner
+	if inner == nil {
+		inner = h.pending
+	}
 	h.buf = bytes.Buffer{}
 	h.mu.Unlock()
 	if inner != nil {
@@ -183,33 +189,48 @@ func (h *holdSink) startInner() {
 		return
 	}
 	h.startOnce.Do(func() {
+		defer h.markReady()
 		inner := f()
 		if err := inner.begin(); err != nil {
 			h.mu.Lock()
 			h.stopped = true
 			h.mu.Unlock()
-			h.markReady()
 			return
 		}
 		h.mu.Lock()
 		if h.stopped { // stop 与 begin 并发：丢弃刚建好的
 			h.mu.Unlock()
 			inner.stop()
-			h.markReady()
 			return
 		}
-		h.inner = inner
-		buf := h.buf.Bytes()
-		h.buf = bytes.Buffer{}
-		ended := h.ended
+		h.pending = inner
 		h.mu.Unlock()
-		if len(buf) > 0 {
-			_ = inner.write(buf)
+		// 补写循环：每次在锁内取出缓冲的全部字节、锁外写入；补写期间新到的 PCM 追加到 buf 尾部，
+		// 由下一次循环按序写出。缓冲为空时在同一临界区内切换 inner，此后 write/end 直通。
+		for {
+			h.mu.Lock()
+			if h.stopped { // stop 已经对 pending 执行 stop，此处不重复执行
+				h.pending = nil
+				h.mu.Unlock()
+				return
+			}
+			if h.buf.Len() == 0 {
+				h.pending, h.inner = nil, inner
+				ended := h.ended
+				h.mu.Unlock()
+				if ended {
+					_ = inner.end()
+				}
+				return
+			}
+			chunk := h.buf.Bytes() // 取走底层数组的所有权，buf 换为新实例，不复制
+			h.buf = bytes.Buffer{}
+			h.mu.Unlock()
+			if err := inner.write(chunk); err != nil {
+				h.stop() // 写入失败：本段止播；stop 经 pending 停止 inner 并释放其播放份额
+				return
+			}
 		}
-		if ended {
-			_ = inner.end()
-		}
-		h.markReady()
 	})
 }
 

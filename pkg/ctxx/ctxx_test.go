@@ -87,6 +87,16 @@ func TestScopeFailClosed(t *testing.T) {
 	}
 }
 
+func TestScopeOverrideReadsInvalidScope(t *testing.T) {
+	if _, ok := ScopeOverrideFrom(context.Background()); ok {
+		t.Fatal("empty ctx must not yield override scope")
+	}
+	s, ok := ScopeOverrideFrom(WithScope(context.Background(), Scope{UserID: "u"}))
+	if !ok || s.UserID != "u" || s.SessionID != "" {
+		t.Fatalf("override scope without SessionID: ok=%v scope=%+v", ok, s)
+	}
+}
+
 func TestDerivationKeepsValues(t *testing.T) {
 	ctx := WithScope(testRoot(), Scope{SessionID: "s"})
 	child, cancel := context.WithCancel(ctx)

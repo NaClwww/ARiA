@@ -34,8 +34,9 @@
 //	aria-host --fake                     # stdin + ASR + TTS（echo 冒烟）
 //	aria-host                            # 按 aria.toml 连真实模型
 //
-// 交互：[名字] 开头切换说话人；/quit 优雅退出；Ctrl+C 打断当前回答，
-// 连按两次强制退出。stdin EOF 在 ASR 模式下不退出（常驻语音形态）。
+// 交互：[名字] 开头切换说话人；/quit 按收尾链退出；Ctrl+C 打断当前回答，2 秒内
+// 再按一次按收尾链退出，收尾期间再按一次强制退出；SIGTERM 按收尾链退出。
+// stdin EOF 在 ASR 模式下不退出（常驻语音形态）。
 package main
 
 import (
@@ -46,6 +47,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"aria/core/loop"
@@ -246,21 +248,36 @@ func main() {
 		os.Exit(2)
 	}
 
-	// Ctrl+C：第一次打断当前回答（steering），第二次强制退出。信号处理
-	// 不进 app（要拿 sess.Interrupt），强退兜底也在这里。
+	// 退出请求：/quit、stdin EOF 与信号共用，幂等。
+	quitCtx, requestQuit := context.WithCancel(context.Background())
+
+	// 信号处理不进 app（要调用 sess.Interrupt）：
+	//   - Ctrl+C 首次：打断当前回答（steering）；
+	//   - 距上一次打断 forceQuitWindow 内再按 Ctrl+C，或收到 SIGTERM：requestQuit，按收尾链退出；
+	//   - 收尾期间再收到信号：os.Exit(130) 强制退出。
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	go func() {
-		<-sig
-		fmt.Fprintln(os.Stderr, "\n（打断当前回答；再按一次强制退出）")
-		sess.Interrupt()
-		<-sig
-		os.Exit(130)
+		var lastInterrupt time.Time
+		quitting := false
+		for s := range sig {
+			switch {
+			case quitting:
+				os.Exit(130)
+			case s != os.Interrupt || time.Since(lastInterrupt) < forceQuitWindow:
+				quitting = true
+				fmt.Fprintln(os.Stderr, "\n（正在退出；再按一次 Ctrl+C 强制退出）")
+				requestQuit()
+			default:
+				lastInterrupt = time.Now()
+				fmt.Fprintf(os.Stderr, "\n（打断当前回答；%v 内再按一次退出）\n", forceQuitWindow)
+				sess.Interrupt()
+			}
+		}
 	}()
 
 	// ---- 输入插头最后挂：所有消费者就位后才放输入进来 ----
 	var plugs []string
-	quit := make(chan struct{})
 	if !h.NoASR {
 		var onPartial func()
 		if light != nil {
@@ -310,10 +327,9 @@ func main() {
 		}
 	}
 	if !h.NoStdin {
-		// stdin EOF 是否收工取决于有没有 ASR 插头：语音形态要常驻；quit 由
-		// /quit/EOF 触发，Service 收尾等它自然返回即可。
-		app.Service("stdin", func(context.Context) {
-			ariahost.StdinPlug(os.Stdin, input.Deliver, cfg.Session.DefaultUser, h.NoASR, quit)
+		// stdin EOF 是否退出取决于有没有 ASR 插头：语音形态要常驻。
+		app.Service("stdin", func(ctx context.Context) {
+			ariahost.StdinPlug(ctx, os.Stdin, input.Deliver, cfg.Session.DefaultUser, h.NoASR, requestQuit)
 		})
 		plugs = append(plugs, "stdin")
 	}
@@ -331,8 +347,11 @@ func main() {
 
 	// 阻塞到 /quit/EOF，然后逆序收尾：输入插头先停 → 消费者排干 → 灯/耳
 	// 资产回收 → 会话结算 → record 收口。
-	app.Run(quit)
+	app.Run(quitCtx.Done())
 }
+
+// forceQuitWindow 是两次 Ctrl+C 判定为退出请求的最大间隔；超出则按新的一次打断处理。
+const forceQuitWindow = 2 * time.Second
 
 // hostKnob 收编一个 [host] 装配项的「flag 声明 + 显式才写回」：构造时已把
 // flag 注册进默认 FlagSet，Parse 之后 applyExplicit 只对命令行真正出现的

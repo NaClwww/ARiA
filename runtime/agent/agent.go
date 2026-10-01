@@ -47,6 +47,10 @@ type Config struct {
 	// 显式接 window.ProviderCompressor 之类的摘要实现。
 	Compressor window.Compressor
 
+	// KeepRecentTurns 是窗口保留原文的近轮数 K（window.SetKeepRecentTurns）：近轮累计
+	// 达到 2K 轮时只压缩较早的轮次；0 = 每轮结算后全部压缩。
+	KeepRecentTurns int
+
 	// Store 是可选的会话历史落盘（v1 只写不恢复）；nil → 不落盘。
 	// 实现必须尊重 ctx 取消，否则关停时尾部事件可能写不完（见 CloseGrace）。
 	Store persist.Store
@@ -194,6 +198,7 @@ func (a *Agent) NewSession(scope ctxx.Scope) (*Session, error) {
 	base, cancel := context.WithCancel(ctxx.WithScope(base, scope))
 	win := window.New(a.compressor, a.log)
 	win.SetSystem(a.cfg.SystemPrompt)
+	win.SetKeepRecentTurns(a.cfg.KeepRecentTurns)
 	s := &Session{
 		loop:   l,
 		win:    win,
@@ -368,6 +373,10 @@ func (s *Session) History() (memory, recent []message.Message) { return s.win.Sn
 // 不丢在途结果。
 func (s *Session) SetCompressor(c window.Compressor) { s.win.SetCompressor(c) }
 
+// SetKeepRecentTurns 热替换保留原文的近轮数 K（window.SetKeepRecentTurns），与 SetCompressor
+// 同属压缩策略，配置重载时两者一并更新。
+func (s *Session) SetKeepRecentTurns(k int) { s.win.SetKeepRecentTurns(k) }
+
 // WaitCompress 等待在途压缩结束（测试与关停观察用）。
 func (s *Session) WaitCompress() { s.win.Wait() }
 
@@ -466,13 +475,14 @@ func (s *Session) runContext(host context.Context) (context.Context, context.Can
 
 func mergeScope(session ctxx.Scope, ctx context.Context) ctxx.Scope {
 	out := session
-	if host, ok := ctxx.ScopeFrom(ctx); ok {
-		if host.UserID != "" {
-			out.UserID = host.UserID
-		}
-		if host.AgentID != "" {
-			out.AgentID = host.AgentID
-		}
+	// 宿主 ctx 的 Scope 可只带 UserID（无 SessionID，Valid 为 false），按原始值读取覆盖字段；
+	// ctx 中无 Scope 时得到零值，以下判定均不生效。
+	host, _ := ctxx.ScopeOverrideFrom(ctx)
+	if host.UserID != "" {
+		out.UserID = host.UserID
+	}
+	if host.AgentID != "" {
+		out.AgentID = host.AgentID
 	}
 	return out
 }

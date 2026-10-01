@@ -153,14 +153,15 @@ func main() {
 	}
 
 	ag, err := agent.New(agent.Config{
-		Provider:     prov,
-		Tools:        tools,
-		Compressor:   compressor,
-		Store:        store,
-		SystemPrompt: systemPrompt,
-		MaxTurns:     cfg.Limits.MaxTurns,
-		ToolTimeout:  time.Duration(cfg.Limits.ToolTimeoutMS) * time.Millisecond,
-		Logger:       log,
+		Provider:        prov,
+		Tools:           tools,
+		Compressor:      compressor,
+		KeepRecentTurns: cfg.Compress.KeepRecentTurns,
+		Store:           store,
+		SystemPrompt:    systemPrompt,
+		MaxTurns:        cfg.Limits.MaxTurns,
+		ToolTimeout:     time.Duration(cfg.Limits.ToolTimeoutMS) * time.Millisecond,
+		Logger:          log,
 	})
 	if err != nil {
 		log.Error("agent new failed", "err", err)
@@ -185,15 +186,20 @@ func main() {
 		*configPath, modelName(*fake, cfg.Provider.Model), cfg.Session.ID, cfg.Session.DefaultUser)
 	fmt.Fprintln(os.Stderr, "输入一句话回车发送；[名字] 开头切换说话人；Ctrl+C 打断；/quit 退出。")
 
-	// Ctrl+C：第一次打断当前回答（steering），第二次强制退出。
+	// Ctrl+C：打断当前回答（steering）；距上一次打断 2 秒内再按一次强制退出，
+	// 超出 2 秒按新的一次打断处理。
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt)
 	go func() {
-		<-sig
-		fmt.Fprintln(os.Stderr, "\n（打断当前回答；再按一次强制退出）")
-		sess.Interrupt()
-		<-sig
-		os.Exit(130)
+		var lastInterrupt time.Time
+		for range sig {
+			if time.Since(lastInterrupt) < 2*time.Second {
+				os.Exit(130)
+			}
+			lastInterrupt = time.Now()
+			fmt.Fprintln(os.Stderr, "\n（打断当前回答；2 秒内再按一次强制退出）")
+			sess.Interrupt()
+		}
 	}()
 
 	lines := make(chan string)
@@ -248,7 +254,9 @@ func run(sess *agent.Session, lines <-chan string, mgr *config.Manager, prov pro
 				continue
 			}
 			sess.SetCompressor(c)
-			fmt.Fprintf(errw, "（已重读配置；模型 %s，压缩策略 %s）\n", cfg.Provider.Model, cfg.Compress.Strategy)
+			sess.SetKeepRecentTurns(cfg.Compress.KeepRecentTurns)
+			fmt.Fprintf(errw, "（已重读配置；模型 %s，压缩策略 %s，保留近轮 %d）\n",
+				cfg.Provider.Model, cfg.Compress.Strategy, cfg.Compress.KeepRecentTurns)
 			continue
 		}
 		defUser := orDefault(cfg.Session.DefaultUser, "user")

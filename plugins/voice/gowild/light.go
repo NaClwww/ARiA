@@ -40,6 +40,13 @@ func (s lightState) String() string {
 // 否则断流会让灯挂在绿色上。
 const partialWindow = 1500 * time.Millisecond
 
+// lightRetryBackoff 与 lightRetryMax 是下发失败后重新求值的退避间隔：首次失败 5 s，
+// 连续失败每次翻倍，上限 60 s；下发成功后归零。
+const (
+	lightRetryBackoff = 5 * time.Second
+	lightRetryMax     = 60 * time.Second
+)
+
 // LightConfig 是状态灯的装配参数。
 type LightConfig struct {
 	// Base 是 launcher 根地址（POST <Base>/api/light 的 color 模式只驱
@@ -76,10 +83,12 @@ type Light struct {
 	mu        sync.Mutex
 	heartbeat time.Time
 	decay     *time.Timer
+	retry     *time.Timer // 下发失败后的重新求值定时器：单实例，替换时停止旧定时器，SettleIdle 时停止
 
 	applied        lightState // 已成功下发的态；构造为 -1：首拍强制下发
 	failWant       lightState // 上次失败的目标态（退避期内同目标不重试）
 	retryNotBefore time.Time
+	retryBackoff   time.Duration // 当前退避间隔，仅灯循环 goroutine 读写
 }
 
 func NewLight(cfg LightConfig, gate GateState, log *slog.Logger) (*Light, error) {
@@ -109,7 +118,7 @@ func NewLight(cfg LightConfig, gate GateState, log *slog.Logger) (*Light, error)
 		done:    make(chan struct{}),
 		applied: lightState(-1),
 	}
-	gate.Observe(func(bool) { l.signal() })
+	gate.Observe(l.signal)
 	go l.loop()
 	l.signal() // 初始求值：把灯收到已知的待机态（设备可能停在任意旧状态）
 	return l, nil
@@ -145,6 +154,7 @@ func (l *Light) SettleIdle() {
 	}
 	l.mu.Unlock()
 	<-l.done
+	l.setRetry(nil) // 灯循环已退出，此后不再安排重试
 	if err := l.apply(lightIdle); err != nil {
 		l.log.Warn("light: 退出置待机失败", "err", err)
 	}
@@ -163,7 +173,7 @@ func (l *Light) loop() {
 }
 
 // evaluate 求值一次：thinking > listening > idle。只在目标态与已下发态
-// 不同才下发；失败退避 5s（同目标态），设备不可达时不刷错误日志。
+// 不同才下发；失败后同一目标态在退避期内不重发，退避期满由 retry 定时器重新求值。
 func (l *Light) evaluate() {
 	l.mu.Lock()
 	hb := l.heartbeat
@@ -182,13 +192,28 @@ func (l *Light) evaluate() {
 		return
 	}
 	if err := l.apply(want); err != nil {
-		l.log.Warn("light: 下发失败", "state", want, "err", err)
-		l.failWant, l.retryNotBefore = want, time.Now().Add(5*time.Second)
+		l.retryBackoff = min(max(2*l.retryBackoff, lightRetryBackoff), lightRetryMax)
+		l.log.Warn("light: 下发失败", "state", want, "err", err, "retry_in", l.retryBackoff)
+		l.failWant, l.retryNotBefore = want, time.Now().Add(l.retryBackoff)
+		// 定时器在 retryNotBefore 确定之后启动：触发时退避期已满，重新求值不会被退避判定拦下。
+		l.setRetry(time.AfterFunc(l.retryBackoff, l.signal))
 		return
 	}
+	l.setRetry(nil)
+	l.retryBackoff = 0
 	l.applied = want
 	l.failWant, l.retryNotBefore = lightIdle, time.Time{}
 	l.log.Info("light: "+want.String(), "rgb", l.colors[want])
+}
+
+// setRetry 替换重试定时器并停止旧定时器（l.mu 保护：SettleIdle 在灯循环之外调用）。
+func (l *Light) setRetry(t *time.Timer) {
+	l.mu.Lock()
+	if l.retry != nil {
+		l.retry.Stop()
+	}
+	l.retry = t
+	l.mu.Unlock()
 }
 
 // apply 下发一档颜色（同步、2s 超时；灯循环单线程调用）。color 模式的

@@ -113,17 +113,18 @@ func TestParseLightColors(t *testing.T) {
 func TestGateTransitionsNotify(t *testing.T) {
 	g := NewGate()
 	var mu sync.Mutex
-	var events []bool
-	cancel := g.Observe(func(a bool) {
+	var events []bool // 每次回调时读取的 Active()
+	cancel := g.Observe(func() {
 		mu.Lock()
-		events = append(events, a)
+		events = append(events, g.Active())
 		mu.Unlock()
 	})
 
-	g.Acquire() // 0→1：true
+	g.Acquire() // 0→1：通知
 	g.Acquire() // 1→2：不通知
 	g.Release() // 2→1：不通知
-	g.Release() // 1→0：false
+	g.Release() // 1→0：通知
+	g.Release() // 计数已为 0：不通知
 	cancel()
 	g.Acquire() // 已退订：即便 0→1 也不通知
 	g.Release()

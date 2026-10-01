@@ -233,3 +233,66 @@ func TestStoreWindowCompressedShape(t *testing.T) {
 		}
 	}
 }
+
+// initial_input 按内容去重：同一 Store 实例内重复出现的消息（含同一行内的重复）写为
+// {"ref":hash}，首次出现的消息写全文并带 hash；重新打开文件后去重状态清空。
+func TestStoreInitialInputDedupe(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.jsonl")
+	sys := message.NewSystem("人设")
+	start := func(st *Store, msgs ...message.Message) {
+		t.Helper()
+		if err := st.Append(context.Background(), "a", loop.Event{Kind: loop.KindAgentStart,
+			Data: loop.AgentStartData{Scope: ctxx.Scope{SessionID: "a"}, InitialInput: msgs}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start(s, sys, message.NewUser("第一句"))
+	start(s, sys, message.NewUser("第一句"), message.NewUser("第二句"))
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start(s2, sys, sys)
+	if err := s2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	type elem struct {
+		Hash   string     `json:"hash"`
+		Ref    string     `json:"ref"`
+		Role   string     `json:"role"`
+		Blocks []rawBlock `json:"blocks"`
+	}
+	var lines [][]elem
+	for _, env := range readEnvelopes(t, path) {
+		var d struct {
+			InitialInput []elem `json:"initial_input"`
+		}
+		if err := json.Unmarshal(env.Data, &d); err != nil {
+			t.Fatal(err)
+		}
+		lines = append(lines, d.InitialInput)
+	}
+	if len(lines) != 3 {
+		t.Fatalf("lines = %d", len(lines))
+	}
+	l0, l1, l2 := lines[0], lines[1], lines[2]
+	if len(l0) != 2 || l0[0].Hash == "" || l0[0].Ref != "" || l0[0].Role != "system" || l0[1].Hash == "" {
+		t.Fatalf("首行应全部写全文：%+v", l0)
+	}
+	if len(l1) != 3 || l1[0].Ref != l0[0].Hash || l1[1].Ref != l0[1].Hash ||
+		l1[2].Hash == "" || len(l1[2].Blocks) != 1 || l1[2].Blocks[0].Text != "第二句" {
+		t.Fatalf("第二行应为两条 ref 加一条全文：%+v", l1)
+	}
+	if len(l2) != 2 || l2[0].Hash != l0[0].Hash || l2[0].Ref != "" || l2[1].Ref != l2[0].Hash {
+		t.Fatalf("重新打开后应重写全文，同一行内的重复写 ref：%+v", l2)
+	}
+}

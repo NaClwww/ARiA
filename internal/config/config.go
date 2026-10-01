@@ -92,10 +92,12 @@ type LLM struct {
 }
 
 type Compress struct {
-	Strategy    string // provider（默认，LLM 摘要）| keeplast（只留最近 N 条）| 将来 twopart
-	KeepLastN   int    // strategy=keeplast 的条数；0 = 实现侧默认（window.DefaultKeepLast）
-	Model       string // strategy=provider 的模型覆盖；空 = 跟随 provider.model
-	Instruction string // strategy=provider 的提示词覆盖；空 = 默认提示词
+	Strategy  string // provider（默认，LLM 摘要）| keeplast（只留最近 N 条）| 将来 twopart
+	KeepLastN int    // strategy=keeplast 的条数；0 = 实现侧默认（window.DefaultKeepLast）
+	// KeepRecentTurns 是保留原文的近轮数 K（两种策略通用）：近轮达到 2K 轮时只压缩较早的轮次；0 = 每轮全部压缩。
+	KeepRecentTurns int
+	Model           string // strategy=provider 的模型覆盖；空 = 跟随 provider.model
+	Instruction     string // strategy=provider 的提示词覆盖；空 = 默认提示词
 }
 
 type Tools struct {
@@ -413,10 +415,11 @@ func configFrom(v *viper.Viper) Config {
 			ReasoningEffort: v.GetString("llm.reasoning_effort"),
 		},
 		Compress: Compress{
-			Strategy:    v.GetString("compress.strategy"),
-			KeepLastN:   v.GetInt("compress.keep_last_n"),
-			Model:       v.GetString("compress.model"),
-			Instruction: v.GetString("compress.instruction"),
+			Strategy:        v.GetString("compress.strategy"),
+			KeepLastN:       v.GetInt("compress.keep_last_n"),
+			KeepRecentTurns: v.GetInt("compress.keep_recent_turns"),
+			Model:           v.GetString("compress.model"),
+			Instruction:     v.GetString("compress.instruction"),
 		},
 		Tools:  Tools{Builtin: v.GetStringSlice("tools.builtin")},
 		Record: Record{Path: v.GetString("record.path")},
@@ -448,9 +451,11 @@ func setDefaults(v *viper.Viper) {
 	// 不用这几个旋钮）。
 	v.SetDefault("compress.strategy", "provider")
 	v.SetDefault("compress.keep_last_n", 0)
+	v.SetDefault("compress.keep_recent_turns", 2) // 最近 2 轮保持原文，近轮达到 4 轮时压缩较早的 2 轮
 	v.SetDefault("compress.model", "")
 	v.SetDefault("compress.instruction", "")
-	v.SetDefault("tools.builtin", []string{"now", "lorem"})
+	// 缺省只含两个宿主共有的工具；lorem 只在 aria-demo 的注册表中存在，由配置显式启用。
+	v.SetDefault("tools.builtin", []string{"now"})
 	v.SetDefault("record.path", "")
 	v.SetDefault("limits.max_turns", 0)
 	v.SetDefault("limits.tool_timeout_ms", 30000) // 30s：core 的 0 语义是「不限时」，配置层给个安全默认

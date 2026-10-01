@@ -1,13 +1,29 @@
 package gowild
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
 
-type inputCapture struct{ count int }
+// inputCapture 不接受注入，每次 Start 计数一次（Start 在投递 goroutine 中执行）。
+type inputCapture struct {
+	mu    sync.Mutex
+	count int
+}
 
-func (s *inputCapture) Deliver(string, string) error { s.count++; return nil }
+func (*inputCapture) Inject(string, string) (bool, error) { return false, nil }
+func (s *inputCapture) Start(string, string) error {
+	s.mu.Lock()
+	s.count++
+	s.mu.Unlock()
+	return nil
+}
+func (s *inputCapture) n() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.count
+}
 
 func TestInputAcceptsDuringLoopButNotPlayback(t *testing.T) {
 	busy, playing := NewGate(), NewGate()
@@ -22,8 +38,9 @@ func TestInputAcceptsDuringLoopButNotPlayback(t *testing.T) {
 	in.Deliver("echo", "user")
 	playing.Release()
 	in.Deliver("after playback, loop still active", "user")
-	if sink.count != 2 || !busy.Active() {
-		t.Fatalf("count=%d busy=%v", sink.count, busy.Active())
+	waitFor(t, "两条放行的输入起轮", func() bool { return sink.n() == 2 })
+	if !busy.Active() {
+		t.Fatal("busy gate released by input delivery")
 	}
 	busy.Release()
 }
