@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"aria/core/loop"
+	"aria/pkg/ctxx"
 )
 
 type fakeStore struct {
@@ -111,5 +112,47 @@ func TestRecorderStopsOnContextCancel(t *testing.T) {
 func TestRecorderRequiresStore(t *testing.T) {
 	if _, err := New(nil, quietLogger()); err == nil {
 		t.Fatal("nil Store must be rejected")
+	}
+}
+
+// sidStore 按「会话标识:事件类型」记录写入的事件。
+type sidStore struct {
+	mu  sync.Mutex
+	got []string
+}
+
+func (s *sidStore) Append(_ context.Context, sessionID string, ev loop.Event) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.got = append(s.got, sessionID+":"+string(ev.Kind))
+	return nil
+}
+
+// 事件记在所属轮次 AgentStart 的 Scope.SessionID 下；首个 AgentStart 之前使用 Consume 的 sessionID。
+func TestRecorderFollowsAgentStartSession(t *testing.T) {
+	st := &sidStore{}
+	r, _ := New(st, quietLogger())
+	start := func(sid string) loop.Event {
+		return loop.Event{Kind: loop.KindAgentStart, Data: loop.AgentStartData{Scope: ctxx.Scope{SessionID: sid}}}
+	}
+	ch := make(chan loop.Event, 8)
+	ch <- ev(loop.KindMessageEnd)
+	ch <- start("s1")
+	ch <- ev(loop.KindMessageEnd)
+	ch <- ev(loop.KindAgentEnd)
+	ch <- start("s2")
+	ch <- ev(loop.KindAgentEnd)
+	close(ch)
+	if err := r.Consume(context.Background(), "s0", ch); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"s0:message_end", "s1:agent_start", "s1:message_end", "s1:agent_end", "s2:agent_start", "s2:agent_end"}
+	if len(st.got) != len(want) {
+		t.Fatalf("want %v got %v", want, st.got)
+	}
+	for i := range want {
+		if st.got[i] != want[i] {
+			t.Fatalf("want %v got %v", want, st.got)
+		}
 	}
 }

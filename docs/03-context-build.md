@@ -96,17 +96,19 @@ Host(语音识别中) → Speculate(base=transcript快照, 猜测输入)
 
 实现：`runtime/speculate/speculate.go`（~180 行，零 core 依赖、仅 Provider + pkg）。
 
-## 5. 运行时结构：Agent / Session / 不分会话（D1–D6，2026-09-11 拍板）
+## 5. 运行时结构：Agent / Session / 会话切换（D1–D6，2026-09-11 拍板；会话切换 2026-10-01 修订）
 
 **Agent** = Setup 装配产物：拢 Provider / Tools / Store / 名册，提供 `NewSession(scope)`。纯零件盒，不持会话状态。
 
 **Session** = 长寿命单例容器：压缩记忆 + ingress 状态（投机槽预留，v1 不接入）；`Input(ctx, msg) (RunResult, error)` 阻塞式，宿主经事件订阅拿增量（TTS 不等整句）。
 
-**不分会话**：一个伴侣实例 = 一个长寿命 Session，无「新开」动作；对话边界由**话题判终**（§6）承担。「隔天继续聊」= 同一会话继续——每轮组装本来就用压缩记忆，睡一夜和聊完一个话题机制相同。多人共享记忆（群聊语义）；未来「私聊模式」作为 Assembler 召回规则实现，不推翻模型。
+**会话切换**（2026-10-01 修订，取代原「不分会话」）：一个伴侣实例 = 一个长寿命 Session 容器，会话由 `Scope.SessionID` 标识。最近一轮结算后 `Config.IdleTimeout`（配置 `session.idle_timeout_s`，缺省 1800 s，0 = 不切换）内没有新输入时切换会话：切换前结算的近轮全部压缩进记忆（`Window.Flush`：不保留最近 K 轮，与上下文用量无关），压缩记忆带入新会话；之后的输入使用新的 `SessionID`（`<session.id>-<开始时刻>`，`agent.SessionIDAt`）。进程启动即开始新会话（v1 只写不恢复）。切换与按用量触发的压缩不并发：在途压缩先完成，`Flush` 要求的轮次随后压缩；切换后结算的轮次不在要求之内，保留原文。计时以 `Input` 开始为「有操作」，每轮结算后重新计时；到期回调与 `Input` 经同一互斥锁串行。多人共享记忆（群聊语义）；未来「私聊模式」作为 Assembler 召回规则实现，不推翻模型。
 
 **并发**：一 Session 同时只跑一轮（并发新输入由会话互斥串行）；轮间插话走 `Queue`，仅运行中接受（2026-09-28）。schedule/ 子包不建，G1 草稿维持。
 
 **persist** v1 只写不恢复：`Append(ctx, sessionID, ev)` 窄接口定义在 runtime/persist，实现放 plugins 经 Setup 注入；「跨天续聊」由压缩摘要持久化支撑，事件重放推到有需求再说。
+
+事件按会话记录：`Recorder` 以所属轮次 AgentStart 的 `Scope.SessionID` 为准；window_compressed 事件记在该批压缩内容所属的会话下（`Window.SetOnCompress` 回调携带该批的 ctx）。
 
 **窗口命令**（注入/置顶/驱逐）v1 不做，M3 随非线性窗口一起。
 
@@ -135,11 +137,11 @@ Host(语音识别中) → Speculate(base=transcript快照, 猜测输入)
 
 | 包 | 职责 | 关键类型 |
 |---|---|---|
-| `runtime/window` | 每轮组装 + 间隙压缩 | `Window.Assemble/Settle`、`Compressor`、`KeepLast`（兜底）、`ProviderCompressor`（LLM 摘要） |
+| `runtime/window` | 每轮组装 + 间隙压缩 | `Window.Assemble/Settle/Flush`、`Compressor`、`KeepLast`（缺省回退）、`ProviderCompressor`（LLM 摘要） |
 | `runtime/persist` | durable 事件 → Store 写路（只写不恢复） | `Store`（窄接口，实现注入）、`Recorder.Consume` |
 | `runtime/artifact` | 大中间产物存放与读回（artifact+ref） | `Store`（窄接口）、`Memory`（默认实现）、`OpenTool`（`artifact_open`） |
 | `runtime/toolkit` | 工具装饰器（挂点 4/5） | `Truncate`（超长结果 → 预览+引用） |
-| `runtime/agent` | 总装：零件盒 + 长寿命 Session | `Agent.New/NewSession`、`Session.Input/Queue/Interrupt/Subscribe/History` |
+| `runtime/agent` | 总装：零件盒 + 长寿命 Session（无操作超时切换会话） | `Agent.New/NewSession`、`Session.Input/Queue/Interrupt/Subscribe/History/SessionID` |
 
 组装结果作为 `Run` 的 input 进 core（每条 Run 的历史 = 组装结果），core 槽 1 的 Assembler 仍留给宿主的额外变换。
 
@@ -177,7 +179,7 @@ Host(语音识别中) → Speculate(base=transcript快照, 猜测输入)
 **主线实现语义（两轮审查后定稿，2026-09-11）**：
 
 - **Input 返回即已结算**：`Session.Input` 只在「本轮 AgentEnd 已投递并完成窗口并入」后才返回（会话关闭或消费链断裂除外）——不存在提前返回留下未结算轮次的路径，否则下一轮会覆盖未结算缓冲、整轮历史永久丢失；
-- **轮次身份**：run ctx 的值（Scope/Credentials/Budget/Options/Trace）来自当次调用，生存期同时挂在会话长活 ctx 上（01 §1.2：会话关闭能终止在途轮）；`Scope.SessionID` 由会话锚定，`UserID` 允许当次覆盖（§6 当次说话人）；
+- **轮次身份**：run ctx 的值（Scope/Credentials/Budget/Options/Trace）来自当次调用，生存期同时挂在会话长活 ctx 上（01 §1.2：会话关闭能终止在途轮）；`Scope.SessionID` 由会话锚定（会话切换后为新标识），`UserID` 允许当次覆盖（§6 当次说话人）；
 - **压缩继承轮次身份**：间隙压缩用触发轮的 ctx 值（Scope/凭据/Trace），但脱离该轮取消；窗口 `Close` 可取消在途压缩（cancel 在 Settle 持锁时注册，避免竞态漏掉）；
 - **压缩失败不丢内容**：失败或空输出一律退回未压缩形态；原始回退有上限（防压缩持续失败时无界增长）；
 - **窗口只读**：宿主拿 `History()` 快照，没有窗口写入口（v1 无窗口命令）；

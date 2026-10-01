@@ -9,6 +9,8 @@
 // 比较基准是同一会话上一条 agent_start 的 initial_input（同一行内的重复同样写 ref）。
 // 组装上下文是滑动窗口（system + 记忆 + 近轮 + 新输入），重复内容只出现在相邻两次组装之间；
 // Store 实例新建（进程重启、重新打开文件）后各会话的首条 agent_start 写全文。
+// 比较基准最多保留 maxBaselines 个会话（会话按无操作超时切换，标识持续新增），超出时移除
+// 最早建立基准的会话，该会话的下一条 agent_start 写全文。
 package jsonl
 
 import (
@@ -41,7 +43,12 @@ type Store struct {
 	// prev 按会话记录上一条 agent_start 的 initial_input hash 集合，写入成功后整体替换；
 	// 占用为每会话一个上下文的消息数。
 	prev map[string]map[[16]byte]struct{}
+	// order 是 prev 中各会话建立基准的先后顺序，长度不超过 maxBaselines。
+	order []string
 }
+
+// maxBaselines 是 prev 保留比较基准的会话数上限。
+const maxBaselines = 16
 
 // New 打开（或创建）path 的追加句柄；父目录自动创建。
 func New(path string) (*Store, error) {
@@ -117,6 +124,13 @@ func (s *Store) appendAgentStart(sessionID string, ev loop.Event, d loop.AgentSt
 	}
 	if err := s.writeLocked(line); err != nil {
 		return err
+	}
+	if _, ok := s.prev[sessionID]; !ok {
+		s.order = append(s.order, sessionID)
+		if len(s.order) > maxBaselines {
+			delete(s.prev, s.order[0])
+			s.order = s.order[1:]
+		}
 	}
 	s.prev[sessionID] = cur
 	return nil

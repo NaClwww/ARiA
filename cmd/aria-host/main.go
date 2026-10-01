@@ -339,7 +339,7 @@ func main() {
 	}
 
 	fmt.Fprintf(os.Stderr, "ARiA host · 插头 %v · backend %s · 模型 %s · 会话 %s · 说话人 %s\n",
-		plugs, h.Backend, eng.ModelName(), cfg.Session.ID, cfg.Session.DefaultUser)
+		plugs, h.Backend, eng.ModelName(), sess.SessionID(), cfg.Session.DefaultUser)
 	if useGateway {
 		fmt.Fprintf(os.Stderr, "asr-gateway %s（backend 仅承担 TTS）\n", h.ASRGateway)
 	}

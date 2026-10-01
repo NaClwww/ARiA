@@ -152,12 +152,15 @@ func main() {
 		os.Exit(2)
 	}
 
+	sessionID, newSessionID := assemble.SessionIDs(cfg.Session, time.Now())
 	ag, err := agent.New(agent.Config{
 		Provider:        prov,
 		Tools:           tools,
 		Compressor:      compressor,
 		KeepRecentTurns: cfg.Compress.KeepRecentTurns,
 		Compact:         assemble.CompactBudget(cfg.Compress),
+		IdleTimeout:     assemble.IdleTimeout(cfg.Session),
+		NewSessionID:    newSessionID,
 		Store:           store,
 		SystemPrompt:    systemPrompt,
 		MaxTurns:        cfg.Limits.MaxTurns,
@@ -168,7 +171,7 @@ func main() {
 		log.Error("agent new failed", "err", err)
 		os.Exit(1)
 	}
-	sess, err := ag.NewSession(ctxx.Scope{SessionID: cfg.Session.ID, UserID: cfg.Session.DefaultUser})
+	sess, err := ag.NewSession(ctxx.Scope{SessionID: sessionID, UserID: cfg.Session.DefaultUser})
 	if err != nil {
 		log.Error("session new failed", "err", err)
 		os.Exit(1)
@@ -184,7 +187,7 @@ func main() {
 	}()
 
 	fmt.Fprintf(os.Stderr, "ARiA demo · 配置 %s · 模型 %s · 会话 %s · 说话人 %s\n",
-		*configPath, modelName(*fake, cfg.Provider.Model), cfg.Session.ID, cfg.Session.DefaultUser)
+		*configPath, modelName(*fake, cfg.Provider.Model), sess.SessionID(), cfg.Session.DefaultUser)
 	fmt.Fprintln(os.Stderr, "输入一句话回车发送；[名字] 开头切换说话人；Ctrl+C 打断；/quit 退出。")
 
 	// Ctrl+C：打断当前回答（steering）；距上一次打断 2 秒内再按一次强制退出，
@@ -257,8 +260,10 @@ func run(sess *agent.Session, lines <-chan string, mgr *config.Manager, prov pro
 			sess.SetCompressor(c)
 			sess.SetKeepRecentTurns(cfg.Compress.KeepRecentTurns)
 			sess.SetCompactBudget(assemble.CompactBudget(cfg.Compress))
-			fmt.Fprintf(errw, "（已重读配置；模型 %s，压缩策略 %s，保留近轮 %d，预留比例 %.2f）\n",
-				cfg.Provider.Model, cfg.Compress.Strategy, cfg.Compress.KeepRecentTurns, cfg.Compress.ReserveRatio)
+			sess.SetIdleTimeout(assemble.IdleTimeout(cfg.Session))
+			fmt.Fprintf(errw, "（已重读配置；模型 %s，压缩策略 %s，保留近轮 %d，预留比例 %.2f，会话切换 %d s）\n",
+				cfg.Provider.Model, cfg.Compress.Strategy, cfg.Compress.KeepRecentTurns, cfg.Compress.ReserveRatio,
+				cfg.Session.IdleTimeoutS)
 			continue
 		}
 		defUser := orDefault(cfg.Session.DefaultUser, "user")
@@ -342,7 +347,8 @@ func printEffective(w io.Writer, configPath, overridePath string, mgr *config.Ma
 		orDefault(eff.Compress.Instruction, "(默认提示词)"))
 	fmt.Fprintf(w, "工具       %v\n", eff.Tools.Builtin)
 	fmt.Fprintf(w, "落盘       %s\n", orDefault(eff.Record.Path, "(关闭)"))
-	fmt.Fprintf(w, "会话/说话人 %s / %s\n", eff.Session.ID, eff.Session.DefaultUser)
+	fmt.Fprintf(w, "会话/说话人 %s / %s（会话切换 idle_timeout_s=%d，0 = 不切换）\n",
+		eff.Session.ID, eff.Session.DefaultUser, eff.Session.IdleTimeoutS)
 	fmt.Fprintf(w, "上限       max_turns=%d tool_timeout_ms=%d\n", eff.Limits.MaxTurns, eff.Limits.ToolTimeoutMS)
 }
 

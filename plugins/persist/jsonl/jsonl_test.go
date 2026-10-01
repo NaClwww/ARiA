@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -294,5 +295,57 @@ func TestStoreInitialInputDedupe(t *testing.T) {
 	}
 	if len(l2) != 2 || l2[0].Hash != l0[0].Hash || l2[0].Ref != "" || l2[1].Ref != l2[0].Hash {
 		t.Fatalf("重新打开后应重写全文，同一行内的重复写 ref：%+v", l2)
+	}
+}
+
+// 比较基准最多保留 maxBaselines 个会话：超出时移除最早建立基准的会话，其下一条 agent_start 写全文；
+// 仍在保留范围内的会话照常写 ref。
+func TestStoreBaselinesCapped(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.jsonl")
+	s, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sys := message.NewSystem("人设")
+	start := func(sid string) {
+		t.Helper()
+		if err := s.Append(context.Background(), sid, loop.Event{Kind: loop.KindAgentStart,
+			Data: loop.AgentStartData{Scope: ctxx.Scope{SessionID: sid}, InitialInput: []message.Message{sys}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i <= maxBaselines; i++ { // maxBaselines + 1 个会话：s0 的基准被移除
+		start(fmt.Sprintf("s%d", i))
+	}
+	start("s0")
+	start(fmt.Sprintf("s%d", maxBaselines))
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.prev) != maxBaselines || len(s.order) != maxBaselines {
+		t.Fatalf("基准应保留 %d 个会话：prev %d order %d", maxBaselines, len(s.prev), len(s.order))
+	}
+
+	type elem struct {
+		Hash string `json:"hash"`
+		Ref  string `json:"ref"`
+	}
+	envs := readEnvelopes(t, path)
+	last := func(i int) elem {
+		t.Helper()
+		var d struct {
+			InitialInput []elem `json:"initial_input"`
+		}
+		if err := json.Unmarshal(envs[i].Data, &d); err != nil || len(d.InitialInput) != 1 {
+			t.Fatalf("第 %d 行解析失败：%v", i, err)
+		}
+		return d.InitialInput[0]
+	}
+	n := len(envs)
+	if e := last(n - 2); e.Hash == "" || e.Ref != "" {
+		t.Fatalf("s0 的基准已移除，应写全文：%+v", e)
+	}
+	if e := last(n - 1); e.Ref == "" {
+		t.Fatalf("s%d 的基准仍保留，应写 ref：%+v", maxBaselines, e)
 	}
 }

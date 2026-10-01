@@ -4,8 +4,9 @@
 // 主线（v1）：Input(msg) → 窗口组装 → core.Run → 等本轮结算 → 返回。
 // 尚未接入：ingress 成轮（随语音，03 §6）、小轮/抢话（03 §7）、投机（05 G0）。
 //
-// 「不分会话」：一个伴侣实例通常只建一个 Session，从启动活到关闭；
-// 对话边界由话题判终承担，不由会话生命周期承担。
+// 会话切换：一个伴侣实例通常只建一个 Session（容器），从启动活到关闭；最近一轮结算后
+// Config.IdleTimeout 内没有新输入时切换到新的会话标识（Scope.SessionID），切换前的近轮
+// 全部压缩进记忆，压缩记忆带入新会话。
 package agent
 
 import (
@@ -53,6 +54,15 @@ type Config struct {
 	// Compact 是按上下文用量触发压缩的预留策略；窗口大小与 token 估算取自 Provider（见 CompactBudget）。
 	Compact CompactBudget
 
+	// IdleTimeout 是会话切换的无操作时长：最近一轮结算后 IdleTimeout 内没有新的 Input 时，
+	// 当前会话结束（近轮全部压缩进记忆，见 window.Flush），之后的输入使用新的 Scope.SessionID。
+	// 0 = 不切换。
+	IdleTimeout time.Duration
+
+	// NewSessionID 生成会话切换后的会话标识，参数为切换时刻；
+	// nil → SessionIDAt(NewSession 传入的 SessionID, 切换时刻)。
+	NewSessionID func(now time.Time) string
+
 	// Store 是可选的会话历史落盘（v1 只写不恢复）；nil → 不落盘。
 	// 实现必须尊重 ctx 取消，否则关停时尾部事件可能写不完（见 CloseGrace）。
 	Store persist.Store
@@ -89,6 +99,12 @@ type Config struct {
 
 // DefaultArtifactEntries 是默认内存 artifact 存储的条数上限（FIFO 淘汰）。
 const DefaultArtifactEntries = 64
+
+// SessionIDAt 返回以 base 为前缀、以 t 为开始时刻的会话标识：
+// <base>-<YYYYMMDD>-<hhmmss.mmm>（t 所在时区）。
+func SessionIDAt(base string, t time.Time) string {
+	return base + "-" + t.Format("20060102-150405.000")
+}
 
 // CompactBudget 的缺省值。
 const (
@@ -228,7 +244,8 @@ func (a *Agent) buildTools() []tool.Tool {
 }
 
 // NewSession 建一个长寿命会话。scope 必填（01 R4 fail-closed）：
-// SessionID 是会话锚点（不可被单次输入改写），UserID 是初始说话人；
+// SessionID 是首个会话的标识（不可被单次输入改写；会话切换后改用 Config.NewSessionID
+// 生成的标识，见 Config.IdleTimeout），UserID 是初始说话人；
 // 单次 Input 的 ctx 可以用自己的 UserID 覆盖它（03 §6：当次 Input 的
 // UserID = 说话人，多人共享一个 Session）。
 func (a *Agent) NewSession(scope ctxx.Scope) (*Session, error) {
@@ -267,17 +284,28 @@ func (a *Agent) NewSession(scope ctxx.Scope) (*Session, error) {
 		store:   a.cfg.Store,
 		prov:    a.cfg.Provider,
 		compact: a.cfg.Compact,
+		idle:    a.cfg.IdleTimeout,
+		newID:   a.cfg.NewSessionID,
+	}
+	if s.newID == nil {
+		base := scope.SessionID
+		s.newID = func(t time.Time) string { return SessionIDAt(base, t) }
 	}
 	// 压缩观测 → durable 事件直写 store（压缩发生在 run 之间，不经飞轮总线；
 	// jsonl 单行锁串行化两路写入）。失败只响亮记日志——压缩本身已落地，
 	// 审计写失败不该连坐会话。
 	if a.cfg.Store != nil {
-		win.SetOnCompress(func(rep loop.WindowCompressedData) {
+		win.SetOnCompress(func(cctx context.Context, rep loop.WindowCompressedData) {
+			// 记在该批内容所属的会话下：会话切换后才完成的压缩仍属切换前的会话。
+			sid := s.SessionID()
+			if sc, ok := ctxx.ScopeFrom(cctx); ok {
+				sid = sc.SessionID
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			ev := loop.Event{Kind: loop.KindWindowCompressed, At: time.Now(), Data: rep}
-			if err := s.store.Append(ctx, scope.SessionID, ev); err != nil {
-				s.log.Error("agent: window_compressed 落盘失败", "session", scope.SessionID, "err", err)
+			if err := s.store.Append(ctx, sid, ev); err != nil {
+				s.log.Error("agent: window_compressed append failed", "session", sid, "err", err)
 			}
 		})
 	}
@@ -311,12 +339,12 @@ func (a *Agent) NewSession(scope ctxx.Scope) (*Session, error) {
 			err := rec.Consume(pctx, scope.SessionID, pch)
 			switch {
 			case err != nil && pctx.Err() == nil:
-				s.log.Error("agent: persist stopped", "session", scope.SessionID, "err", err)
+				s.log.Error("agent: persist stopped", "session", s.SessionID(), "err", err)
 				s.fail(err)
 			case err == nil && !s.isClosed():
 				// 会话没关但流断了：总线判定订阅者停滞并把我们断开，
 				// durable 承诺已破，必须让宿主看见（不能静默）。
-				s.log.Error("agent: persist stream closed unexpectedly", "session", scope.SessionID)
+				s.log.Error("agent: persist stream closed unexpectedly", "session", s.SessionID())
 				s.fail(ErrStreamClosed)
 			}
 		}()
@@ -328,7 +356,7 @@ func (a *Agent) NewSession(scope ctxx.Scope) (*Session, error) {
 type Session struct {
 	loop   *loop.Loop
 	win    *window.Window
-	scope  ctxx.Scope
+	scope  ctxx.Scope // SessionID 在会话切换时改写，读写持 mu（见 currentScope）
 	ctx    context.Context
 	cancel context.CancelFunc
 	closed chan struct{}
@@ -355,8 +383,15 @@ type Session struct {
 	lastUsage message.Usage     // 本轮最后一次 LLM 调用的 usage（结算时判定上下文用量）
 	compact   CompactBudget     // 压缩预留策略，见 SetCompactBudget
 	noWindow  bool              // 已记录过「窗口未知」告警
-	runEnd    chan struct{}     // 本轮已结算的信号
-	err       error             // 首个后台错误
+
+	idle         time.Duration          // 会话切换的无操作时长，见 Config.IdleTimeout
+	newID        func(time.Time) string // 会话切换后的会话标识生成
+	idleTimer    *time.Timer            // 无操作计时：每轮结算时启动，Input 开始时停止
+	idleGen      uint64                 // 计时代号：每次启动或停止递增，到期回调据此判定是否作废
+	lastCtx      context.Context        // 当前会话最近一轮的 run ctx（会话切换的压缩使用其身份）
+	sessionTurns int                    // 当前会话已结算的轮数
+	runEnd       chan struct{}          // 本轮已结算的信号
+	err          error                  // 首个后台错误
 }
 
 // Input 阻塞跑完一轮：组装 → core.Run → 等本轮结算进窗口 → 返回。
@@ -374,6 +409,9 @@ func (s *Session) Input(ctx context.Context, msg message.Message) (loop.RunResul
 	if err := s.checkOpen(); err != nil {
 		return loop.RunResult{}, err
 	}
+	s.mu.Lock()
+	s.stopIdleLocked() // 有新输入：当前会话继续，无操作计时作废
+	s.mu.Unlock()
 
 	runCtx, cancel := s.runContext(ctx)
 	defer cancel()
@@ -446,6 +484,18 @@ func (s *Session) SetCompactBudget(c CompactBudget) {
 	s.mu.Unlock()
 }
 
+// SetIdleTimeout 热替换会话切换的无操作时长（见 Config.IdleTimeout）：当前会话有已结算的轮次时
+// 自调用时刻起按新时长重新计时；d ≤ 0 停止计时，不再切换。
+func (s *Session) SetIdleTimeout(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.idle = d
+	s.armIdleLocked()
+}
+
+// SessionID 返回当前会话标识（会话切换后为新标识）。
+func (s *Session) SessionID() string { return s.currentScope().SessionID }
+
 // WaitCompress 等待在途压缩结束（测试与关停观察用）。
 func (s *Session) WaitCompress() { s.win.Wait() }
 
@@ -470,6 +520,9 @@ func (s *Session) Err() error {
 func (s *Session) Close() error {
 	s.once.Do(func() {
 		close(s.closed)
+		s.mu.Lock()
+		s.stopIdleLocked()
+		s.mu.Unlock()
 		s.loop.Interrupt()
 		s.cancel()
 
@@ -484,7 +537,7 @@ func (s *Session) Close() error {
 			case <-s.persistDone:
 			case <-time.After(s.grace):
 				s.log.Warn("agent: persist drain timed out; tail events may be unsaved",
-					"session", s.scope.SessionID, "grace", s.grace)
+					"session", s.SessionID(), "grace", s.grace)
 				s.persistCancel()
 			}
 		}
@@ -536,7 +589,7 @@ func (s *Session) fail(err error) {
 func (s *Session) runContext(host context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(host)
 	stop := context.AfterFunc(s.ctx, cancel)
-	return ctxx.WithScope(ctx, mergeScope(s.scope, ctx)), func() {
+	return ctxx.WithScope(ctx, mergeScope(s.currentScope(), ctx)), func() {
 		stop()
 		cancel()
 	}
@@ -579,7 +632,7 @@ func (s *Session) consumeWindow(ch <-chan loop.Event) {
 				if !s.isClosed() {
 					// 会话没关但事件流断了：窗口再也不会结算，
 					// 必须唤醒在途 Input 并让宿主看见（否则永久等待）。
-					s.log.Error("agent: window stream closed unexpectedly", "session", s.scope.SessionID)
+					s.log.Error("agent: window stream closed unexpectedly", "session", s.SessionID())
 					s.fail(ErrStreamClosed)
 				}
 				return
@@ -628,7 +681,7 @@ func (s *Session) settle() {
 	s.mu.Unlock()
 
 	if ctx == nil {
-		ctx = s.ctx // 兜底：没有触发 ctx 时用会话 ctx（身份为会话自身）
+		ctx = ctxx.WithScope(s.ctx, s.currentScope()) // 没有触发 ctx 时使用会话 ctx 与当前会话身份
 	}
 	s.win.SetBudget(s.budget(ctx, compact))
 	used := 0
@@ -636,9 +689,79 @@ func (s *Session) settle() {
 		used = usage.In + usage.Out // 本轮最后一次请求的规模，即下一轮组装中已有部分的规模
 	}
 	s.win.Settle(ctx, turn, used)
+	s.mu.Lock()
+	s.lastCtx = ctx
+	s.sessionTurns++
+	s.armIdleLocked()
+	s.mu.Unlock()
 	if done != nil {
 		close(done)
 	}
+}
+
+// currentScope 返回会话 Scope 的副本（SessionID 为当前会话标识）。
+func (s *Session) currentScope() ctxx.Scope {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.scope
+}
+
+// stopIdleLocked 停止无操作计时，并使已到期、尚未执行的回调作废（调用方持有 s.mu）。
+func (s *Session) stopIdleLocked() {
+	s.idleGen++
+	if s.idleTimer != nil {
+		s.idleTimer.Stop()
+		s.idleTimer = nil
+	}
+}
+
+// armIdleLocked 按 s.idle 重新启动无操作计时（调用方持有 s.mu）；会话已关闭、未设置时长
+// 或当前会话没有已结算的轮次时只停止计时。
+func (s *Session) armIdleLocked() {
+	s.stopIdleLocked()
+	if s.idle <= 0 || s.sessionTurns == 0 || s.isClosed() {
+		return
+	}
+	gen := s.idleGen
+	s.idleTimer = time.AfterFunc(s.idle, func() { s.onIdle(gen) })
+}
+
+// onIdle 是无操作计时到期的回调。持 runMu 与 Input 互斥：在途轮次结束后才执行，期间开始的
+// Input 已使计时代号改变，回调随之作废。代号未变且当前会话有已结算的轮次时切换会话：
+// 近轮全部压缩进记忆（window.Flush，使用最近一轮 run ctx 的身份，即切换前的会话），
+// 之后的输入使用新的 SessionID。切换由 s.log 输出一条 Info 日志 agent: session switched。
+func (s *Session) onIdle(gen uint64) {
+	s.runMu.Lock()
+	defer s.runMu.Unlock()
+	if s.isClosed() {
+		return
+	}
+	now := time.Now()
+	s.mu.Lock()
+	if gen != s.idleGen || s.sessionTurns == 0 {
+		s.mu.Unlock()
+		return
+	}
+	prevScope, ctx := s.scope, s.lastCtx
+	prev := prevScope.SessionID
+	next := s.newID(now)
+	if next == "" || next == prev {
+		s.log.Warn("agent: NewSessionID returned an empty or unchanged id, SessionIDAt used",
+			"session", prev, "got", next)
+		next = SessionIDAt(prev, now)
+	}
+	s.scope.SessionID = next
+	s.sessionTurns = 0
+	s.lastCtx = nil
+	s.idleTimer = nil
+	idle := s.idle
+	s.mu.Unlock()
+
+	if ctx == nil {
+		ctx = ctxx.WithScope(s.ctx, prevScope)
+	}
+	s.win.Flush(ctx)
+	s.log.Info("agent: session switched", "session", prev, "next", next, "idle", idle)
 }
 
 // budget 按本轮 ctx 的模型与输出上限计算窗口预算。Provider 报告窗口未知时返回零值
@@ -654,7 +777,7 @@ func (s *Session) budget(ctx context.Context, compact CompactBudget) window.Budg
 		s.mu.Unlock()
 		if warn {
 			s.log.Warn("agent: model context window unknown, usage-based compaction disabled",
-				"session", s.scope.SessionID, "model", model)
+				"session", s.SessionID(), "model", model)
 		}
 		return window.Budget{}
 	}

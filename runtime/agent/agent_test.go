@@ -1426,3 +1426,150 @@ func TestSessionNoWindowNeverCompacts(t *testing.T) {
 		t.Fatalf("窗口未知不应压缩，实际 %d 次", n)
 	}
 }
+
+// ---------- 会话切换（IdleTimeout） ----------
+
+// sidStore 按「会话标识:事件类型」记录写入的事件。
+type sidStore struct {
+	mu  sync.Mutex
+	got []string
+}
+
+func (s *sidStore) Append(_ context.Context, sessionID string, ev loop.Event) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.got = append(s.got, sessionID+":"+string(ev.Kind))
+	return nil
+}
+
+func (s *sidStore) has(entry string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, g := range s.got {
+		if g == entry {
+			return true
+		}
+	}
+	return false
+}
+
+// waitUntil 以 5 ms 间隔轮询 cond，2 s 内不成立即判定失败。
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("等待超时：%s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestSessionIDAt(t *testing.T) {
+	at := time.Date(2026, 10, 1, 15, 30, 45, 123_000_000, time.UTC)
+	if got, want := SessionIDAt("aria", at), "aria-20261001-153045.123"; got != want {
+		t.Fatalf("want %s got %s", want, got)
+	}
+}
+
+// 最近一轮结算后 IdleTimeout 内无输入：近轮全部压缩进记忆（不保留 K 轮、窗口未知也压缩），
+// 之后的输入使用新的 SessionID；压缩事件记在切换前的会话下。
+func TestSessionSwitchesAfterIdle(t *testing.T) {
+	cc := &countingCompressor{}
+	st := &sidStore{}
+	sp := &scopeProbeProvider{inner: provider.NewFake(
+		provider.FakeStep{Text: []string{"一"}}, provider.FakeStep{Text: []string{"二"}})}
+	s, _ := newTestSession(t, Config{
+		Provider:        sp,
+		Compressor:      cc,
+		KeepRecentTurns: 2,
+		Store:           st,
+		IdleTimeout:     20 * time.Millisecond,
+		NewSessionID:    func(time.Time) string { return "s2" },
+	})
+	if _, err := s.Input(context.Background(), message.NewUser("第一轮")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "会话切换为 s2", func() bool { return s.SessionID() == "s2" })
+	s.WaitCompress()
+	if n := cc.calls(); n != 1 {
+		t.Fatalf("切换时应压缩 1 次，实际 %d 次", n)
+	}
+	if mem, recent := s.History(); len(recent) != 0 || len(mem) != 2 {
+		t.Fatalf("近轮应全部进入记忆：memory %v recent %v", rendered(mem), rendered(recent))
+	}
+	if _, err := s.Input(context.Background(), message.NewUser("第二轮")); err != nil {
+		t.Fatal(err)
+	}
+	if got := sp.lastScope().SessionID; got != "s2" {
+		t.Fatalf("切换后的输入应使用 s2，实际 %s", got)
+	}
+	_ = s.Close()
+	for _, e := range []string{"s1:agent_start", "s1:window_compressed", "s2:agent_start"} {
+		if !st.has(e) {
+			t.Fatalf("缺少写入记录 %s：%v", e, st.got)
+		}
+	}
+}
+
+// 计时期间有新的 Input：之前启动的计时作废，到期回调不切换会话；最近一次结算启动的计时到期才切换。
+// 未设置 NewSessionID 时新标识为 SessionIDAt(初始标识, 切换时刻)。
+func TestInputInvalidatesIdleTimer(t *testing.T) {
+	s, _ := newTestSession(t, Config{
+		Provider:    provider.NewFake(provider.FakeStep{Text: []string{"一"}}, provider.FakeStep{Text: []string{"二"}}),
+		Compressor:  window.KeepLast(100),
+		IdleTimeout: time.Hour,
+	})
+	gen := func() uint64 {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.idleGen
+	}
+	if _, err := s.Input(context.Background(), message.NewUser("第一轮")); err != nil {
+		t.Fatal(err)
+	}
+	stale := gen()
+	if _, err := s.Input(context.Background(), message.NewUser("第二轮")); err != nil {
+		t.Fatal(err)
+	}
+	s.onIdle(stale)
+	if got := s.SessionID(); got != "s1" {
+		t.Fatalf("作废的计时不应切换会话，实际 %s", got)
+	}
+	s.onIdle(gen())
+	if got := s.SessionID(); !strings.HasPrefix(got, "s1-") {
+		t.Fatalf("应切换为 s1- 前缀的新标识，实际 %s", got)
+	}
+}
+
+// SetIdleTimeout(0) 停止计时；Close 停止计时。
+func TestIdleTimerStoppedBySetIdleTimeoutAndClose(t *testing.T) {
+	s, _ := newTestSession(t, Config{
+		Provider:    provider.NewFake(provider.FakeStep{Text: []string{"一"}}),
+		Compressor:  window.KeepLast(100),
+		IdleTimeout: time.Hour,
+	})
+	timer := func() *time.Timer {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.idleTimer
+	}
+	if _, err := s.Input(context.Background(), message.NewUser("第一轮")); err != nil {
+		t.Fatal(err)
+	}
+	if timer() == nil {
+		t.Fatal("结算后应启动计时")
+	}
+	s.SetIdleTimeout(0)
+	if timer() != nil {
+		t.Fatal("SetIdleTimeout(0) 后计时应停止")
+	}
+	s.SetIdleTimeout(time.Hour)
+	if timer() == nil {
+		t.Fatal("恢复时长后应重新计时")
+	}
+	_ = s.Close()
+	if timer() != nil {
+		t.Fatal("Close 后计时应停止")
+	}
+}

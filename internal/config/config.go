@@ -83,8 +83,11 @@ type Persona struct {
 }
 
 type Session struct {
-	ID          string
+	ID          string // 会话标识前缀：实际会话标识为 <ID>-<会话开始时刻>，见 agent.SessionIDAt
 	DefaultUser string
+	// IdleTimeoutS 是会话切换的无操作时长（秒）：最近一轮结束后该时长内没有新输入时，
+	// 近轮全部压缩进记忆，之后的输入进入新会话。0 = 不切换。
+	IdleTimeoutS int
 }
 
 type LLM struct {
@@ -417,8 +420,9 @@ func configFrom(v *viper.Viper) Config {
 			SystemPromptFile: v.GetString("persona.system_prompt_file"),
 		},
 		Session: Session{
-			ID:          v.GetString("session.id"),
-			DefaultUser: v.GetString("session.default_user"),
+			ID:           v.GetString("session.id"),
+			DefaultUser:  v.GetString("session.default_user"),
+			IdleTimeoutS: v.GetInt("session.idle_timeout_s"),
 		},
 		LLM: LLM{
 			Temperature:     v.GetFloat64("llm.temperature"),
@@ -462,6 +466,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("persona.system_prompt_file", "")
 	v.SetDefault("session.id", "aria")
 	v.SetDefault("session.default_user", "user")
+	v.SetDefault("session.idle_timeout_s", 1800) // 30 min 无输入切换会话
 	// llm.temperature / llm.max_tokens / llm.reasoning_effort 故意无默认：
 	// 空 = 不下发该字段，交给 provider 的模型默认（thinking 型模型一般
 	// 不用这几个旋钮）。

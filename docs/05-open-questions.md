@@ -66,7 +66,7 @@
 
 **G2 · ContextWindow 与非线性 Planner 细节 `[M3 前]`** —— 草案 [notes/context-planning-draft.md](notes/context-planning-draft.md)（Unit 分级、打分公式、L0-L3、pull 工具、context.why、评测、thought 块入窗默认策略）。已定共识：窗口是一等可编程状态、选择非线性呈现线性稳定、ContextSource 契约（03 §2）、**v1 每轮组装模型**（压缩记忆+当前感知+新输入 + 间隙压缩，03 §5）。
 
-**G3 · hook 挂点两问 `[M2 实现期]`** —— ① 挂点 2/4（LLM 响应变换、工具结果变换）用装饰器表达还是升格 core 一等槽（倾向先装饰器，B→C 升级不破坏契约）；② tool hook 具体场景盘点：是否有挂点全景表（03 §3）之外的需求。runtime 生命周期事件词汇补全在此项——注意「不分会话」（03 §5）下无 session created/resumed/closed 生命周期，词汇应改为话题级（topic ended、window compacted）与任务级（task started/failed）。
+**G3 · hook 挂点两问 `[M2 实现期]`** —— ① 挂点 2/4（LLM 响应变换、工具结果变换）用装饰器表达还是升格 core 一等槽（倾向先装饰器，B→C 升级不破坏契约）；② tool hook 具体场景盘点：是否有挂点全景表（03 §3）之外的需求。runtime 生命周期事件词汇补全在此项——注意 03 §5 的会话切换（2026-10-01）：会话边界只有无操作超时切换一种，无 resumed（v1 只写不恢复）；词汇除 session switched 外，按话题级（topic ended、window compacted）与任务级（task started/failed）补全。
 
 ## 建议的讨论顺序
 

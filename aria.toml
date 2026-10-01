@@ -38,8 +38,9 @@ system_prompt = ""
 system_prompt_file = ""        # 例："persona/default.md"
 
 [session]
-id = "aria"
+id = "aria"                     # 会话标识前缀：每个会话的标识为 <id>-<开始时刻>，如 aria-20261001-153045.123
 default_user = "user"
+idle_timeout_s = 1800           # 最近一轮结束后该时长（秒）内没有新输入：近轮全部压缩进记忆，之后的输入进入新会话；0 = 不切换
 
 [llm]                           # 热调区：网页面板改动立即生效（每请求 Options 覆盖）
 #temperature = 0.7              # 不设（默认）= 请求里不下发该字段，用 provider 模型默认；思考模式下服务端本就忽略它

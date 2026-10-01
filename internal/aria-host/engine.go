@@ -162,12 +162,15 @@ func NewEngine(opts Options) (*Engine, error) {
 		log.Info("tools", "count", len(tools), "names", names)
 	}
 
+	sessionID, newSessionID := assemble.SessionIDs(cfg.Session, time.Now())
 	ag, err := agent.New(agent.Config{
 		Provider:        prov,
 		Tools:           tools,
 		Compressor:      compressor,
 		KeepRecentTurns: cfg.Compress.KeepRecentTurns,
 		Compact:         assemble.CompactBudget(cfg.Compress),
+		IdleTimeout:     assemble.IdleTimeout(cfg.Session),
+		NewSessionID:    newSessionID,
 		Assembler:       vision,
 		Store:           store,
 		SystemPrompt:    systemPrompt,
@@ -178,7 +181,7 @@ func NewEngine(opts Options) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("agent 装配失败: %w", err)
 	}
-	sess, err := ag.NewSession(ctxx.Scope{SessionID: cfg.Session.ID, UserID: cfg.Session.DefaultUser})
+	sess, err := ag.NewSession(ctxx.Scope{SessionID: sessionID, UserID: cfg.Session.DefaultUser})
 	if err != nil {
 		return nil, fmt.Errorf("会话建立失败: %w", err)
 	}
