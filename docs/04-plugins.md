@@ -52,7 +52,7 @@ type ContextSource interface {
 ```
 
 - **调用方是 runtime**（03 §5）：Collect 在每轮组装链上同步驱动；Observe 在该轮事件写入磁盘后异步驱动（幂等；重试与死信细节随并发调度草稿确定）；
-- 写路修订中（2026-10-02）：Observe 按轮驱动将改为按压缩批次暂存、会话结束提交，接口划分待定，见 [memory/options.md](memory/options.md)「写入与召回流程」；
+- 写路修订中（2026-10-02）：Observe 按轮驱动改为按压缩批次暂存、会话结束提交；记忆服务使用独立接口 Stage / End / Start / Recall，ContextSource 的写路随之修订，见 [memory/options.md](memory/options.md)「记忆服务接口」；
 - **RAG 知识库 = 另一个 ContextSource**：corpus 建索引走 Batch 任务写自己的存储，Collect 只读；
 - **L1 会话全量原文不在此契约**：由 runtime 事件溯源落盘（runtime/persist，v1 只写不恢复）；`history.load` 是 M4 pull 工具，直读 L1。
 
