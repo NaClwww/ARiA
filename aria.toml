@@ -29,6 +29,8 @@ kind = "deepseek"                        # deepseek（官方端点特化：思�
 base_url = "https://api.deepseek.com"   # deepseek kind 可省略（默认官方端点；/v1 别名亦可）；openai kind 默认官方 OpenAI
 model = "deepseek-flash"                 # 稳定默认：V4.1-Flash（tool calls + 视觉 + 思考，并发 2500，输入 1 元/M 档）；备选 deepseek-v4-pro（无视觉，勿用于摄像头注入）；deepseek kind 留空也用它
 api_key_env = "ARIA_API_KEY"   # key 本体永远在环境变量，不落任何文件；deepseek kind 另兜底 DEEPSEEK_API_KEY
+# context_window = 0             # 模型上下文窗口（token）；0 = 适配器内置值（deepseek 按模型名查表；openai 无内置值，未配置时不按用量压缩）
+# max_output = 0                 # 请求未设 max_tokens 时的输出上限（token）；0 = 适配器内置值
 
 [persona]
 # 二选一，file 优先
@@ -47,7 +49,13 @@ default_user = "user"
 [compress]
 strategy = "provider"           # provider（调 LLM 压成摘要）| keeplast（不调 LLM，只留最近 N 条）
 keep_last_n = 0                 # strategy = "keeplast" 时的条数；0 = 引擎默认
-keep_recent_turns = 2           # 保留原文的近轮数 K（两种策略通用）：近轮达到 2K 轮时压缩较早的轮次；0 = 每轮全部压缩
+keep_recent_turns = 2           # 压缩时保留原文的近轮数 K（两种策略通用）；压缩进行中结算的轮次不计入 K
+# 压缩按上下文用量触发：剩余量（模型窗口 − 用量）低于预留量时压缩。
+# 预留量 = max(reserve_ratio × 窗口, 单轮) + concurrent_turns × 单轮，单轮 = 输出上限 + turn_reserve_tokens。
+# 模型窗口与缺省输出上限由 provider 按模型给出（[provider] 的 context_window / max_output 可覆盖）。
+reserve_ratio = 0.10            # 预留量不低于窗口的比例
+turn_reserve_tokens = 16384     # 单轮输入预留（用户输入 + 工具结果），单位 token
+concurrent_turns = 1            # 压缩与对话并发期间额外预留的轮数；负数 = 不额外预留
 # 将来会有第三个策略 twopart（软摘要 + 硬台账），届时这里加个名字即可
 # model = ""                    # provider 策略的模型覆盖；空 = 跟随 provider.model
 # instruction = ""              # provider 策略的提示词覆盖；空 = 默认提示词

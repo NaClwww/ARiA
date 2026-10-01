@@ -71,6 +71,10 @@ type Provider struct {
 	BaseURL   string
 	Model     string
 	APIKeyEnv string // key 本体永远在环境变量；这里只存变量名
+	// ContextWindow / MaxOutput 覆盖适配器的模型限额（token）；0 = 适配器内置值
+	// （kind=deepseek 按模型名查表；kind=openai 无内置值，未配置时不按上下文用量压缩）。
+	ContextWindow int
+	MaxOutput     int
 }
 
 type Persona struct {
@@ -94,10 +98,15 @@ type LLM struct {
 type Compress struct {
 	Strategy  string // provider（默认，LLM 摘要）| keeplast（只留最近 N 条）| 将来 twopart
 	KeepLastN int    // strategy=keeplast 的条数；0 = 实现侧默认（window.DefaultKeepLast）
-	// KeepRecentTurns 是保留原文的近轮数 K（两种策略通用）：近轮达到 2K 轮时只压缩较早的轮次；0 = 每轮全部压缩。
+	// KeepRecentTurns 是压缩时保留原文的近轮数 K（两种策略通用）。
 	KeepRecentTurns int
-	Model           string // strategy=provider 的模型覆盖；空 = 跟随 provider.model
-	Instruction     string // strategy=provider 的提示词覆盖；空 = 默认提示词
+	// 按上下文用量触发压缩的预留策略（见 agent.CompactBudget）：
+	// 预留量 = max(ReserveRatio × 窗口, 单轮) + ConcurrentTurns × 单轮，单轮 = 输出上限 + TurnReserveTokens。
+	ReserveRatio      float64
+	TurnReserveTokens int
+	ConcurrentTurns   int    // 负数 = 不额外预留
+	Model             string // strategy=provider 的模型覆盖；空 = 跟随 provider.model
+	Instruction       string // strategy=provider 的提示词覆盖；空 = 默认提示词
 }
 
 type Tools struct {
@@ -396,10 +405,12 @@ func configFrom(v *viper.Viper) Config {
 		},
 		Server: Server{Listen: v.GetString("server.listen")},
 		Provider: Provider{
-			Kind:      v.GetString("provider.kind"),
-			BaseURL:   v.GetString("provider.base_url"),
-			Model:     v.GetString("provider.model"),
-			APIKeyEnv: v.GetString("provider.api_key_env"),
+			Kind:          v.GetString("provider.kind"),
+			BaseURL:       v.GetString("provider.base_url"),
+			Model:         v.GetString("provider.model"),
+			APIKeyEnv:     v.GetString("provider.api_key_env"),
+			ContextWindow: v.GetInt("provider.context_window"),
+			MaxOutput:     v.GetInt("provider.max_output"),
 		},
 		Persona: Persona{
 			SystemPrompt:     v.GetString("persona.system_prompt"),
@@ -415,11 +426,14 @@ func configFrom(v *viper.Viper) Config {
 			ReasoningEffort: v.GetString("llm.reasoning_effort"),
 		},
 		Compress: Compress{
-			Strategy:        v.GetString("compress.strategy"),
-			KeepLastN:       v.GetInt("compress.keep_last_n"),
-			KeepRecentTurns: v.GetInt("compress.keep_recent_turns"),
-			Model:           v.GetString("compress.model"),
-			Instruction:     v.GetString("compress.instruction"),
+			Strategy:          v.GetString("compress.strategy"),
+			KeepLastN:         v.GetInt("compress.keep_last_n"),
+			KeepRecentTurns:   v.GetInt("compress.keep_recent_turns"),
+			ReserveRatio:      v.GetFloat64("compress.reserve_ratio"),
+			TurnReserveTokens: v.GetInt("compress.turn_reserve_tokens"),
+			ConcurrentTurns:   v.GetInt("compress.concurrent_turns"),
+			Model:             v.GetString("compress.model"),
+			Instruction:       v.GetString("compress.instruction"),
 		},
 		Tools:  Tools{Builtin: v.GetStringSlice("tools.builtin")},
 		Record: Record{Path: v.GetString("record.path")},
@@ -442,6 +456,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("provider.base_url", "")
 	v.SetDefault("provider.model", "")
 	v.SetDefault("provider.api_key_env", "ARIA_API_KEY")
+	v.SetDefault("provider.context_window", 0)
+	v.SetDefault("provider.max_output", 0)
 	v.SetDefault("persona.system_prompt", "")
 	v.SetDefault("persona.system_prompt_file", "")
 	v.SetDefault("session.id", "aria")
@@ -451,7 +467,10 @@ func setDefaults(v *viper.Viper) {
 	// 不用这几个旋钮）。
 	v.SetDefault("compress.strategy", "provider")
 	v.SetDefault("compress.keep_last_n", 0)
-	v.SetDefault("compress.keep_recent_turns", 2) // 最近 2 轮保持原文，近轮达到 4 轮时压缩较早的 2 轮
+	v.SetDefault("compress.keep_recent_turns", 2) // 压缩时最近 2 轮保持原文
+	v.SetDefault("compress.reserve_ratio", 0.10)
+	v.SetDefault("compress.turn_reserve_tokens", 16384)
+	v.SetDefault("compress.concurrent_turns", 1)
 	v.SetDefault("compress.model", "")
 	v.SetDefault("compress.instruction", "")
 	// 缺省只含两个宿主共有的工具；lorem 只在 aria-demo 的注册表中存在，由配置显式启用。

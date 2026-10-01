@@ -36,6 +36,11 @@ func (r *recorderProvider) Stream(ctx context.Context, req provider.Request) (<-
 	return r.inner.Stream(ctx, req)
 }
 
+func (r *recorderProvider) Limits(model string) provider.Limits { return r.inner.Limits(model) }
+func (r *recorderProvider) CountTokens(model string, msgs []message.Message) int {
+	return r.inner.CountTokens(model, msgs)
+}
+
 func (r *recorderProvider) at(i int) provider.Request {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -95,6 +100,10 @@ func rendered(msgs []message.Message) []string {
 	}
 	return out
 }
+
+// eagerLimits 使每次结算都满足压缩触发条件：窗口 1 token，预留量远大于窗口；
+// MaxOutput 等于窗口使组装不截断。用于逐轮压缩语义的测试。
+var eagerLimits = provider.Limits{ContextWindow: 1, MaxOutput: 1}
 
 // ---------- 用 Test 建会话的辅助 ----------
 
@@ -284,7 +293,7 @@ func TestDefaultCompressorKeepsWindowBounded(t *testing.T) {
 	for i := range steps {
 		steps[i] = provider.FakeStep{Text: []string{"ok"}}
 	}
-	s, _ := newTestSession(t, Config{Provider: provider.NewFake(steps...)})
+	s, _ := newTestSession(t, Config{Provider: provider.NewFake(steps...).WithLimits(eagerLimits)})
 
 	for i := 0; i < len(steps); i++ {
 		if _, err := s.Input(context.Background(), message.NewUser("msg")); err != nil {
@@ -400,7 +409,7 @@ func TestCloseDrainsPersist(t *testing.T) {
 func TestCompressionCtxCarriesTurnIdentity(t *testing.T) {
 	probe := &ctxProbeCompressor{}
 	s, _ := newTestSession(t, Config{
-		Provider:   provider.NewFake(provider.FakeStep{Text: []string{"ok"}}),
+		Provider:   provider.NewFake(provider.FakeStep{Text: []string{"ok"}}).WithLimits(eagerLimits),
 		Compressor: probe,
 	})
 	host, _ := ctxx.EnsureTrace(ctxx.WithCredentials(context.Background(), ctxx.Credentials{"openai": "sk-test"}))
@@ -490,7 +499,7 @@ func TestProviderCompressorWiredIntoSession(t *testing.T) {
 		Provider: provider.NewFake(
 			provider.FakeStep{Text: []string{"第一次回答"}},
 			provider.FakeStep{Text: []string{"第二次回答"}},
-		),
+		).WithLimits(eagerLimits),
 		Compressor: &window.ProviderCompressor{
 			Provider: provider.NewFake(provider.FakeStep{Text: []string{"用户打了招呼"}}),
 		},
@@ -517,6 +526,7 @@ func TestProviderCompressorWiredIntoSession(t *testing.T) {
 
 // gateProvider 在 Stream 里等 release；ctx 取消时按 provider 义务收尾部分输出。
 type gateProvider struct {
+	provider.NoLimits
 	once    sync.Once
 	started chan struct{}
 	release chan struct{}
@@ -620,6 +630,11 @@ func (p *scopeProbeProvider) Stream(ctx context.Context, req provider.Request) (
 		p.mu.Unlock()
 	}
 	return p.inner.Stream(ctx, req)
+}
+
+func (p *scopeProbeProvider) Limits(model string) provider.Limits { return p.inner.Limits(model) }
+func (p *scopeProbeProvider) CountTokens(model string, msgs []message.Message) int {
+	return p.inner.CountTokens(model, msgs)
 }
 
 func (p *scopeProbeProvider) lastScope() ctxx.Scope {
@@ -954,6 +969,7 @@ func TestQueueRejectedDuringSettlementWait(t *testing.T) {
 
 // gatedProvider 首次调用阻塞在 gate 上（模拟慢速模型），便于在运行中注入。
 type gatedProvider struct {
+	provider.NoLimits
 	gate    chan struct{}
 	entered chan struct{}
 	reply   string
@@ -984,6 +1000,7 @@ func (g *gatedProvider) Stream(ctx context.Context, _ provider.Request) (<-chan 
 
 // cancelOnlyProvider 只在 ctx 取消时收尾（契约合规）。
 type cancelOnlyProvider struct {
+	provider.NoLimits
 	once    sync.Once
 	entered chan struct{}
 }
@@ -1235,7 +1252,7 @@ func (c *countingCompressor) calls() int {
 func TestSessionSetCompressorHotSwap(t *testing.T) {
 	first := &countingCompressor{}
 	s, _ := newTestSession(t, Config{
-		Provider:   provider.NewFake(provider.FakeStep{Text: []string{"第一轮"}}, provider.FakeStep{Text: []string{"第二轮"}}),
+		Provider:   provider.NewFake(provider.FakeStep{Text: []string{"第一轮"}}, provider.FakeStep{Text: []string{"第二轮"}}).WithLimits(eagerLimits),
 		Compressor: first,
 	})
 	if _, err := s.Input(context.Background(), message.NewUser("hi")); err != nil {
@@ -1319,7 +1336,7 @@ func TestStopperSurvivesToolWrapping(t *testing.T) {
 func TestWindowCompressedEventPersisted(t *testing.T) {
 	st := &memStore{}
 	s, _ := newTestSession(t, Config{
-		Provider:   provider.NewFake(provider.FakeStep{Text: []string{"好"}}),
+		Provider:   provider.NewFake(provider.FakeStep{Text: []string{"好"}}).WithLimits(eagerLimits),
 		Store:      st,
 		Compressor: window.KeepLast(10),
 	})
@@ -1345,4 +1362,67 @@ func (s *memStore) hasKind(k loop.Kind) bool {
 		}
 	}
 	return false
+}
+
+// ---------- 按上下文用量触发压缩（CompactBudget） ----------
+
+// 预留量 = max(比例 × 窗口, 单轮) + 并发轮数 × 单轮；单轮 = 输出上限 + 单轮输入预留。
+func TestCompactBudgetWindowBudget(t *testing.T) {
+	lim := provider.Limits{ContextWindow: 1_000_000, MaxOutput: 65536}
+	b := CompactBudget{}.windowBudget(lim, 0, nil)
+	turn := 65536 + DefaultTurnReserveTokens
+	if want := 100_000 + turn; b.Reserve != want || b.MaxOutput != 65536 || b.ContextWindow != 1_000_000 {
+		t.Fatalf("缺省预算不符：%+v，预留量应为 %d", b, want)
+	}
+	// ctx 的 MaxTokens 覆盖缺省输出上限；单轮超过比例下限时取单轮；并发轮数为负时不额外预留。
+	b = CompactBudget{ReserveRatio: 0.01, TurnReserveTokens: 1000, ConcurrentTurns: -1}.windowBudget(lim, 20000, nil)
+	if b.Reserve != 21000 || b.MaxOutput != 20000 {
+		t.Fatalf("覆盖后预算不符：%+v", b)
+	}
+	if b := (CompactBudget{}).windowBudget(provider.Limits{}, 0, nil); b.ContextWindow != 0 {
+		t.Fatalf("窗口未知时应返回零值：%+v", b)
+	}
+}
+
+// 结算按最后一次调用的 usage（输入 + 输出）判定：剩余量不低于预留量时不压缩，低于时压缩。
+func TestSessionCompactsWhenUsageNearWindow(t *testing.T) {
+	cc := &countingCompressor{}
+	s, _ := newTestSession(t, Config{
+		Provider: provider.NewFake(
+			provider.FakeStep{Text: []string{"一"}, Usage: message.Usage{In: 100, Out: 10}},
+			provider.FakeStep{Text: []string{"二"}, Usage: message.Usage{In: 600, Out: 50}},
+		).WithLimits(provider.Limits{ContextWindow: 1000, MaxOutput: 100}),
+		Compressor: cc,
+		Compact:    CompactBudget{ReserveRatio: 0.1, TurnReserveTokens: 100, ConcurrentTurns: 1}, // 预留 400
+	})
+	if _, err := s.Input(context.Background(), message.NewUser("第一轮")); err != nil {
+		t.Fatal(err)
+	}
+	s.WaitCompress()
+	if n := cc.calls(); n != 0 {
+		t.Fatalf("用量 110、剩余 890 不应压缩，实际 %d 次", n)
+	}
+	if _, err := s.Input(context.Background(), message.NewUser("第二轮")); err != nil {
+		t.Fatal(err)
+	}
+	s.WaitCompress()
+	if n := cc.calls(); n != 1 {
+		t.Fatalf("用量 650、剩余 350 低于预留 400，应压缩 1 次，实际 %d 次", n)
+	}
+}
+
+// Provider 报告窗口未知时不压缩。
+func TestSessionNoWindowNeverCompacts(t *testing.T) {
+	cc := &countingCompressor{}
+	s, _ := newTestSession(t, Config{
+		Provider:   provider.NewFake(provider.FakeStep{Text: []string{"一"}, Usage: message.Usage{In: 1_000_000, Out: 1}}),
+		Compressor: cc,
+	})
+	if _, err := s.Input(context.Background(), message.NewUser("话")); err != nil {
+		t.Fatal(err)
+	}
+	s.WaitCompress()
+	if n := cc.calls(); n != 0 {
+		t.Fatalf("窗口未知不应压缩，实际 %d 次", n)
+	}
 }

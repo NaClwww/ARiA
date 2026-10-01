@@ -60,7 +60,8 @@ func Provider(cfg config.Config, apiKey string) (ProviderResult, error) {
 			model = deepseek.DefaultModel // 稳定默认：V4.1-Flash（选型依据见插件包注释）
 		}
 		return ProviderResult{
-			Impl:  deepseek.New(deepseek.Config{BaseURL: cfg.Provider.BaseURL, APIKey: key, Model: cfg.Provider.Model}),
+			Impl: deepseek.New(deepseek.Config{BaseURL: cfg.Provider.BaseURL, APIKey: key, Model: cfg.Provider.Model,
+				ContextWindow: cfg.Provider.ContextWindow, MaxOutput: cfg.Provider.MaxOutput}),
 			Kind:  kind,
 			Model: model,
 		}, nil
@@ -76,7 +77,8 @@ func Provider(cfg config.Config, apiKey string) (ProviderResult, error) {
 			return ProviderResult{}, errors.New("provider \"openai\" 需要 provider.model（或换 kind = \"deepseek\" 吃默认模型）")
 		}
 		return ProviderResult{
-			Impl:  openai.New(openai.Config{BaseURL: cfg.Provider.BaseURL, APIKey: key, Model: cfg.Provider.Model}),
+			Impl: openai.New(openai.Config{BaseURL: cfg.Provider.BaseURL, APIKey: key, Model: cfg.Provider.Model,
+				ContextWindow: cfg.Provider.ContextWindow, MaxOutput: cfg.Provider.MaxOutput}),
 			Kind:  kind,
 			Model: cfg.Provider.Model,
 		}, nil

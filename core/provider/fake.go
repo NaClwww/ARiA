@@ -15,7 +15,29 @@ type Fake struct {
 	mu    sync.Mutex
 	steps []FakeStep
 	i     int
+	lim   *Limits // nil = 窗口未知；见 WithLimits
 }
+
+// WithLimits 设置 Limits 的返回值（所有模型相同），返回 f 本身便于链式构造。
+func (f *Fake) WithLimits(l Limits) *Fake {
+	f.mu.Lock()
+	f.lim = &l
+	f.mu.Unlock()
+	return f
+}
+
+// Limits 返回 WithLimits 设置的值；未设置时为零值。
+func (f *Fake) Limits(string) Limits {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.lim == nil {
+		return Limits{}
+	}
+	return *f.lim
+}
+
+// CountTokens 不提供估算：调用方改用 EstimateTokens。
+func (f *Fake) CountTokens(string, []message.Message) int { return -1 }
 
 type FakeStep struct {
 	Text    []string // text 增量序列

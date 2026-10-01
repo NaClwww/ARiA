@@ -4,6 +4,9 @@
 //
 // 压缩（一次 LLM 调用）不在组装快路径上：轮次结束后由 Settle 在间隙里异步做，
 // 未就绪时下一轮继续用旧记忆——慢一点，但组装路径永远没有 LLM 调用。
+//
+// 压缩按上下文用量触发（见 Budget）：上下文剩余量低于预留量时，压缩触发时刻
+// 近轮中除最近 K 轮以外的轮次；压缩进行中结算的轮次不计入 K，保留原文。
 package window
 
 import (
@@ -14,9 +17,30 @@ import (
 	"sync"
 
 	"aria/core/loop"
+	"aria/core/provider"
 	"aria/pkg/ctxx"
 	"aria/pkg/message"
 )
+
+// Budget 是按上下文用量触发压缩的预算（单位 token）。
+type Budget struct {
+	// ContextWindow 是模型上下文窗口；≤ 0 时不按用量触发压缩，组装也不截断。
+	ContextWindow int
+	// MaxOutput 是单次请求的输出上限：组装结果超过 ContextWindow − MaxOutput 时，
+	// 组装截断最早的原文（压缩进行中上下文继续增长的情形）。
+	MaxOutput int
+	// Reserve 是预留量：剩余量（ContextWindow − 上下文用量）低于该值时触发压缩。
+	Reserve int
+	// Count 估算消息的 token 数（无 usage 时与压缩完成后判定用量）；nil 时用 provider.EstimateTokens。
+	Count func([]message.Message) int
+}
+
+func (b Budget) count(ms []message.Message) int {
+	if b.Count != nil {
+		return b.Count(ms)
+	}
+	return provider.EstimateTokens(ms)
+}
 
 const (
 	// DefaultKeepLast 是无 Compressor 时的兜底保留条数。
@@ -46,7 +70,9 @@ type Window struct {
 	inflight    []message.Message // 正被压缩的消息：仍参与组装，压完才被替换
 	recent      []message.Message // 尚未压缩的近轮（此前输入与产出）
 	recentTurns []int             // recent 中各轮的消息条数，按结算顺序；按轮切分压缩范围用
-	keepTurns   int               // 保留原文的近轮数 K，见 SetKeepRecentTurns
+	keepTurns   int               // 压缩时保留原文的近轮数 K，见 SetKeepRecentTurns
+	budget      Budget            // 按用量触发压缩的预算，见 SetBudget
+	used        int               // 最近一次判定得到的上下文用量（token）
 	compressing bool
 	pendingCtx  context.Context // 触发待压缩批次的 Settle 的 ctx：下一轮压缩换用它的身份
 	onCompress  func(loop.WindowCompressedData)
@@ -84,10 +110,8 @@ func (w *Window) SetOnCompress(fn func(loop.WindowCompressedData)) {
 	w.mu.Unlock()
 }
 
-// SetKeepRecentTurns 设置保留原文的近轮数 K（负数按 0 处理；运行期调用时自下一次 Settle 起按新值判定）：
-//   - K = 0：每轮结算后把全部近轮交给压缩；
-//   - K > 0：近轮累计达到 2K 轮时触发压缩，只压缩较早的轮次，最近 K 轮保持原文。
-//
+// SetKeepRecentTurns 设置压缩时保留原文的近轮数 K（负数按 0 处理；运行期调用时自下一次压缩起生效）。
+// 压缩取触发时刻近轮中除最近 K 轮以外的轮次；近轮不超过 K 轮时全部压缩。
 // 压缩以轮为单位切分，一轮内的工具调用与结果不会被拆开。
 func (w *Window) SetKeepRecentTurns(k int) {
 	if k < 0 {
@@ -98,9 +122,31 @@ func (w *Window) SetKeepRecentTurns(k int) {
 	w.mu.Unlock()
 }
 
-// dueLocked 报告近轮是否达到压缩触发条件（调用方持有 w.mu）：近轮数不少于 max(1, 2K)。
+// SetBudget 设置按上下文用量触发压缩的预算；自下一次 Settle 起生效。
+// 未设置（ContextWindow ≤ 0）时窗口不压缩。
+func (w *Window) SetBudget(b Budget) {
+	w.mu.Lock()
+	w.budget = b
+	w.mu.Unlock()
+}
+
+// dueLocked 报告是否满足压缩触发条件（调用方持有 w.mu）：
+// 有近轮可压缩，且剩余量（ContextWindow − used）低于 Reserve。
 func (w *Window) dueLocked() bool {
-	return len(w.recentTurns) >= max(1, 2*w.keepTurns)
+	b := w.budget
+	return b.ContextWindow > 0 && len(w.recentTurns) > 0 && b.ContextWindow-w.used < b.Reserve
+}
+
+// estimateLocked 按 budget.Count 估算当前上下文（system、记忆、在途与近轮）的 token 数（调用方持有 w.mu）。
+func (w *Window) estimateLocked() int {
+	ms := make([]message.Message, 0, len(w.memory)+len(w.inflight)+len(w.recent)+1)
+	if w.system != "" {
+		ms = append(ms, message.NewSystem(w.system))
+	}
+	ms = append(ms, w.memory...)
+	ms = append(ms, w.inflight...)
+	ms = append(ms, w.recent...)
+	return w.budget.count(ms)
 }
 
 // SetCompressor 热替换压缩策略（03 §5 组装层的零件位；配置点菜 / 网页面板）。
@@ -126,27 +172,60 @@ func (w *Window) SetCompressor(c Compressor) {
 //
 // inflight（正被压缩的消息）也参与组装：压缩在途时用户又说了话，
 // 那些消息必须仍在上下文里，否则会短暂失忆。
+//
+// 设置了 Budget 时，组装结果的估算超过 ContextWindow − MaxOutput 则从最早的原文
+// （inflight 与近轮）开始略去，直至不超过；只影响本次组装结果，窗口状态不变。
 func (w *Window) Assemble(input []message.Message) []message.Message {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	n := len(w.memory) + len(w.inflight) + len(w.recent) + len(input)
+	head := make([]message.Message, 0, len(w.memory)+1)
 	if w.system != "" {
-		n++
+		head = append(head, message.NewSystem(w.system))
 	}
-	out := make([]message.Message, 0, n)
-	if w.system != "" {
-		out = append(out, message.NewSystem(w.system))
-	}
-	out = append(out, cloneAll(w.memory)...)
-	out = append(out, cloneAll(w.inflight)...)
-	out = append(out, cloneAll(w.recent)...)
-	out = append(out, cloneAll(input)...)
-	return out
+	head = append(head, cloneAll(w.memory)...)
+	raw := append(cloneAll(w.inflight), cloneAll(w.recent)...)
+	tail := cloneAll(input)
+	raw = w.fitLocked(head, raw, tail)
+
+	out := make([]message.Message, 0, len(head)+len(raw)+len(tail))
+	out = append(out, head...)
+	out = append(out, raw...)
+	return append(out, tail...)
 }
 
-// Settle 在一轮结束后把本轮消息并入窗口并触发间隙压缩。
+// fitLocked 在组装结果超过硬上限（ContextWindow − MaxOutput）时略去 raw 开头的消息（调用方持有 w.mu）。
+// 略去后开头若是失去配对调用的工具结果，一并略去。head 与 tail 本身超限时不再处理，由 provider 报错。
+func (w *Window) fitLocked(head, raw, tail []message.Message) []message.Message {
+	b := w.budget
+	limit := b.ContextWindow - b.MaxOutput
+	if b.ContextWindow <= 0 || limit <= 0 || len(raw) == 0 {
+		return raw
+	}
+	fixed := b.count(head) + b.count(tail)
+	sizes := make([]int, len(raw))
+	total := fixed
+	for i := range raw {
+		sizes[i] = b.count(raw[i : i+1])
+		total += sizes[i]
+	}
+	if total <= limit {
+		return raw
+	}
+	drop := 0
+	for drop < len(raw) && (total > limit || raw[drop].Role == message.RoleTool) {
+		total -= sizes[drop]
+		drop++
+	}
+	w.log.Warn("window: assembled context over limit, oldest raw messages omitted",
+		"omitted", drop, "estimated_tokens", total, "limit", limit)
+	return raw[drop:]
+}
+
+// Settle 在一轮结束后把本轮消息并入窗口，上下文用量达到触发条件时启动间隙压缩。
+// used 是本轮结束时的上下文用量（最后一次请求的输入与输出 token 之和）；
+// ≤ 0 表示没有 usage，按 Budget.Count 估算。
 // 非阻塞：压缩在后台进行，下一轮组装不等待它（03 §5）。
-func (w *Window) Settle(ctx context.Context, turn []message.Message) {
+func (w *Window) Settle(ctx context.Context, turn []message.Message, used int) {
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
@@ -155,17 +234,24 @@ func (w *Window) Settle(ctx context.Context, turn []message.Message) {
 	w.recent = append(w.recent, cloneAll(turn)...)
 	w.recentTurns = append(w.recentTurns, len(turn))
 	if w.compressing {
-		// 压缩在途：只标脏。当前这轮压完后会用最新内容再压一次，
-		// 期间多次 Settle 被合并（避免并发压缩互相覆盖）。记下触发本批的
-		// ctx——下一轮压缩的身份（Scope/凭据/参数）属于这批内容的主人，
-		// 不能沿用上一轮的（2026-09-28 审查：B 的内容曾以 A 的 UserID 压缩）。
+		// 压缩在途：本轮不计入在途压缩的保留量 K，原文保留；压缩完成后按完成时的
+		// 估算用量重新判定。记下触发本批的 ctx——下一次压缩的身份（Scope/凭据/参数）
+		// 属于这批内容的主人，不能沿用上一轮的（2026-09-28 审查：B 的内容曾以 A 的 UserID 压缩）。
 		if w.pendingCtx == nil && ctx != nil {
 			w.pendingCtx = ctx
 		}
 		w.mu.Unlock()
 		return
 	}
-	if !w.dueLocked() { // 近轮未达到 2K 轮：继续以原文参与组装
+	switch {
+	case w.budget.ContextWindow <= 0:
+		w.used = 0
+	case used > 0:
+		w.used = used
+	default:
+		w.used = w.estimateLocked()
+	}
+	if !w.dueLocked() { // 剩余量不低于预留量：继续以原文参与组装
 		w.mu.Unlock()
 		return
 	}
@@ -198,9 +284,12 @@ func (w *Window) compress(ctx context.Context) {
 			cctx, cancel := context.WithCancel(ctxx.Detached(ctx))
 			ctx, w.cancel = cctx, cancel
 		}
-		// 只取较早的轮次：保留最近 keepTurns 轮原文。触发时 dueLocked 保证 cutTurns ≥ 1；
-		// SetKeepRecentTurns 在触发与快照之间调大 K 时按 0 截取。
-		cutTurns := max(len(w.recentTurns)-w.keepTurns, 0)
+		// 只取较早的轮次：保留最近 keepTurns 轮原文；近轮不超过 K 轮时全部压缩
+		// （最近 K 轮本身使用量超出预留量的情形）。
+		cutTurns := len(w.recentTurns) - w.keepTurns
+		if cutTurns <= 0 {
+			cutTurns = len(w.recentTurns)
+		}
 		cut := 0
 		for _, n := range w.recentTurns[:cutTurns] {
 			cut += n
@@ -243,9 +332,13 @@ func (w *Window) compress(ctx context.Context) {
 			w.memory = cloneAll(out) // 不持有 Compressor 的切片
 		}
 		w.inflight = nil
-		// 切分后近轮恰为 K 轮：只有压缩期间的新结算能使近轮再次达到触发条件，此时继续压缩；
-		// 否则结束，待压缩批次的 ctx 一并清除，下一次由触发压缩的 Settle 提供 ctx。
-		done := w.closed || !w.dueLocked()
+		// 成功：按压缩后的内容重新估算用量，仍满足触发条件（近轮仍过长，或压缩期间又有新结算）
+		// 时继续压缩。失败：结束，由下一次 Settle 重新判定，不在此处连续重试。
+		// 结束时待压缩批次的 ctx 一并清除，下一次由触发压缩的 Settle 提供 ctx。
+		if err == nil && w.budget.ContextWindow > 0 {
+			w.used = w.estimateLocked()
+		}
+		done := w.closed || err != nil || !w.dueLocked()
 		if done {
 			w.pendingCtx = nil
 			w.compressing = false

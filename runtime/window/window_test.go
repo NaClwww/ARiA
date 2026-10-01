@@ -19,6 +19,17 @@ import (
 
 func quiet() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
+// eager 是每次结算都满足压缩触发条件的预算：估算用量恒为 2，剩余量恒为负；
+// MaxOutput 等于 ContextWindow 使组装不截断。用于逐轮压缩语义的测试。
+var eager = Budget{ContextWindow: 1, MaxOutput: 1, Reserve: 2, Count: func([]message.Message) int { return 2 }}
+
+// eagerWin 构造设置了 eager 预算的窗口。
+func eagerWin(c Compressor) *Window {
+	w := New(c, quiet())
+	w.SetBudget(eager)
+	return w
+}
+
 func texts(msgs []message.Message) []string {
 	out := make([]string, 0, len(msgs))
 	for _, m := range msgs {
@@ -61,8 +72,8 @@ func TestAssembleComposesMemoryRecentInput(t *testing.T) {
 // 轮后结算：本轮消息进近轮，且触发异步压缩。
 func TestSettleCompressesInBackground(t *testing.T) {
 	c := &recordingCompressor{out: []message.Message{message.NewSystem("摘要")}}
-	w := New(c, quiet())
-	w.Settle(context.Background(), []message.Message{message.NewUser("第一轮")})
+	w := eagerWin(c)
+	w.Settle(context.Background(), []message.Message{message.NewUser("第一轮")}, 0)
 	w.Wait()
 
 	if _, recent := w.Snapshot(); len(recent) != 0 {
@@ -81,8 +92,8 @@ func TestSettleCompressesInBackground(t *testing.T) {
 func TestAssembleDoesNotWaitForCompression(t *testing.T) {
 	gate := make(chan struct{})
 	c := &blockingCompressor{gate: gate, entered: make(chan struct{}, 1), out: []message.Message{message.NewSystem("摘要")}}
-	w := New(c, quiet())
-	w.Settle(context.Background(), []message.Message{message.NewUser("正在压缩")})
+	w := eagerWin(c)
+	w.Settle(context.Background(), []message.Message{message.NewUser("正在压缩")}, 0)
 
 	done := make(chan []message.Message, 1)
 	go func() { done <- w.Assemble([]message.Message{message.NewUser("新输入")}) }()
@@ -102,12 +113,12 @@ func TestAssembleDoesNotWaitForCompression(t *testing.T) {
 func TestSettleCoalescesWhileCompressing(t *testing.T) {
 	gate := make(chan struct{})
 	c := &blockingCompressor{gate: gate, entered: make(chan struct{}, 1), out: []message.Message{message.NewSystem("摘要")}}
-	w := New(c, quiet())
+	w := eagerWin(c)
 
-	w.Settle(context.Background(), []message.Message{message.NewUser("第一轮")})
+	w.Settle(context.Background(), []message.Message{message.NewUser("第一轮")}, 0)
 	<-c.entered // 确保第一轮压缩已在途，后两次才会被合并
-	w.Settle(context.Background(), []message.Message{message.NewUser("第二轮")})
-	w.Settle(context.Background(), []message.Message{message.NewUser("第三轮")})
+	w.Settle(context.Background(), []message.Message{message.NewUser("第二轮")}, 0)
+	w.Settle(context.Background(), []message.Message{message.NewUser("第三轮")}, 0)
 	close(gate)
 	w.Wait()
 
@@ -124,8 +135,8 @@ func TestSettleCoalescesWhileCompressing(t *testing.T) {
 // 压缩失败不丢内容：退回未压缩形态继续累积。
 func TestCompressFailureKeepsMessages(t *testing.T) {
 	c := &recordingCompressor{err: errors.New("boom")}
-	w := New(c, quiet())
-	w.Settle(context.Background(), []message.Message{message.NewUser("不能丢")})
+	w := eagerWin(c)
+	w.Settle(context.Background(), []message.Message{message.NewUser("不能丢")}, 0)
 	w.Wait()
 
 	mem, _ := w.Snapshot()
@@ -169,7 +180,7 @@ func TestKeepLastKeepsToolGroupsIntact(t *testing.T) {
 
 // 压缩失败的兜底裁剪同样不拆散工具调用组。
 func TestFallbackTrimKeepsToolGroupsIntact(t *testing.T) {
-	w := New(&recordingCompressor{err: errors.New("boom")}, quiet())
+	w := eagerWin(&recordingCompressor{err: errors.New("boom")})
 	w.fallbackCap = 3
 	w.mu.Lock()
 	w.memory = []message.Message{
@@ -182,7 +193,7 @@ func TestFallbackTrimKeepsToolGroupsIntact(t *testing.T) {
 	}
 	w.mu.Unlock()
 
-	w.Settle(context.Background(), []message.Message{message.NewUser("q2"), message.NewAssistant("a2")})
+	w.Settle(context.Background(), []message.Message{message.NewUser("q2"), message.NewAssistant("a2")}, 0)
 	w.Wait()
 
 	// memory+turn 共 6 条 > cap 3：切点落在组内，向后扩到配对 assistant，
@@ -229,17 +240,17 @@ func TestTrimKeepLastPassesGarbageThrough(t *testing.T) {
 // ctx，B 的内容曾以 A 的 UserID 被压缩。
 func TestPendingBatchCompressesWithItsOwnCtx(t *testing.T) {
 	c := &gatedCtxCompressor{gate: make(chan struct{}), entered: make(chan struct{}, 1)}
-	w := New(c, quiet())
+	w := eagerWin(c)
 
 	ctxA := ctxx.WithScope(context.Background(), ctxx.Scope{SessionID: "s", UserID: "A"})
 	ctxB := ctxx.WithScope(context.Background(), ctxx.Scope{SessionID: "s", UserID: "B"})
-	w.Settle(ctxA, []message.Message{message.NewUser("a")})
+	w.Settle(ctxA, []message.Message{message.NewUser("a")}, 0)
 	select { // 确认第一轮压缩已在途，B 的 Settle 才会走 pending 路径
 	case <-c.entered:
 	case <-time.After(3 * time.Second):
 		t.Fatal("第一轮压缩未启动")
 	}
-	w.Settle(ctxB, []message.Message{message.NewUser("b")})
+	w.Settle(ctxB, []message.Message{message.NewUser("b")}, 0)
 	close(c.gate) // 放行第一轮；pending 的 b 批触发第二轮
 	w.Wait()
 
@@ -284,9 +295,9 @@ func (c *gatedCtxCompressor) recorded() []context.Context {
 
 // 默认兜底：不传 Compressor 时窗口有界。
 func TestDefaultKeepLastBoundsWindow(t *testing.T) {
-	w := New(nil, quiet())
+	w := eagerWin(nil)
 	for i := 0; i < DefaultKeepLast+10; i++ {
-		w.Settle(context.Background(), []message.Message{message.NewUser(string(rune('a' + i%26)))})
+		w.Settle(context.Background(), []message.Message{message.NewUser(string(rune('a' + i%26)))}, 0)
 	}
 	w.Wait()
 	mem, recent := w.Snapshot()
@@ -413,9 +424,9 @@ func TestProviderCompressorTruncatesLongArgs(t *testing.T) {
 // （03 §5）。指令不是对话内容，摘要模型看不到也不该看到。
 func TestSystemNeverEntersCompression(t *testing.T) {
 	c := &recordingCompressor{out: []message.Message{MemoryMessage("概要")}}
-	w := New(c, quiet())
+	w := eagerWin(c)
 	w.SetSystem("人设指令：你是 ARiA")
-	w.Settle(context.Background(), []message.Message{message.NewUser("你好")})
+	w.Settle(context.Background(), []message.Message{message.NewUser("你好")}, 0)
 	w.Wait()
 
 	for _, s := range c.seen() {
@@ -431,6 +442,7 @@ func TestSystemNeverEntersCompression(t *testing.T) {
 
 // recordingProvider 记下一次请求并回一条定稿摘要（单 goroutine 用，无锁）。
 type recordingProvider struct {
+	provider.NoLimits
 	req provider.Request
 }
 
@@ -446,20 +458,28 @@ func (p *recordingProvider) Stream(_ context.Context, req provider.Request) (<-c
 // ---------- 测试替身 ----------
 
 type recordingCompressor struct {
-	mu  sync.Mutex
-	got []string
-	out []message.Message
-	err error
+	mu    sync.Mutex
+	got   []string
+	calls int
+	out   []message.Message
+	err   error
 }
 
 func (c *recordingCompressor) Compress(_ context.Context, memory, turn []message.Message) ([]message.Message, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.calls++
 	c.got = append(c.got, texts(append(cloneAll(memory), turn...))...)
 	if c.err != nil {
 		return nil, c.err
 	}
 	return cloneAll(c.out), nil
+}
+
+func (c *recordingCompressor) callCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
 }
 
 func (c *recordingCompressor) seen() []string {
@@ -498,8 +518,8 @@ func (c *blockingCompressor) allSeen() [][]string {
 
 // 压缩输出为空按失败处理：绝不能静默清空已结算内容。
 func TestEmptyCompressorOutputFallsBack(t *testing.T) {
-	w := New(nilCompressor{}, quiet())
-	w.Settle(context.Background(), []message.Message{message.NewUser("必须留下")})
+	w := eagerWin(nilCompressor{})
+	w.Settle(context.Background(), []message.Message{message.NewUser("必须留下")}, 0)
 	w.Wait()
 
 	mem, recent := w.Snapshot()
@@ -512,10 +532,10 @@ func TestEmptyCompressorOutputFallsBack(t *testing.T) {
 // 窗口必须把它当失败退回，而不是清空历史。
 func TestProviderCompressorEmptyTextTurnKeepsMessages(t *testing.T) {
 	fake := provider.NewFake(provider.FakeStep{Text: []string{"不应被调用"}})
-	w := New(&ProviderCompressor{Provider: fake}, quiet())
+	w := eagerWin(&ProviderCompressor{Provider: fake})
 	w.Settle(context.Background(), []message.Message{{Role: message.RoleUser, Blocks: []message.Block{
 		message.ImageBlock{MIME: "image/jpeg", Data: []byte{1, 2, 3}},
-	}}})
+	}}}, 0)
 	w.Wait()
 
 	mem, recent := w.Snapshot()
@@ -527,8 +547,8 @@ func TestProviderCompressorEmptyTextTurnKeepsMessages(t *testing.T) {
 // Close 能取消在途压缩（压缩实现尊重 ctx 时不得无限等待）。
 func TestCloseCancelsInFlightCompression(t *testing.T) {
 	c := &ctxBlockingCompressor{entered: make(chan struct{})}
-	w := New(c, quiet())
-	w.Settle(context.Background(), []message.Message{message.NewUser("压缩中")})
+	w := eagerWin(c)
+	w.Settle(context.Background(), []message.Message{message.NewUser("压缩中")}, 0)
 	<-c.entered
 
 	done := make(chan struct{})
@@ -542,12 +562,12 @@ func TestCloseCancelsInFlightCompression(t *testing.T) {
 
 // 压缩持续失败时的原始回退有上限（防止无界增长）。
 func TestFallbackCapBoundsRepeatedFailures(t *testing.T) {
-	w := New(&recordingCompressor{err: errors.New("boom")}, quiet())
+	w := eagerWin(&recordingCompressor{err: errors.New("boom")})
 	big := make([]message.Message, 0, defaultFallbackCap*3)
 	for i := 0; i < defaultFallbackCap*3; i++ {
 		big = append(big, message.NewUser("m"))
 	}
-	w.Settle(context.Background(), big)
+	w.Settle(context.Background(), big, 0)
 	w.Wait()
 
 	mem, recent := w.Snapshot()
@@ -560,8 +580,8 @@ func TestFallbackCapBoundsRepeatedFailures(t *testing.T) {
 func TestCompressorNeverSeesWindowInternals(t *testing.T) {
 	c := &recordingCompressor{out: []message.Message{}}
 	c.out = []message.Message{message.NewSystem("概要")}
-	w := New(c, quiet())
-	w.Settle(context.Background(), []message.Message{message.NewUser("第一次")})
+	w := eagerWin(c)
+	w.Settle(context.Background(), []message.Message{message.NewUser("第一次")}, 0)
 	w.Wait()
 
 	// Compressor 收到的 messages 必须是副本：改写不影响窗口
@@ -680,9 +700,9 @@ func TestAssembleOrderWithSystemAndMemory(t *testing.T) {
 func TestSetCompressorSwapsBetweenGaps(t *testing.T) {
 	gate := make(chan struct{})
 	old := &blockingCompressor{gate: gate, entered: make(chan struct{}, 1), out: []message.Message{message.NewUser("旧策略结果")}}
-	w := New(old, quiet())
+	w := eagerWin(old)
 
-	w.Settle(context.Background(), []message.Message{message.NewUser("第一轮")})
+	w.Settle(context.Background(), []message.Message{message.NewUser("第一轮")}, 0)
 	select {
 	case <-old.entered: // 旧策略已在途
 	case <-time.After(2 * time.Second):
@@ -704,7 +724,7 @@ func TestSetCompressorSwapsBetweenGaps(t *testing.T) {
 
 	// 下一个间隙：新策略（KeepLast(1)）生效——只留最近 1 条。
 	w.SetCompressor(KeepLast(1))
-	w.Settle(context.Background(), []message.Message{message.NewUser("第二轮A"), message.NewUser("第二轮B")})
+	w.Settle(context.Background(), []message.Message{message.NewUser("第二轮A"), message.NewUser("第二轮B")}, 0)
 	w.Wait()
 
 	mem, _ = w.Snapshot()
@@ -715,10 +735,10 @@ func TestSetCompressorSwapsBetweenGaps(t *testing.T) {
 
 // SetCompressor(nil) 与 New(nil) 一致：退化为 KeepLast(默认条数)。
 func TestSetCompressorNilFallsBackToKeepLast(t *testing.T) {
-	w := New(nilCompressor{}, quiet())
+	w := eagerWin(nilCompressor{})
 	w.SetCompressor(nil)
 
-	w.Settle(context.Background(), []message.Message{message.NewUser("留着")})
+	w.Settle(context.Background(), []message.Message{message.NewUser("留着")}, 0)
 	w.Wait()
 
 	mem, _ := w.Snapshot()
@@ -731,7 +751,7 @@ func TestSetCompressorNilFallsBackToKeepLast(t *testing.T) {
 func TestSetCompressorConcurrentWithCompression(t *testing.T) {
 	gate := make(chan struct{})
 	bc := &blockingCompressor{gate: gate, entered: make(chan struct{}, 1), out: []message.Message{message.NewUser("x")}}
-	w := New(bc, quiet())
+	w := eagerWin(bc)
 
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
@@ -741,7 +761,7 @@ func TestSetCompressorConcurrentWithCompression(t *testing.T) {
 			if i%2 == 0 {
 				w.SetCompressor(KeepLast(i + 1))
 			} else {
-				w.Settle(context.Background(), []message.Message{message.NewUser("轮")})
+				w.Settle(context.Background(), []message.Message{message.NewUser("轮")}, 0)
 			}
 		}(i)
 	}
@@ -762,7 +782,7 @@ func containsText(ms []message.Message, want string) bool {
 // Wait 与 Settle 并发不得 panic（旧实现用 sync.WaitGroup：Add 与 Wait 交错会
 // 触发「WaitGroup is reused before previous Wait has returned」进程级崩溃）。
 func TestWaitConcurrentWithSettle(t *testing.T) {
-	w := New(KeepLast(10), quiet())
+	w := eagerWin(KeepLast(10))
 
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
@@ -784,7 +804,7 @@ func TestWaitConcurrentWithSettle(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 50; j++ {
-				w.Settle(context.Background(), []message.Message{message.NewUser("轮")})
+				w.Settle(context.Background(), []message.Message{message.NewUser("轮")}, 0)
 			}
 		}()
 	}
@@ -803,9 +823,9 @@ func TestOnCompressReportsSuccessAndFailure(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	c := &recordingCompressor{out: []message.Message{message.NewSystem("摘要")}}
-	w := New(c, quiet())
+	w := eagerWin(c)
 	w.SetOnCompress(func(r loop.WindowCompressedData) { got = r; wg.Done() })
-	w.Settle(context.Background(), []message.Message{message.NewUser("第一轮")})
+	w.Settle(context.Background(), []message.Message{message.NewUser("第一轮")}, 0)
 	w.Wait()
 	wg.Wait()
 	if got.Err != "" || got.InMessages != 1 || got.OutMessages != 1 || got.InChars != 3 || got.OutChars != 2 {
@@ -815,9 +835,9 @@ func TestOnCompressReportsSuccessAndFailure(t *testing.T) {
 	// 失败：Err 在场，退回后 Out=原输入规模。
 	wg.Add(1)
 	c2 := &recordingCompressor{err: errors.New("boom")}
-	w2 := New(c2, quiet())
+	w2 := eagerWin(c2)
 	w2.SetOnCompress(func(r loop.WindowCompressedData) { got = r; wg.Done() })
-	w2.Settle(context.Background(), []message.Message{message.NewUser("话")})
+	w2.Settle(context.Background(), []message.Message{message.NewUser("话")}, 0)
 	w2.Wait()
 	wg.Wait()
 	if got.Err == "" || got.InMessages != 1 || got.OutMessages != 1 {
@@ -825,26 +845,56 @@ func TestOnCompressReportsSuccessAndFailure(t *testing.T) {
 	}
 }
 
-// ---------- 保留近轮原文（SetKeepRecentTurns） ----------
+// ---------- 按上下文用量触发压缩（Budget）与保留近轮（SetKeepRecentTurns） ----------
 
 func qaTurn(n string) []message.Message {
 	return []message.Message{message.NewUser("问" + n), message.NewAssistant("答" + n)}
 }
 
-// K=2：前 3 轮结算不触发压缩；第 4 轮结算后只压缩较早的 2 轮，最近 2 轮保持原文，
+// perMsg 是每条消息计 10 token 的估算（测试用确定值）。
+func perMsg(ms []message.Message) int { return 10 * len(ms) }
+
+// 剩余量不低于预留量时不压缩，近轮全部以原文参与组装。
+func TestBudgetAboveReserveKeepsRaw(t *testing.T) {
+	rc := &recordingCompressor{out: []message.Message{message.NewUser("摘要")}}
+	w := New(rc, quiet())
+	w.SetBudget(Budget{ContextWindow: 1000, MaxOutput: 100, Reserve: 200, Count: perMsg})
+	for _, n := range []string{"1", "2", "3"} {
+		w.Settle(context.Background(), qaTurn(n), 100)
+		w.Wait()
+	}
+	if n := rc.callCount(); n != 0 {
+		t.Fatalf("剩余 900 ≥ 预留 200，不应压缩，实际 %d 次", n)
+	}
+	if got := len(w.Assemble(nil)); got != 6 {
+		t.Fatalf("应保留 6 条原文，实际 %d", got)
+	}
+}
+
+// 未设置预算（窗口未知）时任何用量都不压缩。
+func TestNoBudgetNeverCompresses(t *testing.T) {
+	rc := &recordingCompressor{out: []message.Message{message.NewUser("摘要")}}
+	w := New(rc, quiet())
+	for _, n := range []string{"1", "2", "3"} {
+		w.Settle(context.Background(), qaTurn(n), 1_000_000)
+		w.Wait()
+	}
+	if n := rc.callCount(); n != 0 {
+		t.Fatalf("未设置预算不应压缩，实际 %d 次", n)
+	}
+}
+
+// K=2：剩余量低于预留量时只压缩较早的轮次，最近 2 轮保持原文；
 // 组装顺序为 记忆 → 近轮原文 → 新输入。
-func TestKeepRecentTurnsCompressesOnlyOlderTurns(t *testing.T) {
+func TestBudgetCompressesAllButRecentK(t *testing.T) {
 	rc := &recordingCompressor{out: []message.Message{message.NewUser("摘要")}}
 	w := New(rc, quiet())
 	w.SetKeepRecentTurns(2)
+	w.SetBudget(Budget{ContextWindow: 1000, MaxOutput: 100, Reserve: 200, Count: perMsg})
 	for _, n := range []string{"1", "2", "3"} {
-		w.Settle(context.Background(), qaTurn(n))
-		w.Wait()
+		w.Settle(context.Background(), qaTurn(n), 100)
 	}
-	if got := rc.seen(); len(got) != 0 {
-		t.Fatalf("近轮未达到 4 轮不应压缩，压缩器收到 %v", got)
-	}
-	w.Settle(context.Background(), qaTurn("4"))
+	w.Settle(context.Background(), qaTurn("4"), 850) // 剩余 150 < 预留 200
 	w.Wait()
 	wantSeen := []string{"user:问1", "assistant:答1", "user:问2", "assistant:答2"}
 	if got := rc.seen(); !equal(got, wantSeen) {
@@ -857,53 +907,129 @@ func TestKeepRecentTurnsCompressesOnlyOlderTurns(t *testing.T) {
 	}
 }
 
-// K=1：压缩在途时到达的结算使近轮再次达到 2K 轮，压缩结束后按新的切分继续压缩。
-func TestKeepRecentTurnsPendingBatchDue(t *testing.T) {
+// K=1：A、B、C 结算后触发，压缩 A、B，保留 C；压缩进行中结算的 D 不计入 K、
+// 不参与本次压缩，完成后窗口为 摘要 + C + D（压缩后估算用量未达到触发条件，不再压缩）。
+func TestTurnsSettledDuringCompactionKeptAndNotCounted(t *testing.T) {
 	bc := &blockingCompressor{gate: make(chan struct{}), entered: make(chan struct{}, 1),
 		out: []message.Message{message.NewUser("摘要")}}
 	w := New(bc, quiet())
 	w.SetKeepRecentTurns(1)
+	w.SetBudget(Budget{ContextWindow: 1000, MaxOutput: 100, Reserve: 200, Count: perMsg})
 	ctx := context.Background()
-	w.Settle(ctx, qaTurn("1")) // 1 轮：不触发
-	w.Settle(ctx, qaTurn("2")) // 2 轮：压缩第 1 轮
+	w.Settle(ctx, qaTurn("A"), 100)
+	w.Settle(ctx, qaTurn("B"), 100)
+	w.Settle(ctx, qaTurn("C"), 900) // 剩余 100 < 预留 200：压缩 A、B
 	<-bc.entered
-	w.Settle(ctx, qaTurn("3")) // 压缩在途：标记待压缩
+	w.Settle(ctx, qaTurn("D"), 950) // 压缩进行中：D 保留原文
 	close(bc.gate)
 	w.Wait()
 
 	passes := bc.allSeen()
-	if len(passes) != 2 || !equal(passes[0], []string{"user:问1", "assistant:答1"}) ||
-		!equal(passes[1], []string{"user:问2", "assistant:答2"}) {
+	if len(passes) != 1 || !equal(passes[0], []string{"user:问A", "assistant:答A", "user:问B", "assistant:答B"}) {
 		t.Fatalf("压缩批次不符：%v", passes)
 	}
 	got := texts(w.Assemble(nil))
-	want := []string{"user:摘要", "user:问3", "assistant:答3"}
+	want := []string{"user:摘要", "user:问C", "assistant:答C", "user:问D", "assistant:答D"}
 	if !equal(got, want) {
 		t.Fatalf("assemble: want %v got %v", want, got)
 	}
 }
 
-// K=2：压缩在途时到达的结算未使近轮达到 2K 轮，压缩结束后不再继续，近轮保持原文。
-func TestKeepRecentTurnsPendingBatchNotDue(t *testing.T) {
-	bc := &blockingCompressor{gate: make(chan struct{}), entered: make(chan struct{}, 1),
-		out: []message.Message{message.NewUser("摘要")}}
-	w := New(bc, quiet())
+// 近轮不超过 K 轮时满足触发条件：全部压缩。
+func TestBudgetRecentWithinKCompressedWhenDue(t *testing.T) {
+	rc := &recordingCompressor{out: []message.Message{message.NewUser("摘要")}}
+	w := New(rc, quiet())
 	w.SetKeepRecentTurns(2)
-	ctx := context.Background()
-	for _, n := range []string{"1", "2", "3", "4"} {
-		w.Settle(ctx, qaTurn(n))
-	}
-	<-bc.entered
-	w.Settle(ctx, qaTurn("5")) // 压缩在途：近轮为 3、4、5 共 3 轮，未达到 4 轮
-	close(bc.gate)
+	w.SetBudget(Budget{ContextWindow: 1000, MaxOutput: 100, Reserve: 200, Count: perMsg})
+	w.Settle(context.Background(), qaTurn("1"), 100)
+	w.Settle(context.Background(), qaTurn("2"), 900)
 	w.Wait()
-
-	if passes := bc.allSeen(); len(passes) != 1 {
-		t.Fatalf("应只压缩一次：%v", passes)
+	want := []string{"user:问1", "assistant:答1", "user:问2", "assistant:答2"}
+	if got := rc.seen(); !equal(got, want) {
+		t.Fatalf("应全部压缩：want %v got %v", want, got)
 	}
-	got := texts(w.Assemble(nil))
-	want := []string{"user:摘要", "user:问3", "assistant:答3", "user:问4", "assistant:答4", "user:问5", "assistant:答5"}
-	if !equal(got, want) {
-		t.Fatalf("assemble: want %v got %v", want, got)
+	if got := texts(w.Assemble(nil)); !equal(got, []string{"user:摘要"}) {
+		t.Fatalf("assemble: got %v", got)
+	}
+}
+
+// 压缩后估算用量仍满足触发条件时继续压缩剩余近轮。
+func TestBudgetStillDueAfterCompressionCompressesAgain(t *testing.T) {
+	big := func(ms []message.Message) int {
+		n := 0
+		for _, m := range ms {
+			if m.Text() == "大摘要" {
+				n += 900
+			} else {
+				n += 10
+			}
+		}
+		return n
+	}
+	rc := &recordingCompressor{out: []message.Message{message.NewUser("大摘要")}}
+	w := New(rc, quiet())
+	w.SetKeepRecentTurns(1)
+	w.SetBudget(Budget{ContextWindow: 1000, MaxOutput: 100, Reserve: 200, Count: big})
+	w.Settle(context.Background(), qaTurn("1"), 100)
+	w.Settle(context.Background(), qaTurn("2"), 900)
+	w.Wait()
+	if n := rc.callCount(); n != 2 {
+		t.Fatalf("压缩后估算 920 仍超出，应再压缩一次，实际 %d 次", n)
+	}
+	if got := texts(w.Assemble(nil)); !equal(got, []string{"user:大摘要"}) {
+		t.Fatalf("assemble: got %v", got)
+	}
+}
+
+// 压缩失败后不在压缩循环内重试，由下一次结算重新判定。
+func TestBudgetCompressFailureNotRetriedImmediately(t *testing.T) {
+	rc := &recordingCompressor{err: errors.New("boom")}
+	w := eagerWin(rc)
+	w.Settle(context.Background(), []message.Message{message.NewUser("话")}, 0)
+	w.Wait()
+	if n := rc.callCount(); n != 1 {
+		t.Fatalf("失败后应只调用 1 次，实际 %d 次", n)
+	}
+}
+
+// 无 usage（used ≤ 0）时按 Count 估算用量：第 1 轮估算 20、剩余 80 不触发，
+// 第 2 轮估算 40、剩余 60 低于预留 70 触发。
+func TestSettleEstimatesWhenNoUsage(t *testing.T) {
+	rc := &recordingCompressor{out: []message.Message{message.NewUser("摘要")}}
+	w := New(rc, quiet())
+	w.SetBudget(Budget{ContextWindow: 100, MaxOutput: 10, Reserve: 70, Count: perMsg})
+	w.Settle(context.Background(), qaTurn("1"), 0)
+	w.Wait()
+	if n := rc.callCount(); n != 0 {
+		t.Fatalf("第 1 轮不应压缩，实际 %d 次", n)
+	}
+	w.Settle(context.Background(), qaTurn("2"), 0)
+	w.Wait()
+	if n := rc.callCount(); n != 1 {
+		t.Fatalf("第 2 轮应压缩 1 次，实际 %d 次", n)
+	}
+}
+
+// 组装估算超过 ContextWindow − MaxOutput 时从最早的原文开始略去，失去配对调用的
+// 工具结果一并略去；窗口状态不变。
+func TestAssembleOmitsOldestRawOverLimit(t *testing.T) {
+	w := New(nil, quiet())
+	w.SetBudget(Budget{ContextWindow: 100, MaxOutput: 50, Reserve: 0, Count: perMsg}) // 硬上限 50
+	call := message.ToolCall{ID: "c1", Name: "now"}
+	turn := []message.Message{
+		message.NewUser("问1"),
+		{Role: message.RoleAssistant, ToolCalls: []message.ToolCall{call}},
+		{Role: message.RoleTool, ToolCallID: "c1", Blocks: []message.Block{message.TextBlock{Text: "结果"}}},
+		message.NewAssistant("答1"),
+	}
+	w.Settle(context.Background(), turn, 0)
+	w.Settle(context.Background(), qaTurn("2"), 0)
+	// 估算 70 > 50：略去 问1 与工具调用后为 50，开头的工具结果失去配对调用，一并略去。
+	got := w.Assemble([]message.Message{message.NewUser("新输入")})
+	if len(got) != 4 || got[0].Text() != "答1" || got[len(got)-1].Text() != "新输入" {
+		t.Fatalf("应略去 问1、工具调用与其结果：got %v", texts(got))
+	}
+	if _, recent := w.Snapshot(); len(recent) != 6 {
+		t.Fatalf("窗口状态不应改变，近轮应为 6 条，实际 %d", len(recent))
 	}
 }

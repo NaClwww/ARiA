@@ -657,6 +657,7 @@ func TestInterruptCancelsGuard(t *testing.T) {
 }
 
 type requestProbe struct {
+	provider.NoLimits
 	requests []provider.Request
 	contexts []context.Context
 	calls    int
@@ -775,6 +776,9 @@ func probeFunc(fn func(context.Context, provider.Request) (<-chan provider.Strea
 }
 
 type probeFuncT func(context.Context, provider.Request) (<-chan provider.StreamEvent, error)
+
+func (probeFuncT) Limits(string) provider.Limits             { return provider.Limits{} }
+func (probeFuncT) CountTokens(string, []message.Message) int { return -1 }
 
 func (f probeFuncT) Stream(ctx context.Context, req provider.Request) (<-chan provider.StreamEvent, error) {
 	return f(ctx, req)

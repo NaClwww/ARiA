@@ -67,4 +67,12 @@ type Provider interface {
 	// 收尾返回已收内容，不得只回 error。通道关闭前必须恰好一个 MessageComplete
 	// 或至少一个 ErrorEvent。
 	Stream(ctx context.Context, req Request) (<-chan StreamEvent, error)
+
+	// Limits 报告 model 的上下文窗口与缺省输出上限；model 为空指适配器的默认模型。
+	// 未知模型返回零值，调用方据此不按上下文用量触发压缩。
+	Limits(model string) Limits
+
+	// CountTokens 估算 msgs 作为 model 的输入时的 token 数（无 usage 时用于判定上下文用量）；
+	// 返回负数表示不提供估算，调用方改用 EstimateTokens。
+	CountTokens(model string, msgs []message.Message) int
 }

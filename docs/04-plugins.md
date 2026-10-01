@@ -3,11 +3,11 @@
 > 实现 core/runtime 暴露的契约；不反向依赖 runtime 内部；装配只发生在库的唯一 Setup 函数（§5）。
 > 「插件」= Go 接口 + 编译期注册（代码解耦）；跨语言/运行时热插拔二期经 MCP 或 gRPC 子进程。
 
-## 1. 契约一览（全部只有 5 个接口、10 个方法）
+## 1. 契约一览（全部只有 5 个接口、12 个方法）
 
 | 契约 | 定义 | 引入 | 实现（本文） |
 |---|---|---|---|
-| `Provider.Stream(ctx, req)` | core/02 §5 | M1 | §2 各家适配器 |
+| `Provider.Stream(ctx, req)` / `Limits(model)` / `CountTokens(model, msgs)` | core/02 §5 | M1（Limits / CountTokens 2026-10-01） | §2 各家适配器 |
 | `Tool.Def/Exec` | core/02 §5 | M1 | §3 内置工具 |
 | `Assembler.Assemble` | core/02 §4 | M1 | 恒等兜底；runtime/window 每轮组装（03 §5）在 core 槽 1 上折叠 |
 | `ToolSource.Name/Tools/Close` | 本文 §3 | M2 | §3 工具源；MCP 桥（M4）= 一种 ToolSource，实现时再细化 |

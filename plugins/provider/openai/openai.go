@@ -29,6 +29,11 @@ type Config struct {
 	CredName string // ctxx.CredentialFrom 的键，默认 "openai"
 	Model    string // 默认模型；Request.Options.Model 可覆盖
 	HTTP     *http.Client
+
+	// ContextWindow / MaxOutput 是模型限额（OpenAI 兼容端点的模型各异，不内置限额表）；
+	// 0 = 未知，Limits 返回零值，调用方不按上下文用量触发压缩。对所有模型名相同。
+	ContextWindow int
+	MaxOutput     int
 }
 
 type Adapter struct {
@@ -49,6 +54,14 @@ func New(cfg Config) *Adapter {
 	}
 	return &Adapter{cfg: cfg, hc: hc}
 }
+
+// Limits 返回 Config 中配置的限额（与 model 无关）。
+func (a *Adapter) Limits(string) provider.Limits {
+	return provider.Limits{ContextWindow: a.cfg.ContextWindow, MaxOutput: a.cfg.MaxOutput}
+}
+
+// CountTokens 不提供估算：同构端点的分词各异，调用方改用 provider.EstimateTokens。
+func (a *Adapter) CountTokens(string, []message.Message) int { return -1 }
 
 // Stream 发起流式 chat/completions 并把 SSE 分片翻译为 provider 事件。
 func (a *Adapter) Stream(ctx context.Context, req provider.Request) (<-chan provider.StreamEvent, error) {

@@ -11,6 +11,7 @@ import (
 
 	"aria/core/provider"
 	"aria/internal/config"
+	"aria/runtime/agent"
 	"aria/runtime/window"
 )
 
@@ -41,5 +42,15 @@ func Compressor(cfg config.Config, prov provider.Provider) (window.Compressor, e
 		return window.KeepLast(n), nil
 	default:
 		return nil, fmt.Errorf("未知压缩策略 %q（可选：%v）", name, CompressorNames())
+	}
+}
+
+// CompactBudget 把配置的压缩预留策略翻成 agent.CompactBudget（两个宿主的 agent.Config
+// 与配置重载共用）。
+func CompactBudget(c config.Compress) agent.CompactBudget {
+	return agent.CompactBudget{
+		ReserveRatio:      c.ReserveRatio,
+		TurnReserveTokens: c.TurnReserveTokens,
+		ConcurrentTurns:   c.ConcurrentTurns,
 	}
 }

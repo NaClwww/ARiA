@@ -157,6 +157,7 @@ func main() {
 		Tools:           tools,
 		Compressor:      compressor,
 		KeepRecentTurns: cfg.Compress.KeepRecentTurns,
+		Compact:         assemble.CompactBudget(cfg.Compress),
 		Store:           store,
 		SystemPrompt:    systemPrompt,
 		MaxTurns:        cfg.Limits.MaxTurns,
@@ -255,8 +256,9 @@ func run(sess *agent.Session, lines <-chan string, mgr *config.Manager, prov pro
 			}
 			sess.SetCompressor(c)
 			sess.SetKeepRecentTurns(cfg.Compress.KeepRecentTurns)
-			fmt.Fprintf(errw, "（已重读配置；模型 %s，压缩策略 %s，保留近轮 %d）\n",
-				cfg.Provider.Model, cfg.Compress.Strategy, cfg.Compress.KeepRecentTurns)
+			sess.SetCompactBudget(assemble.CompactBudget(cfg.Compress))
+			fmt.Fprintf(errw, "（已重读配置；模型 %s，压缩策略 %s，保留近轮 %d，预留比例 %.2f）\n",
+				cfg.Provider.Model, cfg.Compress.Strategy, cfg.Compress.KeepRecentTurns, cfg.Compress.ReserveRatio)
 			continue
 		}
 		defUser := orDefault(cfg.Session.DefaultUser, "user")
@@ -450,7 +452,10 @@ func makeLoremTool() simpleTool {
 
 // demoProvider 永不耗尽的确定性 provider：问到时间先调 now 工具；
 // 拿到工具结果后作答；其余情况复读用户话语。流式分片输出。
-type demoProvider struct{ toolCalled atomic.Bool }
+type demoProvider struct {
+	provider.NoLimits
+	toolCalled atomic.Bool
+}
 
 func newDemoProvider() *demoProvider { return &demoProvider{} }
 

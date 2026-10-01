@@ -77,7 +77,7 @@ pkg ──── agent-loop（agent-core）──── context-build（runtime�
 5. **ContextWindow 是一等可编程状态，非线性规划是方向**：选择非线性、呈现线性稳定（importance ≠ recency）。v1 窗口 = **每轮组装**（压缩记忆 + 当前感知 + 新输入，间隙异步压缩，03 §5）；非线性 Planner 细节未定稿——草稿 notes/context-planning-draft.md，M3 前重论（05 G2）。
 6. **MCP 经 mcp-to-tool 桥**变成原生 Tool；插件 v1 = 编译期接口注册，跨语言二期 MCP/gRPC 子进程。
 7. **错误三分法**：ToolError 是内容（喂回模型）、ProviderError 退避重试、Fatal 终止。
-8. **插件契约极简（5 接口 10 方法）**：Provider / Tool / Assembler / ToolSource / **ContextSource**（Name/Collect/Observe——窗口生成契约：记忆、RAG、画像、静态知识都是给窗口供给 Unit 的源；Collect 快路径同步、Observe 慢路径异步幂等；蒸馏是源内部管线而非契约）。依赖 = 类型化构造注入，**Go 类型系统即校验**；数据 = 契约类型 / artifact+ref / ctx，插件间不直接调用、无万能信封。
+8. **插件契约极简（5 接口 12 方法）**：Provider / Tool / Assembler / ToolSource / **ContextSource**（Name/Collect/Observe——窗口生成契约：记忆、RAG、画像、静态知识都是给窗口供给 Unit 的源；Collect 快路径同步、Observe 慢路径异步幂等；蒸馏是源内部管线而非契约）。依赖 = 类型化构造注入，**Go 类型系统即校验**；数据 = 契约类型 / artifact+ref / ctx，插件间不直接调用、无万能信封。
 9. **扩展 = 普通 Go 组合，无 Hook 抽象（03 §3）**：core 运行中不可变——读 = 事件订阅，改 = 挂点上的链/装饰器（ChainAssembler/ChainGuard + Tool/Provider 装饰 + 窗口命令），控制 = Interrupt/Queue；tool hook 三层分工：工具内部 / 全局装饰 / Guard 决策；core 只见折叠后的单个实现。
 10. **一切构件确定性可测**：FakeProvider 表驱动，无网络无磁盘，`-race` 干净。
 11. **宿主薄壳与配置分层（2026-09-14）**：薄壳只做三件事——制造 Scope、订阅事件流、**输入插头**（把各路输入加工成「一句完整的话 + 谁说的」）。配置**启动读一次、运行期只写回**：web 是操作面（内存即真相）、文件是持久化载体；生效优先级 = 启动 flag（进程内）> override 文件（网页保存目标，机器写）> base 文件（人写，程序**永不重写**、注释安全）> 默认值。写回只碰 override 层（viper 写回必丢注释），原子写；外部手改走 `Reload()`/重启。详见 [06](06-host-shell.md)。

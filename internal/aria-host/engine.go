@@ -167,6 +167,7 @@ func NewEngine(opts Options) (*Engine, error) {
 		Tools:           tools,
 		Compressor:      compressor,
 		KeepRecentTurns: cfg.Compress.KeepRecentTurns,
+		Compact:         assemble.CompactBudget(cfg.Compress),
 		Assembler:       vision,
 		Store:           store,
 		SystemPrompt:    systemPrompt,

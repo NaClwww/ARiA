@@ -47,9 +47,11 @@ type Config struct {
 	// 显式接 window.ProviderCompressor 之类的摘要实现。
 	Compressor window.Compressor
 
-	// KeepRecentTurns 是窗口保留原文的近轮数 K（window.SetKeepRecentTurns）：近轮累计
-	// 达到 2K 轮时只压缩较早的轮次；0 = 每轮结算后全部压缩。
+	// KeepRecentTurns 是压缩时保留原文的近轮数 K（window.SetKeepRecentTurns）。
 	KeepRecentTurns int
+
+	// Compact 是按上下文用量触发压缩的预留策略；窗口大小与 token 估算取自 Provider（见 CompactBudget）。
+	Compact CompactBudget
 
 	// Store 是可选的会话历史落盘（v1 只写不恢复）；nil → 不落盘。
 	// 实现必须尊重 ctx 取消，否则关停时尾部事件可能写不完（见 CloseGrace）。
@@ -87,6 +89,59 @@ type Config struct {
 
 // DefaultArtifactEntries 是默认内存 artifact 存储的条数上限（FIFO 淘汰）。
 const DefaultArtifactEntries = 64
+
+// CompactBudget 的缺省值。
+const (
+	DefaultReserveRatio      = 0.10  // 预留量不低于窗口的 10%
+	DefaultTurnReserveTokens = 16384 // 单轮输入预留（用户输入 + 工具结果），单位 token
+	DefaultConcurrentTurns   = 1     // 压缩与 agent loop 并发期间额外预留的轮数
+)
+
+// CompactBudget 描述按上下文用量触发压缩的预留量（单位 token）。每次结算时按本轮
+// 模型计算：
+//
+//	单轮 = 输出上限 + TurnReserveTokens
+//	预留量 = max(ReserveRatio × 窗口, 单轮) + ConcurrentTurns × 单轮
+//
+// 窗口与缺省输出上限取自 Provider.Limits；ctx 的 Options.MaxTokens 非零时作为输出上限。
+// 剩余量（窗口 − 上下文用量）低于预留量时触发压缩。Provider 报告窗口未知时不压缩。
+type CompactBudget struct {
+	ReserveRatio      float64 // 0 → DefaultReserveRatio
+	TurnReserveTokens int     // 0 → DefaultTurnReserveTokens
+	ConcurrentTurns   int     // 0 → DefaultConcurrentTurns；负数 = 不额外预留
+}
+
+func (c CompactBudget) withDefaults() CompactBudget {
+	if c.ReserveRatio <= 0 {
+		c.ReserveRatio = DefaultReserveRatio
+	}
+	if c.TurnReserveTokens <= 0 {
+		c.TurnReserveTokens = DefaultTurnReserveTokens
+	}
+	switch {
+	case c.ConcurrentTurns == 0:
+		c.ConcurrentTurns = DefaultConcurrentTurns
+	case c.ConcurrentTurns < 0:
+		c.ConcurrentTurns = 0
+	}
+	return c
+}
+
+// windowBudget 按 lim 与本轮输出上限 maxTokens（0 = 用 lim.MaxOutput）计算窗口预算；
+// count 为 token 估算。lim.ContextWindow ≤ 0 时返回零值（不压缩）。
+func (c CompactBudget) windowBudget(lim provider.Limits, maxTokens int, count func([]message.Message) int) window.Budget {
+	if lim.ContextWindow <= 0 {
+		return window.Budget{}
+	}
+	c = c.withDefaults()
+	out := maxTokens
+	if out <= 0 {
+		out = lim.MaxOutput
+	}
+	turn := out + c.TurnReserveTokens
+	reserve := max(int(c.ReserveRatio*float64(lim.ContextWindow)), turn) + c.ConcurrentTurns*turn
+	return window.Budget{ContextWindow: lim.ContextWindow, MaxOutput: out, Reserve: reserve, Count: count}
+}
 
 // Agent 是 Setup 的产物：纯零件盒，不持会话状态。
 type Agent struct {
@@ -200,16 +255,18 @@ func (a *Agent) NewSession(scope ctxx.Scope) (*Session, error) {
 	win.SetSystem(a.cfg.SystemPrompt)
 	win.SetKeepRecentTurns(a.cfg.KeepRecentTurns)
 	s := &Session{
-		loop:   l,
-		win:    win,
-		scope:  scope,
-		ctx:    base,
-		cancel: cancel,
-		closed: make(chan struct{}),
-		dead:   make(chan struct{}),
-		grace:  a.grace,
-		log:    a.log,
-		store:  a.cfg.Store,
+		loop:    l,
+		win:     win,
+		scope:   scope,
+		ctx:     base,
+		cancel:  cancel,
+		closed:  make(chan struct{}),
+		dead:    make(chan struct{}),
+		grace:   a.grace,
+		log:     a.log,
+		store:   a.cfg.Store,
+		prov:    a.cfg.Provider,
+		compact: a.cfg.Compact,
 	}
 	// 压缩观测 → durable 事件直写 store（压缩发生在 run 之间，不经飞轮总线；
 	// jsonl 单行锁串行化两路写入）。失败只响亮记日志——压缩本身已落地，
@@ -289,12 +346,17 @@ type Session struct {
 
 	runMu sync.Mutex // 一 Session 同时只跑一轮
 
-	mu       sync.Mutex
-	inputBuf []message.Message // 本轮的触发输入（Input 写入，结算时消费）
-	turnBuf  []message.Message // 本轮产出（消息事件累积）
-	turnCtx  context.Context   // 本轮 run ctx（压缩继承其身份）
-	runEnd   chan struct{}     // 本轮已结算的信号
-	err      error             // 首个后台错误
+	prov provider.Provider // 窗口预算的限额与 token 估算来源
+
+	mu        sync.Mutex
+	inputBuf  []message.Message // 本轮的触发输入（Input 写入，结算时消费）
+	turnBuf   []message.Message // 本轮产出（消息事件累积）
+	turnCtx   context.Context   // 本轮 run ctx（压缩继承其身份）
+	lastUsage message.Usage     // 本轮最后一次 LLM 调用的 usage（结算时判定上下文用量）
+	compact   CompactBudget     // 压缩预留策略，见 SetCompactBudget
+	noWindow  bool              // 已记录过「窗口未知」告警
+	runEnd    chan struct{}     // 本轮已结算的信号
+	err       error             // 首个后台错误
 }
 
 // Input 阻塞跑完一轮：组装 → core.Run → 等本轮结算进窗口 → 返回。
@@ -373,9 +435,16 @@ func (s *Session) History() (memory, recent []message.Message) { return s.win.Sn
 // 不丢在途结果。
 func (s *Session) SetCompressor(c window.Compressor) { s.win.SetCompressor(c) }
 
-// SetKeepRecentTurns 热替换保留原文的近轮数 K（window.SetKeepRecentTurns），与 SetCompressor
+// SetKeepRecentTurns 热替换压缩时保留原文的近轮数 K（window.SetKeepRecentTurns），与 SetCompressor
 // 同属压缩策略，配置重载时两者一并更新。
 func (s *Session) SetKeepRecentTurns(k int) { s.win.SetKeepRecentTurns(k) }
+
+// SetCompactBudget 热替换压缩预留策略（CompactBudget），自下一次结算起生效。
+func (s *Session) SetCompactBudget(c CompactBudget) {
+	s.mu.Lock()
+	s.compact = c
+	s.mu.Unlock()
+}
 
 // WaitCompress 等待在途压缩结束（测试与关停观察用）。
 func (s *Session) WaitCompress() { s.win.Wait() }
@@ -494,6 +563,7 @@ func (s *Session) beginTurn(ctx context.Context, msg message.Message) <-chan str
 	s.inputBuf = []message.Message{msg.Clone()}
 	s.turnBuf = nil
 	s.turnCtx = ctx
+	s.lastUsage = message.Usage{}
 	s.runEnd = make(chan struct{})
 	return s.runEnd
 }
@@ -523,6 +593,11 @@ func (s *Session) consumeWindow(ch <-chan loop.Event) {
 // loop.HistoryMessage（「哪些事件进历史」的权威定义，记忆 Pump 共用）；
 // AgentEnd → 结算本轮进窗口。
 func (s *Session) handleEvent(ev loop.Event) {
+	if d, ok := ev.Data.(loop.MessageEndData); ok {
+		s.mu.Lock()
+		s.lastUsage = d.Usage
+		s.mu.Unlock()
+	}
 	if m, ok := loop.HistoryMessage(ev); ok {
 		s.appendTurn(m)
 		return
@@ -545,6 +620,9 @@ func (s *Session) settle() {
 	turn = append(turn, s.turnBuf...)
 	ctx := s.turnCtx
 	s.inputBuf, s.turnBuf, s.turnCtx = nil, nil, nil
+	usage := s.lastUsage
+	s.lastUsage = message.Usage{}
+	compact := s.compact
 	done := s.runEnd
 	s.runEnd = nil
 	s.mu.Unlock()
@@ -552,8 +630,34 @@ func (s *Session) settle() {
 	if ctx == nil {
 		ctx = s.ctx // 兜底：没有触发 ctx 时用会话 ctx（身份为会话自身）
 	}
-	s.win.Settle(ctx, turn)
+	s.win.SetBudget(s.budget(ctx, compact))
+	used := 0
+	if usage.In > 0 {
+		used = usage.In + usage.Out // 本轮最后一次请求的规模，即下一轮组装中已有部分的规模
+	}
+	s.win.Settle(ctx, turn, used)
 	if done != nil {
 		close(done)
 	}
+}
+
+// budget 按本轮 ctx 的模型与输出上限计算窗口预算。Provider 报告窗口未知时返回零值
+// （不压缩），并在本会话首次出现时记一条 Warn 日志。
+func (s *Session) budget(ctx context.Context, compact CompactBudget) window.Budget {
+	opts, _ := ctxx.OptionsFrom(ctx)
+	model := opts.Model
+	lim := s.prov.Limits(model)
+	if lim.ContextWindow <= 0 {
+		s.mu.Lock()
+		warn := !s.noWindow
+		s.noWindow = true
+		s.mu.Unlock()
+		if warn {
+			s.log.Warn("agent: model context window unknown, usage-based compaction disabled",
+				"session", s.scope.SessionID, "model", model)
+		}
+		return window.Budget{}
+	}
+	count := func(ms []message.Message) int { return provider.CountTokens(s.prov, model, ms) }
+	return compact.windowBudget(lim, opts.MaxTokens, count)
 }

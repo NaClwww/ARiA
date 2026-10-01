@@ -10,7 +10,7 @@ import (
 // echoProvider 是 --fake 的内置 echo provider：把最后一句用户输入复读
 // 回去（流式分片），用于不花钱地验证「插头 → Input → 事件流 → 渲染」
 // 整条链路。
-type echoProvider struct{}
+type echoProvider struct{ provider.NoLimits }
 
 func (echoProvider) Stream(_ context.Context, req provider.Request) (<-chan provider.StreamEvent, error) {
 	input := ""

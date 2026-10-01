@@ -66,7 +66,26 @@ type Config struct {
 	// 在 [llm] 把 reasoning_effort 设为 none 或换 compress.model。
 	ThinkingLevel string
 	HTTP          *http.Client
+
+	// ContextWindow / MaxOutput 覆盖内置限额表（modelLimits）；0 = 按模型名查表。
+	// 表中没有的模型名须在此配置，否则 Limits 返回零值（不按上下文用量触发压缩）。
+	ContextWindow int
+	MaxOutput     int
 }
+
+// modelLimits 是在售模型的限额（2026-10 官方「模型 & 价格」页：两款模型上下文 1M、
+// 输出最大 384K）。MaxOutput 取请求不设 max_tokens 时的服务端默认值（思考模式 64K，
+// 非思考 8K，见 wireRequest.MaxTokens）中的较大者；旧模型名由 Flash 承接，限额同 Flash。
+var modelLimits = map[string]provider.Limits{
+	"deepseek-flash":               {ContextWindow: 1_000_000, MaxOutput: 64 * 1024},
+	"deepseek-v4-pro":              {ContextWindow: 1_000_000, MaxOutput: 64 * 1024},
+	"deepseek-v4-flash":            {ContextWindow: 1_000_000, MaxOutput: 64 * 1024},
+	"deepseek-v4-flash-vision-exp": {ContextWindow: 1_000_000, MaxOutput: 64 * 1024},
+}
+
+// tokenRates 是官方「Token 用量计算」页给出的换算比例：1 个英文字符约 0.3 token，
+// 1 个中文字符约 0.6 token；图片缩放后每张至多 1024 token（「图像理解」页）。
+var tokenRates = provider.TokenRates{CJK: 0.6, Other: 0.3, Image: 1024, PerMessage: 4}
 
 type Adapter struct {
 	cfg Config
@@ -88,6 +107,27 @@ func New(cfg Config) *Adapter {
 		hc = &http.Client{Timeout: 5 * time.Minute}
 	}
 	return &Adapter{cfg: cfg, hc: hc}
+}
+
+// Limits 报告 model 的限额：Config 的 ContextWindow 非零时用配置值，否则查 modelLimits；
+// model 为空指 Config.Model。
+func (a *Adapter) Limits(model string) provider.Limits {
+	if model == "" {
+		model = a.cfg.Model
+	}
+	lim := modelLimits[model]
+	if a.cfg.ContextWindow > 0 {
+		lim.ContextWindow = a.cfg.ContextWindow
+	}
+	if a.cfg.MaxOutput > 0 {
+		lim.MaxOutput = a.cfg.MaxOutput
+	}
+	return lim
+}
+
+// CountTokens 按官方换算比例（tokenRates）估算；各在售模型比例相同，model 不参与计算。
+func (a *Adapter) CountTokens(_ string, msgs []message.Message) int {
+	return tokenRates.Estimate(msgs)
 }
 
 // Stream 发起流式 chat/completions 并把 SSE 分片翻译为 provider 事件。

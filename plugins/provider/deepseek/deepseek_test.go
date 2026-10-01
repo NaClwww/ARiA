@@ -718,3 +718,32 @@ func TestLiveDeepseek(t *testing.T) {
 	}
 	t.Logf("thought chars: %d", thoughtLen)
 }
+
+// 限额：在售模型按内置表返回（窗口 1M、缺省输出 64K），model 为空指 Config.Model；
+// Config 的 ContextWindow / MaxOutput 覆盖内置表；表中没有的模型名返回零值。
+func TestDeepseekLimits(t *testing.T) {
+	a := New(Config{})
+	want := provider.Limits{ContextWindow: 1_000_000, MaxOutput: 64 * 1024}
+	if got := a.Limits(""); got != want {
+		t.Fatalf("默认模型限额：got %+v want %+v", got, want)
+	}
+	if got := a.Limits("deepseek-v4-pro"); got != want {
+		t.Fatalf("pro 限额：got %+v want %+v", got, want)
+	}
+	if got := a.Limits("unknown-model"); got != (provider.Limits{}) {
+		t.Fatalf("未知模型应为零值：got %+v", got)
+	}
+	o := New(Config{Model: "unknown-model", ContextWindow: 200_000, MaxOutput: 8192})
+	if got := o.Limits(""); got != (provider.Limits{ContextWindow: 200_000, MaxOutput: 8192}) {
+		t.Fatalf("配置覆盖：got %+v", got)
+	}
+}
+
+// token 估算按官方换算比例：中文 0.6、英文字符 0.3、每条消息另加 4。
+func TestDeepseekCountTokens(t *testing.T) {
+	a := New(Config{})
+	msgs := []message.Message{message.NewUser("今天天气abcd")} // 4 × 0.6 + 4 × 0.3 = 3.6
+	if got := a.CountTokens("", msgs); got != 8 {
+		t.Fatalf("got %d want 8", got)
+	}
+}

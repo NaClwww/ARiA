@@ -87,6 +87,8 @@ type Provider interface {
     Stream(ctx context.Context, req Request) (<-chan Event, error)
     // Request: 组装后消息 + ToolDefs + Options(ctxx 读出)
     // Provider Event: PartDelta / MessageComplete(含 Usage) / Error(分类)
+    Limits(model string) Limits                          // 上下文窗口与缺省输出上限；未知模型返回零值
+    CountTokens(model string, msgs []message.Message) int // token 估算；负数 = 不提供
 }
 type Tool interface {
     Def() ToolDef                                        // name, description, JSON schema
