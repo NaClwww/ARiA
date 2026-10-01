@@ -33,7 +33,7 @@
 
 - pkg = 编译期 import 的类型与纯函数；有状态、带驱动依赖、有生命周期者（存储、网络客户端）**不进 pkg**；
 - 插件角色两分：**基础 = 能力提供者**（被构造注入），**业务 = 操作提供者**（呈现为 Tool/ContextSource 等契约，被编排/被 LLM 调用）。能力接口**定义在消费方**、基础实现隐式满足，双方零 import、只在 Setup 相见；≥2 个消费者才升格共享（三次原则）——如 Setup 开一个 `*sql.DB` 注入两家，换库只改 Setup。标准库接口（`database/sql`、`io/fs`、`slog`）优先，不发明公共 Storage 接口、不做全局单例；
-- 存储分账：会话历史 = runtime 事件溯源订阅者（窄 Store 接口，Setup 注入实现）；记忆 = ContextSource 内部自足；大对象 = artifact+ref；凭据存放 = 宿主（05 B3），pkg 只经 ctxx 传播。
+- 存储分账：会话历史 = runtime 事件溯源订阅者（窄 Store 接口，Setup 注入实现）；大对象 = artifact+ref；凭据存放 = 宿主（05 B3），pkg 只经 ctxx 传播。
 
 ## 2. 窗口生成与上下文（意图级）
 
@@ -41,7 +41,7 @@
 
 1. **ContextWindow 是一等可编程状态**：上层可以声明式地变更（注入/置顶/驱逐），变更在轮边界生效；窗口 ≠ 每轮的 transcript。v1 线性组装下窗口命令语义弱，**不做**（见 §5），随 M3 非线性窗口一起。
 2. **非线性规划是方向**：窗口内容按重要性竞争选择，而不是对话时间线滑窗（importance ≠ recency）；「选择非线性、呈现线性稳定」。
-3. **供给契约是 `ContextSource`**（定义与默认实现见 04 §4）：读路 `Collect`（组装链上同步、快路径，超时降级为本轮无检索）；写路 `Observe`（该轮 durable 事件**落盘成功后**异步驱动——落盘确认机制 2026-10-01 定稿，见 [discussions/2026-10-01-memory-design.md](discussions/2026-10-01-memory-design.md)，幂等）；L1 会话全量原文由事件溯源落盘，不经源契约；namespace 隔离必须做在存储层 WHERE。
+3. **供给契约是 `ContextSource`**（定义见 04 §4）：读路 `Collect`（组装链上同步、快路径，超时降级为本轮无检索）；写路 `Observe`（该轮事件写入磁盘后异步驱动，幂等）；L1 会话全量原文由事件溯源写入磁盘，不经源契约；namespace 隔离必须做在存储层 WHERE。
 
 窗口 IO 一句话：**输入** = ContextSource 集合 + 压缩记忆 + 轮间窗口命令（v1 不做）；**输出** = 每轮组装链折叠成 `[]Message` 进 core 槽 1 → Provider 请求；窗口自身不产生对外输出，对外一律走事件订阅。
 
@@ -125,7 +125,7 @@ Host(语音识别中) → Speculate(base=transcript快照, 猜测输入)
 | 压缩在途消息仍参与组装；失败/空输出退回原文不丢内容 | 骨架 | 不动（正确性本体） |
 | **压缩策略**（keeplast / provider / 将来 twopart 两段式） | 零件位① | 配置点菜，可热切换 |
 | 记忆包装（`<memory>` 框定语、转义） | 零件位② | 暂定死（标签词汇走文档评审） |
-| 背景资料槽（`<context>`，M3 ContextSource） | 零件位③ | **已定稿（2026-10-01）**：窗口源槽——`Assemble` 收 ctx，Collect 结果插在近轮之后、新输入之前；runtime 统一超时降级/容量截断，空结果不注入，噪声纪律（top-k/冷却）继承 2026-08-27 §12——见 [discussions/2026-10-01-memory-design.md](discussions/2026-10-01-memory-design.md) |
+| 背景资料槽（`<context>`，M3 ContextSource） | 零件位③ | 预留 |
 
 装配在宿主侧：**名字 → 实现**的装配表（`internal/assemble`，`"provider"` / `"keeplast"` / 将来 `"twopart"`），由配置 `[compress] strategy` 选择；`window` 本身只认 `Compressor` 接口，不知道任何名字（06 §3）。**热切换已实现（2026-09-14）**：`Window.SetCompressor` / `Session.SetCompressor` 持锁替换，**在途压缩用旧实现跑完**（不打断、结果照常落下——它可能已经调了 provider，换掉只会白花钱），下一个轮间隙用新实现；未知策略名显式报错，不静默退化。新增策略 = 装配表加一个分支，引擎一行不动（twopart 就是这个位置）。
 
@@ -140,7 +140,6 @@ Host(语音识别中) → Speculate(base=transcript快照, 猜测输入)
 | `runtime/artifact` | 大中间产物存放与读回（artifact+ref） | `Store`（窄接口）、`Memory`（默认实现）、`OpenTool`（`artifact_open`） |
 | `runtime/toolkit` | 工具装饰器（挂点 4/5） | `Truncate`（超长结果 → 预览+引用） |
 | `runtime/agent` | 总装：零件盒 + 长寿命 Session | `Agent.New/NewSession`、`Session.Input/Queue/Interrupt/Subscribe/History` |
-| `runtime/memory` | ContextSource 契约 + 写路泵（落盘确认 → 后台 Observe） | `ContextSource`、`Pump`（M3，设计定稿 2026-10-01 未实现，见 discussions/2026-10-01-memory-design.md） |
 
 组装结果作为 `Run` 的 input 进 core（每条 Run 的历史 = 组装结果），core 槽 1 的 Assembler 仍留给宿主的额外变换。
 
@@ -148,7 +147,7 @@ Host(语音识别中) → Speculate(base=transcript快照, 猜测输入)
 
 ```
 [system]               宿主人设/规则/标签声明（可信，唯一进 system 的内容）
-[<memory>]             压缩记忆 / 长期记忆（数据，非 system role）
+[<memory>]             压缩记忆（数据，非 system role）
 [近轮对话]              原文
 [<context source="…">] 检索内容（M3 ContextSource）
 [当前感知]              照片等 ImageBlock

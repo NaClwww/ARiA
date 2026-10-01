@@ -29,11 +29,11 @@ h.Pin/Unpin/Evict/EvictGroup/Replace/PatchPolicy/Why(id)
 
 **Unit 模型**：kind 先验等级（system/taskState 保留级、fact/summary 高价值、dialogue 保底、toolResult/artifact 快驱逐、retrieved 竞争级）+ Provenance 溯源链。铁律：摘要只删窗口席位，不删原文。
 
-**内存层级**：L0 工作窗口 / L1 会话库（全量原文，树状 parent 指针）/ L2 语义记忆（namespace 隔离）/ L3 外部语料与工件。
+**内存层级**：L0 工作窗口 / L1 会话库（全量原文，树状 parent 指针）/ L2 长期记忆（待重新设计）/ L3 外部语料与工件。
 
 **算法（每轮纯函数）**：保留集（system+taskState+Pin）→ 保底集（最近 K 轮，K 由预算反推）→ 剩余预算打分背包：`score = w_rel·relevance + w_imp·importance + w_rec·e^{-λ·Δturn} + w_ref·被引用加权`；类型策略截断；固定区域顺序物化 `[system | facts | summaries | dialogue | input]`；溢出信号投递压缩任务（沿话题边界）。**选择非线性，呈现线性稳定。**
 
-**Pull 路**：给模型三个普通工具——`memory.recall(query,k)`、`history.load(turnRange|unitID)`（沿 Provenance 回页）、`artifact.open(ref,part)`。Push 给基线，Pull 兜底。
+**Pull 路**：给模型两个普通工具——`history.load(turnRange|unitID)`（沿 Provenance 回页）、`artifact.open(ref,part)`。Push 给基线，Pull 兜底。
 
 **可观测**：context.why() 三层（命令史→决策史→当前构成）；decisions 事件带分数分解。
 

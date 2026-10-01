@@ -189,12 +189,4 @@ type TokenCounter interface{ Count(text string) int }
 
 ## 已合入
 
-- **2026-10-01**（随长期记忆首版闭环设计，[2026-10-01-memory-design.md](2026-10-01-memory-design.md)）：
-  - **D2**：sqlite-vec 表述修正（暴力余弦，256 维 blob）合入 04 §4；
-  - **D5**：三级召回之层0（保守版 = profile 小画像常驻）+ 层1（触发线索 cues）随记忆源 v1，`memory_recall` 为 pull 兜底；
-  - **D6**：RRF 融合采纳为向量通道形态（升级位，合入 04 §4）；
-  - **D7**：cues 列继承受控词表纪律（2~4 个/条、高频降权）；
-  - **D1/D10 部分**：memory 侧「词法先行、向量 pull-only 起步」定为路线（实现 P4+）；层2 push embedding 维持评测门槛后。
-  - 落点：04 §3/§4、03 §5、05 C2/C3/G2。
-  - **同日晚补充（引擎选型）**：记忆引擎改为接入 Hindsight（2026-10-01 §11），上表自建检索内部机制的落点（D1/D5/D6/D7 的采纳形态）随之作废、仅作历史记录；D2 的 sqlite-vec 结论作为事实仍然成立；D4（Embedder 契约）挂起——embedding 由 Hindsight 内部承担。
-  - 维持待定：D3（RAG 文档侧 trigram）、D8/D9。
+（无——本次全部为讨论态，正式文档 01-04 未改动）
