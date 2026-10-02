@@ -160,6 +160,7 @@ func main() {
 		KeepRecentTurns: cfg.Compress.KeepRecentTurns,
 		Compact:         assemble.CompactBudget(cfg.Compress),
 		IdleTimeout:     assemble.IdleTimeout(cfg.Session),
+		RecallWait:      assemble.RecallWait(cfg.Session),
 		NewSessionID:    newSessionID,
 		Store:           store,
 		SystemPrompt:    systemPrompt,

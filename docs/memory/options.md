@@ -98,7 +98,7 @@
 | 1 | 会话切换：无操作超时、新 SessionID、清空窗口（`window.Reset`） | 已实现 |
 | 2 | 记忆服务接口与失败处理：`runtime/memory` 的 `Service`（接口）与 `Client`（重试 3 次、Start 超时 5 s、Recall 超时 500 ms） | 已实现 |
 | 3 | Stage：`window.PointExtractor` 与 `Window.SetOnPoints` 上报要点，`agent` 生成 batch_id（`ctxx.NewTrace().TraceID`）与 seq 并投递 | 已实现 |
-| 4 | End / Start：会话切换时依次投递，`NewSession` 时投递 Start；Start 的结果经 `window.RecallMessage` 写入窗口的召回位置（`Window.SetRecalled`） | 已实现 |
+| 4 | End / Start：会话切换时依次投递，`NewSession` 时投递 Start；Start 的结果经 `window.RecallMessage` 写入窗口的召回位置（`Window.SetRecalled`）；会话首轮等待 Start 返回，上限 `session.recall_wait_ms`（`agent.Config.RecallWait`） | 已实现 |
 | 5 | namespace：配置项 `session.namespace`（缺省 `default`），宿主写入 `Scope.Namespace` | 已实现 |
 | 6 | 压缩调用同时输出要点：`window.ProviderCompressor` 实现 `window.PointExtractor`（`CompressWithPoints`）；窗口注册了要点上报（`Window.SetOnPoints`，配置了记忆服务时由 `agent` 注册）时改用该调用，keeplast 不提取 | 已实现 |
 | 7 | 会话切换时对清除的原文提取要点（压缩实现为 `PointExtractor` 时）：`Window.Reset` 返回会话内摘要、原文与最后的批次序号（`window.Cleared`），记忆服务的后台 goroutine 调用 `Window.ExtractPoints`（`ProviderCompressor.ExtractPoints`，以 `Reset` 返回的会话内摘要为上下文，使用该会话最近一轮 run ctx 的值），以下一个序号 Stage，之后 End、Start | 已实现 |
@@ -127,7 +127,7 @@
 |---|---|---|---|---|---|
 | Stage | 每个压缩批次的要点提取完成后，要点为空时不调用（压缩路径） | namespace, session_id, batch_id（每批新生成的 TraceID）, seq（本会话内批次序号，从 1 起）, points | 无 | batch_id：服务端据此拒绝重放 | 重试 3 次，间隔 1 s / 2 s / 4 s；仍失败则输出 Error 日志，本批要点丢弃（原文仍在 jsonl） |
 | End | 会话切换：最后一批 Stage 之后（agent.onIdle） | namespace, session_id, ended_at（该会话最近一轮的结算时刻） | 无 | session_id | 重试 3 次；仍失败则输出 Error 日志，由下一次 Start 补齐 |
-| Start | 新会话开始：会话切换时与进程启动时，异步执行（agent.onIdle、agent.NewSession） | namespace, session_id, started_at | items | session_id | 超时 5 s；超时或失败则新会话不带召回结果，输出 Warn 日志 |
+| Start | 新会话开始：会话切换时与进程启动时，异步执行（agent.onIdle、agent.NewSession） | namespace, session_id, started_at | items | session_id | 超时取 `session.recall_wait_ms`（缺省 5000 ms，0 时为 5 s）；超时或失败则新会话不带召回结果，输出 Warn 日志 |
 | Recall | 每轮组装（是否保留未定） | namespace, session_id, query（当前输入文本）, limit | items | 无 | 超时 500 ms；超时则本轮无检索结果 |
 
 服务端职责：
@@ -137,7 +137,7 @@
 - Start：把此前未结束的会话视为已结束并提交（进程异常退出后的遗留会话由此处理）；返回会话开始时的召回结果，内容由服务端决定，可包括上一会话未提交的暂存、最近要点、即将到期的承诺。
 - Recall：在正式记忆与暂存中检索；按时间排序，同一要点不同时以暂存与正式记忆两种形式返回。
 
-召回条目（items）的字段：text、source（committed 正式记忆 / staged 暂存）、session_id、at。Start 的结果放入新会话窗口的记忆位置（system 之后），整个会话内不变；结果返回前到达的输入照常组装、不等待，结果晚于首轮返回时自下一轮起出现在组装结果中。
+召回条目（items）的字段：text、source（committed 正式记忆 / staged 暂存）、session_id、at。Start 的结果放入新会话窗口的记忆位置（system 之后），整个会话内不变；会话首轮等待 Start 返回后再组装，上限为配置项 `session.recall_wait_ms`（缺省 5000 ms，同时作为 Start 的超时；0 = 首轮不等待）；到达上限仍未返回时首轮不带召回，结果到达后自下一轮起出现在组装结果中（2026-10-02 主人裁定：首轮须带召回，以避免依赖个人记忆的首句指令缺少依据）。
 
 ### 要点的格式（2026-10-02 确认）
 

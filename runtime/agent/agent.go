@@ -74,6 +74,12 @@ type Config struct {
 	// 调用使用 NewSession 传入的 Scope.Namespace。
 	Memory memory.Service
 
+	// RecallWait 是会话首轮等待会话开始召回（Start）的上限，同时作为 Start 的超时；0 = 首轮不等待，
+	// Start 的超时取 memory.DefaultStartTimeout。召回结果写入窗口后首轮立即开始组装；到达上限仍未返回时
+	// 首轮不带召回，由 s.log 输出 Warn 日志 agent: recall not ready, first turn proceeds without recall，
+	// 结果到达后自下一轮起出现在组装结果中。只在配置了 Memory 时生效。
+	RecallWait time.Duration
+
 	// Store 是可选的会话历史落盘（v1 只写不恢复）；nil → 不落盘。
 	// 实现必须尊重 ctx 取消，否则关停时尾部事件可能写不完（见 CloseGrace）。
 	Store persist.Store
@@ -289,20 +295,21 @@ func (a *Agent) NewSession(scope ctxx.Scope) (*Session, error) {
 	win.SetSystem(a.cfg.SystemPrompt)
 	win.SetKeepRecentTurns(a.cfg.KeepRecentTurns)
 	s := &Session{
-		loop:    l,
-		win:     win,
-		scope:   scope,
-		ctx:     base,
-		cancel:  cancel,
-		closed:  make(chan struct{}),
-		dead:    make(chan struct{}),
-		grace:   a.grace,
-		log:     a.log,
-		store:   a.cfg.Store,
-		prov:    a.cfg.Provider,
-		compact: a.cfg.Compact,
-		idle:    a.cfg.IdleTimeout,
-		newID:   a.cfg.NewSessionID,
+		loop:       l,
+		win:        win,
+		scope:      scope,
+		ctx:        base,
+		cancel:     cancel,
+		closed:     make(chan struct{}),
+		dead:       make(chan struct{}),
+		grace:      a.grace,
+		log:        a.log,
+		store:      a.cfg.Store,
+		prov:       a.cfg.Provider,
+		compact:    a.cfg.Compact,
+		idle:       a.cfg.IdleTimeout,
+		recallWait: a.cfg.RecallWait,
+		newID:      a.cfg.NewSessionID,
 	}
 	if s.newID == nil {
 		base := scope.SessionID
@@ -375,6 +382,7 @@ func (a *Agent) NewSession(scope ctxx.Scope) (*Session, error) {
 // startMemory 启动记忆服务调用的后台 goroutine，注册要点上报，并通知首个会话开始。
 func (s *Session) startMemory(svc memory.Service, scope ctxx.Scope) {
 	s.mem = memory.NewClient(svc, s.log)
+	s.mem.SetStartTimeout(s.recallWait)
 	s.memJobs = make(chan memJob, MemoryQueueSize)
 	ctx, cancel := context.WithCancel(context.Background())
 	s.memCancel = cancel
@@ -389,7 +397,7 @@ func (s *Session) startMemory(svc memory.Service, scope ctxx.Scope) {
 		}
 		s.enqueueMemory(s.memStage(sc, seq, points))
 	})
-	s.enqueueMemory(s.memStart(scope, time.Now()))
+	s.enqueueStart(scope, time.Now())
 }
 
 // Session 是一个会话的全部运行时状态。并发安全：Input 之间互斥（03 §5）。
@@ -425,6 +433,8 @@ type Session struct {
 	noWindow  bool              // 已记录过「窗口未知」告警
 
 	idle         time.Duration          // 会话切换的无操作时长，见 Config.IdleTimeout
+	recallWait   time.Duration          // 会话首轮等待召回的上限，见 Config.RecallWait
+	recallReady  chan struct{}          // 当前会话 Start 的完成信号：首轮 Input 取走并等待，见 waitRecall
 	newID        func(time.Time) string // 会话切换后的会话标识生成
 	idleTimer    *time.Timer            // 无操作计时：每轮结算时启动，Input 开始时停止
 	idleGen      uint64                 // 计时代号：每次启动或停止递增，到期回调据此判定是否作废
@@ -457,7 +467,12 @@ func (s *Session) Input(ctx context.Context, msg message.Message) (loop.RunResul
 	}
 	s.mu.Lock()
 	s.stopIdleLocked() // 有新输入：当前会话继续，无操作计时作废
+	ready := s.recallReady
+	s.recallReady = nil // 只有会话的首轮等待召回
 	s.mu.Unlock()
+	if ready != nil {
+		s.waitRecall(ctx, ready)
+	}
 
 	runCtx, cancel := s.runContext(ctx)
 	defer cancel()
@@ -834,7 +849,7 @@ func (s *Session) onIdle(gen uint64) {
 			lastActive = now
 		}
 		s.enqueueMemory(s.memEnd(prevScope, lastActive))
-		s.enqueueMemory(s.memStart(nextScope, now))
+		s.enqueueStart(nextScope, now)
 	}
 	s.log.Info("agent: session switched", "session", prev, "next", next, "idle", idle, "dropped_messages", dropped)
 }
@@ -888,23 +903,57 @@ func (s *Session) memEnd(sc ctxx.Scope, at time.Time) memJob {
 	return memJob{kind: "end", scope: sc, run: func(ctx context.Context) { _ = s.mem.End(ctx, req) }}
 }
 
-// memStart 返回会话开始的通知（Start），成功时召回结果写入窗口（injectRecall）。
-func (s *Session) memStart(sc ctxx.Scope, at time.Time) memJob {
+// memStart 返回会话开始的通知（Start），成功时召回结果写入窗口（injectRecall）；结束时（成功、失败或
+// ctx 取消）关闭 ready。
+func (s *Session) memStart(sc ctxx.Scope, at time.Time, ready chan struct{}) memJob {
 	req := memory.SessionRequest{Namespace: sc.Namespace, SessionID: sc.SessionID, At: at}
 	return memJob{kind: "start", scope: sc, run: func(ctx context.Context) {
+		defer close(ready)
 		if items, err := s.mem.Start(ctx, req); err == nil {
 			s.injectRecall(req.SessionID, items)
 		}
 	}}
 }
 
-// enqueueMemory 非阻塞地投递一次记忆服务调用；队列满时丢弃并由 s.log 输出 Error 日志
+// enqueueStart 投递会话开始的通知（Start），并把其完成信号设为会话首轮的等待对象（见 Config.RecallWait）；
+// 队列满未投递时立即关闭完成信号，首轮不等待。
+func (s *Session) enqueueStart(sc ctxx.Scope, at time.Time) {
+	ready := make(chan struct{})
+	s.mu.Lock()
+	s.recallReady = ready
+	s.mu.Unlock()
+	if !s.enqueueMemory(s.memStart(sc, at, ready)) {
+		close(ready)
+	}
+}
+
+// waitRecall 在会话首轮组装前等待 Start 结束（ready 关闭），上限 s.recallWait；到达上限时由 s.log 输出
+// Warn 日志 agent: recall not ready, first turn proceeds without recall。ctx 取消或会话关闭时停止等待。
+func (s *Session) waitRecall(ctx context.Context, ready <-chan struct{}) {
+	if s.recallWait <= 0 {
+		return
+	}
+	t := time.NewTimer(s.recallWait)
+	defer t.Stop()
+	select {
+	case <-ready:
+	case <-t.C:
+		s.log.Warn("agent: recall not ready, first turn proceeds without recall",
+			"session", s.SessionID(), "wait", s.recallWait)
+	case <-ctx.Done():
+	case <-s.closed:
+	}
+}
+
+// enqueueMemory 非阻塞地投递一次记忆服务调用，返回是否已投递；队列满时丢弃并由 s.log 输出 Error 日志
 // agent: memory queue full, call dropped。可在持窗口锁时调用（不获取会话锁）。
-func (s *Session) enqueueMemory(j memJob) {
+func (s *Session) enqueueMemory(j memJob) bool {
 	select {
 	case s.memJobs <- j:
+		return true
 	default:
 		s.log.Error("agent: memory queue full, call dropped", "kind", j.kind, "session", j.scope.SessionID)
+		return false
 	}
 }
 

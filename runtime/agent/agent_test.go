@@ -1591,7 +1591,8 @@ type fakeMemory struct {
 	starts   []memory.SessionRequest
 	items    map[string][]memory.Item
 	mismatch []string
-	users    []string // 每次 Stage 时 ctx 的 Scope.UserID
+	users    []string        // 每次 Stage 时 ctx 的 Scope.UserID
+	budgets  []time.Duration // 每次 Start 开始时 ctx 的剩余时限
 }
 
 // checkScope 记录 ctx 的 Scope 与请求会话不一致的调用（调用方持有 f.mu）。
@@ -1622,6 +1623,11 @@ func (f *fakeMemory) End(ctx context.Context, r memory.SessionRequest) error {
 }
 
 func (f *fakeMemory) Start(ctx context.Context, r memory.SessionRequest) ([]memory.Item, error) {
+	if dl, ok := ctx.Deadline(); ok {
+		f.mu.Lock()
+		f.budgets = append(f.budgets, time.Until(dl))
+		f.mu.Unlock()
+	}
 	if f.startGate != nil && r.SessionID == "s1" {
 		select {
 		case <-f.startGate:
@@ -1927,5 +1933,48 @@ func TestSessionMemorySwitchStageUsesLastTurnScope(t *testing.T) {
 	defer fm.mu.Unlock()
 	if !slices.Equal(fm.users, []string{"u2"}) || len(fm.mismatch) > 0 {
 		t.Fatalf("切换批的 Stage 应带本轮说话人 u2：users %v mismatch %v", fm.users, fm.mismatch)
+	}
+}
+
+// 会话首轮等待会话开始的召回结果（Config.RecallWait），结果写入窗口后再组装。
+func TestFirstTurnWaitsForRecall(t *testing.T) {
+	gate := make(chan struct{})
+	fm := &fakeMemory{startGate: gate, items: map[string][]memory.Item{"s1": {{Text: "喜欢猫"}}}}
+	s, rp := newTestSession(t, Config{
+		Provider:   provider.NewFake(provider.FakeStep{Text: []string{"好"}}),
+		Memory:     fm,
+		RecallWait: 5 * time.Second,
+	})
+	time.AfterFunc(50*time.Millisecond, func() { close(gate) })
+	if _, err := s.Input(context.Background(), message.NewUser("按平时的口味点外卖")); err != nil {
+		t.Fatal(err)
+	}
+	if msgs := rp.at(0).Messages; len(msgs) != 2 || !strings.Contains(msgs[0].Text(), "喜欢猫") {
+		t.Fatalf("首轮应等待召回并带上：%v", rendered(msgs))
+	}
+}
+
+// 到达上限仍未返回时首轮不带召回；Start 的超时取 RecallWait。
+func TestFirstTurnRecallWaitTimeout(t *testing.T) {
+	fm := &fakeMemory{startGate: make(chan struct{}), items: map[string][]memory.Item{"s1": {{Text: "喜欢猫"}}}}
+	s, rp := newTestSession(t, Config{
+		Provider:   provider.NewFake(provider.FakeStep{Text: []string{"好"}}),
+		Memory:     fm,
+		RecallWait: 50 * time.Millisecond,
+	})
+	begin := time.Now()
+	if _, err := s.Input(context.Background(), message.NewUser("早上好")); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(begin); d > 2*time.Second {
+		t.Fatalf("等待应在上限附近结束：%v", d)
+	}
+	if msgs := rp.at(0).Messages; len(msgs) != 1 {
+		t.Fatalf("超时后首轮不应带召回：%v", rendered(msgs))
+	}
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	if len(fm.budgets) != 1 || fm.budgets[0] > time.Second {
+		t.Fatalf("Start 的超时应取 RecallWait：%v", fm.budgets)
 	}
 }

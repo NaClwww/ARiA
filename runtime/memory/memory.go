@@ -114,6 +114,13 @@ func NewClient(svc Service, log *slog.Logger) *Client {
 	}
 }
 
+// SetStartTimeout 在 d > 0 时以 d 替换 Start 的超时（缺省 DefaultStartTimeout）；须在首次调用 Start 前设置。
+func (c *Client) SetStartTimeout(d time.Duration) {
+	if d > 0 {
+		c.startTimeout = d
+	}
+}
+
 // Stage 暂存一批要点，失败后重试；全部失败时输出 Error 日志 memory: stage failed, points dropped，
 // 返回最后一次的错误。
 func (c *Client) Stage(ctx context.Context, req StageRequest) error {

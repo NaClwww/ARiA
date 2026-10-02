@@ -13,6 +13,11 @@ func IdleTimeout(c config.Session) time.Duration {
 	return time.Duration(c.IdleTimeoutS) * time.Second
 }
 
+// RecallWait 把 [session] recall_wait_ms 换算为 agent.Config.RecallWait。
+func RecallWait(c config.Session) time.Duration {
+	return time.Duration(c.RecallWaitMs) * time.Millisecond
+}
+
 // SessionIDs 返回启动时刻 now 的会话标识与会话切换时的标识生成函数（agent.Config.NewSessionID），
 // 二者均为 agent.SessionIDAt(c.ID, 会话开始时刻)。
 func SessionIDs(c config.Session, now time.Time) (string, func(time.Time) string) {

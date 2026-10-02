@@ -90,6 +90,9 @@ type Session struct {
 	// IdleTimeoutS 是会话切换的无操作时长（秒）：最近一轮结束后该时长内没有新输入时，
 	// 上下文清空，之后的输入进入新会话（不带入上一会话的摘要与原文）。0 = 不切换。
 	IdleTimeoutS int
+	// RecallWaitMs 是会话首轮等待长期记忆召回的上限（毫秒），同时作为召回请求（Start）的超时；
+	// 0 = 首轮不等待。只在接入记忆服务后生效。
+	RecallWaitMs int
 }
 
 type LLM struct {
@@ -426,6 +429,7 @@ func configFrom(v *viper.Viper) Config {
 			DefaultUser:  v.GetString("session.default_user"),
 			IdleTimeoutS: v.GetInt("session.idle_timeout_s"),
 			Namespace:    v.GetString("session.namespace"),
+			RecallWaitMs: v.GetInt("session.recall_wait_ms"),
 		},
 		LLM: LLM{
 			Temperature:     v.GetFloat64("llm.temperature"),
@@ -471,6 +475,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("session.default_user", "user")
 	v.SetDefault("session.idle_timeout_s", 1800) // 30 min 无输入切换会话
 	v.SetDefault("session.namespace", "default")
+	v.SetDefault("session.recall_wait_ms", 5000) // 首轮等待召回最长 5 s
 	// llm.temperature / llm.max_tokens / llm.reasoning_effort 故意无默认：
 	// 空 = 不下发该字段，交给 provider 的模型默认（thinking 型模型一般
 	// 不用这几个旋钮）。

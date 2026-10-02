@@ -170,6 +170,7 @@ func NewEngine(opts Options) (*Engine, error) {
 		KeepRecentTurns: cfg.Compress.KeepRecentTurns,
 		Compact:         assemble.CompactBudget(cfg.Compress),
 		IdleTimeout:     assemble.IdleTimeout(cfg.Session),
+		RecallWait:      assemble.RecallWait(cfg.Session),
 		NewSessionID:    newSessionID,
 		Assembler:       vision,
 		Store:           store,
