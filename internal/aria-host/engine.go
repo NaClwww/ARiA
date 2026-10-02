@@ -27,6 +27,7 @@ import (
 	gowildvision "aria/plugins/vision/gowild"
 	gowildvoice "aria/plugins/voice/gowild"
 	"aria/runtime/agent"
+	"aria/runtime/memory"
 	"aria/runtime/persist"
 )
 
@@ -154,6 +155,18 @@ func NewEngine(opts Options) (*Engine, error) {
 		tools = append(tools, t)
 	}
 	tools = append(tools, opts.Tools...)
+	// 记忆服务（可空）：按 [memory] engine 装配；接入时装入 memory_recall 工具并在人设后追加
+	// 使用规则（工具存在与否是宿主的装配事实，与 speak 同纪律）。
+	memSvc, err := assemble.Memory(cfg.Memory, log)
+	if err != nil {
+		return nil, fmt.Errorf("记忆服务装配失败: %w", err)
+	}
+	if memSvc != nil {
+		tools = append(tools, memory.RecallTool(memory.NewClient(memSvc, log)))
+		systemPrompt += "\n" + memory.RecallToolInstruction
+		log.Info("memory", "engine", cfg.Memory.Engine, "base_url", cfg.Memory.BaseURL,
+			"dir", cfg.Memory.Dir, "members", len(cfg.Memory.Members))
+	}
 	if len(tools) > 0 {
 		names := make([]string, 0, len(tools))
 		for _, t := range tools {
@@ -171,6 +184,7 @@ func NewEngine(opts Options) (*Engine, error) {
 		Compact:         assemble.CompactBudget(cfg.Compress),
 		IdleTimeout:     assemble.IdleTimeout(cfg.Session),
 		RecallWait:      assemble.RecallWait(cfg.Session),
+		Memory:          memSvc,
 		NewSessionID:    newSessionID,
 		Assembler:       vision,
 		Store:           store,

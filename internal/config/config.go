@@ -39,6 +39,7 @@ type Config struct {
 	Tools    Tools
 	Record   Record
 	Limits   Limits
+	Memory   Memory
 }
 
 // Host 是宿主装配段（cmd/aria-host 的启动项基准）：地址与开关。同名 flag
@@ -128,6 +129,16 @@ type Record struct {
 type Limits struct {
 	MaxTurns      int
 	ToolTimeoutMS int
+}
+
+// Memory 是长期记忆服务段（docs/memory/options.md「写入与召回流程」）。
+type Memory struct {
+	// Engine 是记忆服务实现：空 = 不接入（不调用记忆服务、不提取要点、不装 memory_recall 工具）；
+	// "hindsight" = plugins/memory/hindsight（测试期后端）。
+	Engine  string
+	BaseURL string   // hindsight：API 根地址
+	Dir     string   // hindsight：要点暂存目录
+	Members []string // 家庭成员名字：会话开始时逐人检索身份、偏好与重要事实作为用户背景
 }
 
 // Manager 持有两层文件并维护合并视图。并发安全。
@@ -452,6 +463,12 @@ func configFrom(v *viper.Viper) Config {
 			MaxTurns:      v.GetInt("limits.max_turns"),
 			ToolTimeoutMS: v.GetInt("limits.tool_timeout_ms"),
 		},
+		Memory: Memory{
+			Engine:  v.GetString("memory.engine"),
+			BaseURL: v.GetString("memory.base_url"),
+			Dir:     v.GetString("memory.dir"),
+			Members: v.GetStringSlice("memory.members"),
+		},
 	}
 }
 
@@ -492,6 +509,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("record.path", "")
 	v.SetDefault("limits.max_turns", 0)
 	v.SetDefault("limits.tool_timeout_ms", 30000) // 30s：core 的 0 语义是「不限时」，配置层给个安全默认
+	v.SetDefault("memory.engine", "")             // 空 = 不接入记忆服务
+	v.SetDefault("memory.base_url", "http://127.0.0.1:8888")
+	v.SetDefault("memory.dir", "memory-staging")
+	v.SetDefault("memory.members", []string{})
 }
 
 // restoreOverLocked 按快照重建 override 层（写盘失败后的回滚；调用方持锁）。

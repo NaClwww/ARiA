@@ -1773,19 +1773,6 @@ func TestInjectRecallSkipsSwitchedSession(t *testing.T) {
 	}
 }
 
-// 召回条目的渲染：时间前缀与暂存标注。
-func TestRenderRecall(t *testing.T) {
-	at := time.Date(2026, 10, 1, 9, 30, 0, 0, time.Local)
-	got := renderRecall([]memory.Item{
-		{Text: "喜欢猫"},
-		{Text: "改成周日去大阪", At: at, Source: memory.SourceStaged},
-	})
-	want := "- 喜欢猫\n- [2026-10-01 09:30] 改成周日去大阪（未合并）"
-	if got != want {
-		t.Fatalf("want %q got %q", want, got)
-	}
-}
-
 // 会话切换：清除的原文提取要点后以下一个序号暂存，顺序为 Stage → End → Start。
 func TestSessionMemoryExtractsOnSwitch(t *testing.T) {
 	fm := &fakeMemory{}

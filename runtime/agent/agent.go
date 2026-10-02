@@ -13,7 +13,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
@@ -977,32 +976,13 @@ func (s *Session) injectRecall(sessionID string, items []memory.Item) {
 	if len(items) == 0 {
 		return
 	}
-	msg := window.RecallMessage(renderRecall(items))
+	msg := window.RecallMessage(memory.Render(items))
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.scope.SessionID != sessionID {
 		return
 	}
 	s.win.SetRecalled([]message.Message{msg})
-}
-
-// renderRecall 把召回条目渲染为逐行文本：有发生时间的条目带本地时间前缀，暂存条目标注「未合并」。
-func renderRecall(items []memory.Item) string {
-	var b strings.Builder
-	for i, it := range items {
-		if i > 0 {
-			b.WriteByte('\n')
-		}
-		b.WriteString("- ")
-		if !it.At.IsZero() {
-			b.WriteString("[" + it.At.Local().Format("2006-01-02 15:04") + "] ")
-		}
-		b.WriteString(it.Text)
-		if it.Source == memory.SourceStaged {
-			b.WriteString("（未合并）")
-		}
-	}
-	return b.String()
 }
 
 // budget 按本轮 ctx 的模型与输出上限计算窗口预算。Provider 报告窗口未知时返回零值

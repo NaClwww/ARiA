@@ -44,6 +44,12 @@ namespace = "default"           # 长期记忆的命名空间：每个家庭一�
 idle_timeout_s = 1800           # 最近一轮结束后该时长（秒）内没有新输入：上下文清空，之后的输入进入新会话（不带入上一会话的摘要与原文）；0 = 不切换
 recall_wait_ms = 5000          # 会话首轮等待长期记忆召回的上限（毫秒），同时作为召回请求的超时；0 = 首轮不等待（接入记忆服务后生效）
 
+[memory]                        # 长期记忆服务（docs/memory/options.md「写入与召回流程」）
+engine = ""                     # 空 = 不接入（不调用记忆服务、不提取要点、不装 memory_recall 工具）；"hindsight" = 测试期后端（plugins/memory/hindsight，需另行运行 Hindsight 容器）
+base_url = "http://127.0.0.1:8888"   # Hindsight API 根地址
+dir = "memory-staging"          # 要点暂存目录：每个会话一个文件，会话结束时一次写入引擎
+members = []                    # 家庭成员名字，如 ["爸爸", "妈妈"]：会话开始时逐人检索身份、偏好与重要事实作为用户背景
+
 [llm]                           # 热调区：网页面板改动立即生效（每请求 Options 覆盖）
 #temperature = 0.7              # 不设（默认）= 请求里不下发该字段，用 provider 模型默认；思考模式下服务端本就忽略它
 #max_tokens = 8192              # 不设（默认）= 不限；thinking 型模型一般不用这两个旋钮（思考态默认 64K，effort=max 128K）

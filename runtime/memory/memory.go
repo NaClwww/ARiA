@@ -81,10 +81,11 @@ type Service interface {
 	Recall(ctx context.Context, req RecallRequest) ([]Item, error)
 }
 
-// 失败处理的缺省值（docs/memory/options.md「记忆服务接口」）。
+// 失败处理的缺省值（docs/memory/options.md「记忆服务接口」）。Recall 由 memory_recall 工具调用
+// （模型发起，不在组装路径上），超时 3 s。
 const (
 	DefaultStartTimeout  = 5 * time.Second
-	DefaultRecallTimeout = 500 * time.Millisecond
+	DefaultRecallTimeout = 3 * time.Second
 )
 
 // DefaultRetryDelays 是 Stage 与 End 失败后的重试间隔，共重试 3 次；agent 对会话切换时的要点提取使用同一间隔。

@@ -43,6 +43,7 @@ import (
 	"aria/plugins/persist/jsonl"
 	"aria/plugins/tool/basic"
 	"aria/runtime/agent"
+	"aria/runtime/memory"
 	"aria/runtime/persist"
 	"aria/runtime/window"
 )
@@ -151,6 +152,17 @@ func main() {
 		log.Error("tools build failed", "err", err)
 		os.Exit(2)
 	}
+	// 记忆服务（可空）：接入时装入 memory_recall 工具并在人设后追加使用规则（与 aria-host 同源）。
+	memSvc, err := assemble.Memory(cfg.Memory, log)
+	if err != nil {
+		log.Error("memory assemble failed", "err", err)
+		os.Exit(2)
+	}
+	if memSvc != nil {
+		tools = append(tools, memory.RecallTool(memory.NewClient(memSvc, log)))
+		systemPrompt += "\n" + memory.RecallToolInstruction
+		log.Info("memory", "engine", cfg.Memory.Engine, "base_url", cfg.Memory.BaseURL, "dir", cfg.Memory.Dir)
+	}
 
 	sessionID, newSessionID := assemble.SessionIDs(cfg.Session, time.Now())
 	ag, err := agent.New(agent.Config{
@@ -161,6 +173,7 @@ func main() {
 		Compact:         assemble.CompactBudget(cfg.Compress),
 		IdleTimeout:     assemble.IdleTimeout(cfg.Session),
 		RecallWait:      assemble.RecallWait(cfg.Session),
+		Memory:          memSvc,
 		NewSessionID:    newSessionID,
 		Store:           store,
 		SystemPrompt:    systemPrompt,
