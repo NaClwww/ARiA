@@ -3,39 +3,51 @@ package memory
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"strings"
+	"time"
 
 	"aria/core/tool"
 	"aria/pkg/ctxx"
 	"aria/pkg/message"
 )
 
-// memory_recall 工具的取值（docs/memory/options.md「写入与召回流程」已定第 11 项）。
-const (
-	RecallToolName         = "memory_recall"
-	DefaultRecallToolLimit = 10 // limit 缺省值
-	MaxRecallToolLimit     = 20 // limit 上限，超过按上限取
-	// RecallToolEmpty 是没有检索结果时返回模型的文本。
-	RecallToolEmpty = "没有相关的长期记忆。"
-)
+// RecallToolName 是模型主动检索长期记忆的工具名（docs/memory/options.md 已定第 11 项）。
+const RecallToolName = "memory_recall"
 
 // RecallToolInstruction 是装入 memory_recall 工具时追加到人设之后的使用规则：工具存在与否是
 // 宿主的装配事实，由宿主在配置了记忆服务时追加。
 const RecallToolInstruction = "长期记忆：对话涉及家庭成员的经历、偏好、过往约定或 ARiA 答应过的事，" +
 	"且当前上下文中没有依据时，先调用 memory_recall 检索再作答；检索结果属于背景资料，可能过时。"
 
+const (
+	// DefaultRecallToolLimit 是 limit 缺省值，记忆服务实现对 Limit <= 0 的请求也取该值。
+	DefaultRecallToolLimit = 10
+	maxRecallToolLimit     = 20 // limit 上限，超过按上限取
+	recallToolEmpty        = "没有相关的长期记忆。"
+)
+
 var recallToolParams = json.RawMessage(`{"type":"object","properties":{` +
 	`"query":{"type":"string","description":"检索内容：涉及的人名、事件或话题，自然语言"},` +
 	`"limit":{"type":"integer","description":"返回条数上限，缺省 10，最大 20"}},` +
 	`"required":["query"]}`)
 
-// recallTool 是模型主动检索长期记忆的工具：参数 query（必填）、limit（可选）；经 Client.Recall
-// 调用记忆服务（超时 DefaultRecallTimeout），结果经 Render 渲染为逐行文本。namespace 与 session_id
-// 取自 ctx 的 Scope；Scope 缺失、query 为空或检索失败时返回 IsError 结果。
-type recallTool struct{ c *Client }
+// recallTool 调用 Service.Recall（超时 timeout），结果经 Render 渲染为逐行文本。namespace 与 session_id
+// 取自 ctx 的 Scope；Scope 缺失、query 为空或检索失败时返回 IsError 结果，检索失败另由 log 输出 Warn 日志
+// memory: recall failed。
+type recallTool struct {
+	svc     Service
+	log     *slog.Logger
+	timeout time.Duration
+}
 
-// RecallTool 返回 memory_recall 工具；c 为记忆服务的 Client（与 agent 使用同一个 Service）。
-func RecallTool(c *Client) tool.Tool { return recallTool{c: c} }
+// RecallTool 返回 memory_recall 工具；log 为 nil 时使用 slog.Default()。
+func RecallTool(svc Service, log *slog.Logger) tool.Tool {
+	if log == nil {
+		log = slog.Default()
+	}
+	return recallTool{svc: svc, log: log, timeout: DefaultRecallTimeout}
+}
 
 func (t recallTool) Def() tool.Def {
 	return tool.Def{
@@ -61,20 +73,22 @@ func (t recallTool) Exec(ctx context.Context, call tool.Call) tool.Result {
 	}
 	if in.Limit <= 0 {
 		in.Limit = DefaultRecallToolLimit
-	} else if in.Limit > MaxRecallToolLimit {
-		in.Limit = MaxRecallToolLimit
 	}
+	in.Limit = min(in.Limit, maxRecallToolLimit)
 	sc, ok := ctxx.ScopeFrom(ctx)
 	if !ok {
 		return errorResult(call.ID, "memory_recall: ctx 缺少 Scope")
 	}
-	items, err := t.c.Recall(ctx, RecallRequest{
+	ctx, cancel := context.WithTimeout(ctx, t.timeout)
+	defer cancel()
+	items, err := t.svc.Recall(ctx, RecallRequest{
 		Namespace: sc.Namespace, SessionID: sc.SessionID, Query: in.Query, Limit: in.Limit,
 	})
 	if err != nil {
+		t.log.Warn("memory: recall failed", "session", sc.SessionID, "err", err)
 		return errorResult(call.ID, "memory_recall: 检索失败: "+err.Error())
 	}
-	text := RecallToolEmpty
+	text := recallToolEmpty
 	if len(items) > 0 {
 		text = Render(items)
 	}

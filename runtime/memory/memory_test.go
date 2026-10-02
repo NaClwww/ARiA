@@ -59,7 +59,6 @@ func fastClient(svc Service) *Client {
 	c := NewClient(svc, quiet())
 	c.retryDelays = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
 	c.startTimeout = 20 * time.Millisecond
-	c.recallTimeout = 20 * time.Millisecond
 	return c
 }
 
@@ -104,13 +103,10 @@ func TestClientRetryStopsOnCancel(t *testing.T) {
 	}
 }
 
-// Start 与 Recall 超时后返回错误与空结果。
-func TestClientStartAndRecallTimeout(t *testing.T) {
+// Start 超时后返回错误与空结果。
+func TestClientStartTimeout(t *testing.T) {
 	c := fastClient(&fakeService{block: true})
 	if items, err := c.Start(context.Background(), SessionRequest{}); err == nil || items != nil {
 		t.Fatalf("Start 超时应返回错误与 nil：items %v err %v", items, err)
-	}
-	if items, err := c.Recall(context.Background(), RecallRequest{}); err == nil || items != nil {
-		t.Fatalf("Recall 超时应返回错误与 nil：items %v err %v", items, err)
 	}
 }

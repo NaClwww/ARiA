@@ -12,6 +12,7 @@
 package ariahost
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"time"
@@ -59,6 +60,7 @@ type Engine struct {
 
 	log        *slog.Logger
 	jsonlStore *jsonl.Store
+	memClose   func(context.Context) error // 记忆服务的后台提交等待（未接入时为 nil）
 	fake       bool
 	model      string // 生效模型名（deepseek kind 留空配置时为默认 flash）
 }
@@ -157,12 +159,12 @@ func NewEngine(opts Options) (*Engine, error) {
 	tools = append(tools, opts.Tools...)
 	// 记忆服务（可空）：按 [memory] engine 装配；接入时装入 memory_recall 工具并在人设后追加
 	// 使用规则（工具存在与否是宿主的装配事实，与 speak 同纪律）。
-	memSvc, err := assemble.Memory(cfg.Memory, log)
+	mem, err := assemble.Memory(cfg.Memory, log)
 	if err != nil {
 		return nil, fmt.Errorf("记忆服务装配失败: %w", err)
 	}
-	if memSvc != nil {
-		tools = append(tools, memory.RecallTool(memory.NewClient(memSvc, log)))
+	if mem.Service != nil {
+		tools = append(tools, mem.Tool)
 		systemPrompt += "\n" + memory.RecallToolInstruction
 		log.Info("memory", "engine", cfg.Memory.Engine, "base_url", cfg.Memory.BaseURL,
 			"dir", cfg.Memory.Dir, "members", len(cfg.Memory.Members))
@@ -184,7 +186,7 @@ func NewEngine(opts Options) (*Engine, error) {
 		Compact:         assemble.CompactBudget(cfg.Compress),
 		IdleTimeout:     assemble.IdleTimeout(cfg.Session),
 		RecallWait:      assemble.RecallWait(cfg.Session),
-		Memory:          memSvc,
+		Memory:          mem.Service,
 		NewSessionID:    newSessionID,
 		Assembler:       vision,
 		Store:           store,
@@ -200,7 +202,7 @@ func NewEngine(opts Options) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("会话建立失败: %w", err)
 	}
-	return &Engine{Cfg: cfg, Session: sess, log: log, jsonlStore: jsonlStore, fake: opts.Fake, model: model}, nil
+	return &Engine{Cfg: cfg, Session: sess, log: log, jsonlStore: jsonlStore, memClose: mem.Close, fake: opts.Fake, model: model}, nil
 }
 
 // ModelName 是对外展示的模型名（echo 冒烟时为 "echo"；deepseek kind 留空
@@ -215,6 +217,15 @@ func (e *Engine) ModelName() string {
 // Close 收尾落盘（会话本身的 Close 由宿主在等待消费者退出前先行调用，
 // 顺序是宿主的职责）。重复调用安全。
 func (e *Engine) Close() error {
+	if e.memClose != nil {
+		// 记忆服务的后台提交（遗留会话）以 agent.DefaultCloseGrace 为上限等待；超时则放行，
+		// 未完成的提交由下一次启动的 Start 重做（document_id 幂等）。
+		ctx, cancel := context.WithTimeout(context.Background(), agent.DefaultCloseGrace)
+		if err := e.memClose(ctx); err != nil {
+			e.log.Warn("memory: background commit still running at close", "err", err)
+		}
+		cancel()
+	}
 	if e.jsonlStore != nil {
 		return e.jsonlStore.Close()
 	}

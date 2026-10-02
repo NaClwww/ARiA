@@ -1,6 +1,7 @@
 // Package memory 是记忆服务在 runtime 侧的接口与调用策略（docs/memory/options.md「记忆服务接口」）：
-// Service 由记忆服务的客户端实现（放 plugins，经 Setup 注入）；Client 在 Service 之上实现已确认的
-// 失败处理（重试与超时），供 agent 调用。
+// Service 的实现放 plugins，由 internal/assemble.Memory 按配置段 [memory] 装配为 agent.Config.Memory；
+// Client 在 Service 之上实现已确认的失败处理（重试与超时），供 agent 调用；RecallTool 是模型调用的
+// memory_recall 工具。
 package memory
 
 import (
@@ -81,8 +82,8 @@ type Service interface {
 	Recall(ctx context.Context, req RecallRequest) ([]Item, error)
 }
 
-// 失败处理的缺省值（docs/memory/options.md「记忆服务接口」）。Recall 由 memory_recall 工具调用
-// （模型发起，不在组装路径上），超时 3 s。
+// 失败处理的缺省值（docs/memory/options.md「记忆服务接口」）：Start 由 Client 执行；Recall 由 memory_recall
+// 工具（RecallTool）执行，模型发起，不在组装路径上。
 const (
 	DefaultStartTimeout  = 5 * time.Second
 	DefaultRecallTimeout = 3 * time.Second
@@ -92,13 +93,12 @@ const (
 var DefaultRetryDelays = []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
 
 // Client 在 Service 之上实现失败处理：Stage 与 End 失败后按 DefaultRetryDelays 重试；
-// Start 超时 DefaultStartTimeout，Recall 超时 DefaultRecallTimeout。日志经 log 输出。
+// Start 超时 DefaultStartTimeout。日志经 log 输出。
 type Client struct {
-	svc           Service
-	log           *slog.Logger
-	retryDelays   []time.Duration
-	startTimeout  time.Duration
-	recallTimeout time.Duration
+	svc          Service
+	log          *slog.Logger
+	retryDelays  []time.Duration
+	startTimeout time.Duration
 }
 
 // NewClient 用缺省的重试间隔与超时包装 svc；log 为 nil 时使用 slog.Default()。
@@ -107,11 +107,10 @@ func NewClient(svc Service, log *slog.Logger) *Client {
 		log = slog.Default()
 	}
 	return &Client{
-		svc:           svc,
-		log:           log,
-		retryDelays:   DefaultRetryDelays,
-		startTimeout:  DefaultStartTimeout,
-		recallTimeout: DefaultRecallTimeout,
+		svc:          svc,
+		log:          log,
+		retryDelays:  DefaultRetryDelays,
+		startTimeout: DefaultStartTimeout,
 	}
 }
 
@@ -151,18 +150,6 @@ func (c *Client) Start(ctx context.Context, req SessionRequest) ([]Item, error) 
 	items, err := c.svc.Start(ctx, req)
 	if err != nil {
 		c.log.Warn("memory: start failed, session begins without recall", "session", req.SessionID, "err", err)
-		return nil, err
-	}
-	return items, nil
-}
-
-// Recall 检索，超时 recallTimeout；超时或失败时输出 Warn 日志 memory: recall failed，返回 nil 与错误。
-func (c *Client) Recall(ctx context.Context, req RecallRequest) ([]Item, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.recallTimeout)
-	defer cancel()
-	items, err := c.svc.Recall(ctx, req)
-	if err != nil {
-		c.log.Warn("memory: recall failed", "session", req.SessionID, "err", err)
 		return nil, err
 	}
 	return items, nil

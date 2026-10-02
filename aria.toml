@@ -42,7 +42,7 @@ id = "aria"                     # 会话标识前缀：每个会话的标识为 
 default_user = "user"
 namespace = "default"           # 长期记忆的命名空间：每个家庭一个，全员共享
 idle_timeout_s = 1800           # 最近一轮结束后该时长（秒）内没有新输入：上下文清空，之后的输入进入新会话（不带入上一会话的摘要与原文）；0 = 不切换
-recall_wait_ms = 5000          # 会话首轮等待长期记忆召回的上限（毫秒），同时作为召回请求的超时；0 = 首轮不等待（接入记忆服务后生效）
+recall_wait_ms = 5000          # 会话首轮等待长期记忆召回的上限（毫秒），同时作为召回请求的超时；0 = 首轮不等待（memory.engine 非空时生效）
 
 [memory]                        # 长期记忆服务（docs/memory/options.md「写入与召回流程」）
 engine = ""                     # 空 = 不接入（不调用记忆服务、不提取要点、不装 memory_recall 工具）；"hindsight" = 测试期后端（plugins/memory/hindsight，需另行运行 Hindsight 容器）

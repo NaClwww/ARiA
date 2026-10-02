@@ -153,15 +153,15 @@ func main() {
 		os.Exit(2)
 	}
 	// 记忆服务（可空）：接入时装入 memory_recall 工具并在人设后追加使用规则（与 aria-host 同源）。
-	memSvc, err := assemble.Memory(cfg.Memory, log)
+	mem, err := assemble.Memory(cfg.Memory, log)
 	if err != nil {
 		log.Error("memory assemble failed", "err", err)
 		os.Exit(2)
 	}
-	if memSvc != nil {
-		tools = append(tools, memory.RecallTool(memory.NewClient(memSvc, log)))
+	if mem.Service != nil {
+		tools = append(tools, mem.Tool)
 		systemPrompt += "\n" + memory.RecallToolInstruction
-		log.Info("memory", "engine", cfg.Memory.Engine, "base_url", cfg.Memory.BaseURL, "dir", cfg.Memory.Dir)
+		log.Info("memory", "engine", cfg.Memory.Engine, "base_url", cfg.Memory.BaseURL, "dir", cfg.Memory.Dir, "members", len(cfg.Memory.Members))
 	}
 
 	sessionID, newSessionID := assemble.SessionIDs(cfg.Session, time.Now())
@@ -173,7 +173,7 @@ func main() {
 		Compact:         assemble.CompactBudget(cfg.Compress),
 		IdleTimeout:     assemble.IdleTimeout(cfg.Session),
 		RecallWait:      assemble.RecallWait(cfg.Session),
-		Memory:          memSvc,
+		Memory:          mem.Service,
 		NewSessionID:    newSessionID,
 		Store:           store,
 		SystemPrompt:    systemPrompt,
@@ -234,6 +234,14 @@ func main() {
 	unsub()
 	if err := sess.Close(); err != nil {
 		log.Error("session close", "err", err)
+	}
+	if mem.Close != nil {
+		// 记忆服务的后台提交以 agent.DefaultCloseGrace 为上限等待，超时放行（下一次启动重做）。
+		ctx, cancel := context.WithTimeout(context.Background(), agent.DefaultCloseGrace)
+		if err := mem.Close(ctx); err != nil {
+			log.Warn("memory: background commit still running at close", "err", err)
+		}
+		cancel()
 	}
 	<-printerDone
 	if store != nil {
