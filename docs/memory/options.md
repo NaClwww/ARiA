@@ -74,7 +74,7 @@
 
 ## 写入与召回流程（2026-10-02 讨论结论）
 
-本节记录写入时机、暂存与提交、会话之间的衔接、记忆服务接口与合并的执行方。记忆服务尚未选型；ARiA 侧除「新会话不带入上一会话内容」（`window.Reset`）外均未实现。
+本节记录写入时机、暂存与提交、会话之间的衔接、记忆服务接口与合并的执行方。记忆服务尚未选型；ARiA 侧的实现状态见本节「ARiA 侧实现状态」。
 
 ### 已定
 
@@ -90,6 +90,22 @@
 | 8 | 召回 | 第 n 个会话可召回未提交的暂存（一般为第 n−1 个会话）；会话开始时先召回一次，返回内容由服务端处理，包括按时间排序、暂存与正式记忆去重、返回最近一个会话的要点 |
 | 9 | 关闭缺口 | 搁置：会话切换前关闭进程时，尚未成批的原文不进入记忆 |
 | 10 | 合并执行方 | 服务端：End 的语义为服务端按自身策略提交与合并（见「记忆服务接口」）；合并的时机、模型与规则属于服务端设计。ARiA 侧只负责提取要点与调用 4 个接口 |
+
+### ARiA 侧实现状态（2026-10-02）
+
+| # | 工作项 | 状态 |
+|---|---|---|
+| 1 | 会话切换：无操作超时、新 SessionID、清空窗口（`window.Reset`） | 已实现 |
+| 2 | 记忆服务接口与失败处理：`runtime/memory` 的 `Service`（接口）与 `Client`（重试 3 次、Start 超时 5 s、Recall 超时 500 ms） | 已实现 |
+| 3 | Stage：`window.PointExtractor` 与 `Window.SetOnPoints` 上报要点，`agent` 生成 batch_id（`ctxx.NewTrace().TraceID`）与 seq 并投递 | 已实现 |
+| 4 | End / Start：会话切换时依次投递，`NewSession` 时投递 Start；Start 的结果经 `window.RecallMessage` 写入窗口的召回位置（`Window.SetRecalled`） | 已实现 |
+| 5 | namespace：配置项 `session.namespace`（缺省 `default`），宿主写入 `Scope.Namespace` | 已实现 |
+| 6 | 压缩调用同时输出要点：`window.ProviderCompressor` 实现 `window.PointExtractor`（`CompressWithPoints`）；窗口注册了要点上报（`Window.SetOnPoints`，配置了记忆服务时由 `agent` 注册）时改用该调用，keeplast 不提取 | 已实现 |
+| 7 | 会话切换时对清除的原文提取要点（压缩实现为 `PointExtractor` 时）：`Window.Reset` 返回会话内摘要、原文与最后的批次序号（`window.Cleared`），记忆服务的后台 goroutine 调用 `Window.ExtractPoints`（`ProviderCompressor.ExtractPoints`，以 `Reset` 返回的会话内摘要为上下文，使用该会话最近一轮 run ctx 的值），以下一个序号 Stage，之后 End、Start | 已实现 |
+| 8 | 每轮 Recall | 未实现：依赖「未定」第 1 项；`Client.Recall` 已提供 |
+| 9 | 记忆服务的 HTTP 客户端（plugins） | 未实现：依赖「未定」第 4 项；宿主未设置 `agent.Config.Memory`，当前不调用记忆服务，也不提取要点 |
+
+记忆服务调用由每个 Session 的一个后台 goroutine 按投递顺序执行（队列容量 64，队列满时丢弃该次调用并输出 Error 日志），每次调用的 ctx 带该调用所属会话的 Scope。会话切换前已完成批次的要点先于 End 投递；`Close` 时队列中尚未执行的调用丢弃（关闭缺口搁置）。
 
 ### 时序
 
@@ -110,7 +126,7 @@
 | 接口 | 调用时机（ARiA 侧位置） | 参数 | 返回 | 幂等 | 失败处理 |
 |---|---|---|---|---|---|
 | Stage | 每个压缩批次的要点提取完成后，要点为空时不调用（压缩路径） | namespace, session_id, batch_id（每批新生成的 TraceID）, seq（本会话内批次序号，从 1 起）, points | 无 | batch_id：服务端据此拒绝重放 | 重试 3 次，间隔 1 s / 2 s / 4 s；仍失败则输出 Error 日志，本批要点丢弃（原文仍在 jsonl） |
-| End | 会话切换：最后一批 Stage 之后（agent.onIdle） | namespace, session_id, ended_at | 无 | session_id | 重试 3 次；仍失败则输出 Error 日志，由下一次 Start 补齐 |
+| End | 会话切换：最后一批 Stage 之后（agent.onIdle） | namespace, session_id, ended_at（该会话最近一轮的结算时刻） | 无 | session_id | 重试 3 次；仍失败则输出 Error 日志，由下一次 Start 补齐 |
 | Start | 新会话开始：会话切换时与进程启动时，异步执行（agent.onIdle、agent.NewSession） | namespace, session_id, started_at | items | session_id | 超时 5 s；超时或失败则新会话不带召回结果，输出 Warn 日志 |
 | Recall | 每轮组装（是否保留未定） | namespace, session_id, query（当前输入文本）, limit | items | 无 | 超时 500 ms；超时则本轮无检索结果 |
 
@@ -121,17 +137,30 @@
 - Start：把此前未结束的会话视为已结束并提交（进程异常退出后的遗留会话由此处理）；返回会话开始时的召回结果，内容由服务端决定，可包括上一会话未提交的暂存、最近要点、即将到期的承诺。
 - Recall：在正式记忆与暂存中检索；按时间排序，同一要点不同时以暂存与正式记忆两种形式返回。
 
-召回条目（items）的字段：text、source（committed 正式记忆 / staged 暂存）、session_id、at。Start 的结果放入新会话窗口的记忆位置（system 之后），整个会话内不变；结果返回前到达的输入照常组装、不等待。
+召回条目（items）的字段：text、source（committed 正式记忆 / staged 暂存）、session_id、at。Start 的结果放入新会话窗口的记忆位置（system 之后），整个会话内不变；结果返回前到达的输入照常组装、不等待，结果晚于首轮返回时自下一轮起出现在组装结果中。
 
-要点（points）的格式与内容推迟讨论，见下节。
+### 要点的格式（2026-10-02 确认）
+
+| 项 | 结论 |
+|---|---|
+| 输入 | 分两段：「既往摘要」（会话内压缩：上一版摘要；会话切换：会话内的压缩摘要）只用于理解上下文；「本批对话」为要点的唯一来源，以避免重复提取已暂存的内容。会话内压缩的新摘要涵盖两段 |
+| 字段 | `text`（独立成句、写明主语）、`kind`（fact 事实 / preference 偏好 / event 事件 / commitment ARiA 的承诺）、`speakers`（涉及的说话人名字，取自 `[名字]` 标注）、`due`（到期时间，RFC 3339，只用于 commitment） |
+| 记录规则 | 只记录涉及家庭成员或 ARiA 的事实、偏好、事件与 ARiA 的承诺；不记录访客（未识别说话人）的个人事实（需求 2）；不记录寒暄与无信息量的往来；每批最多 10 条 |
+| 输出格式 | 会话内压缩：`{"summary": "...", "points": [...]}`；会话切换时只提取：`{"points": [...]}`。提示词附当前时间（消息无时间戳），供模型换算相对时间 |
+| 摘要长度 | 800 字以内（由提示词限定） |
+| 输出不合法 | 从第一个「{」起解码一个 JSON 对象，其后的文本忽略；解码失败即本次调用失败。会话内压缩按压缩失败回退：本批原文并入记忆、继续参与组装，下一批压缩时移回「本批对话」重新提取，输出 Warn 日志 `window: compress failed, keeping raw messages`；会话切换时的提取失败后按 1 s / 2 s / 4 s 重试 3 次（期间 End、Start 等待），仍失败则不暂存，输出 Error 日志 `agent: session-end point extraction failed, points dropped`。要点逐条校验：字段类型不符与空文本的条目跳过、未知类别置空、不合法的 due 置零、超过 10 条截去 |
+| 启用条件 | 只在配置了记忆服务（`agent.Config.Memory`）时提取要点；未配置时压缩只输出摘要 |
+
+实现：`runtime/memory.Point`（Text / Kind / Speakers / Due）、`runtime/window` 的 `ProviderCompressor`（`CompressWithPoints` / `ExtractPoints`）、`DefaultPointsRules()`、`parseExtraction`。
+
 
 ### 未定
 
 | # | 项 | 说明 |
 |---|---|---|
-| 1 | 提取的格式与内容（推迟讨论） | 要点字段；摘要与要点的合并输出格式、输出不合法时的处理、摘要长度上限（当前 `ProviderCompressor.MaxTokens` 缺省 0 = 不限）；keeplast 策略不调用模型，无法输出要点 |
-| 2 | 召回细节 | 每轮召回是否保留、查询内容、注入条数与长度上限 |
-| 3 | 需求 2 | 要点提取时如何依据说话人标签筛选（随第 1 项讨论） |
-| 4 | 需求 7 | 摄像头画面只在组装时追加、不进入历史，压缩批次中没有视觉内容 |
-| 5 | 需求 8 | 要点需标注承诺与到期时间（随第 1 项讨论），ARiA 侧需要定时机制 |
-| 6 | 记忆服务选型 | 候选方案 A～D 未定；所选服务须提供上述 4 个接口与服务端合并。候选引擎是否具备暂存与提交未查证；不具备时，需要在引擎之外封装一层服务提供这些接口 |
+| 1 | 召回细节 | 每轮召回是否保留、查询内容、注入条数与长度上限 |
+| 2 | 需求 7 | 摄像头画面只在组装时追加、不进入历史，压缩批次中没有视觉内容 |
+| 3 | 需求 8 | 承诺的 `due` 已随要点输出；到期触发需要 ARiA 侧的定时机制，未设计 |
+| 4 | 记忆服务选型 | 候选方案 A～D 未定；所选服务须提供上述 4 个接口与服务端合并。候选引擎是否具备暂存与提交未查证；不具备时，需要在引擎之外封装一层服务提供这些接口 |
+
+需求 2 由要点提取的提示词规则执行，效果未经实测。
