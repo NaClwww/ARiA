@@ -15,6 +15,7 @@ import (
 	"aria/core/provider"
 	"aria/pkg/ctxx"
 	"aria/pkg/message"
+	"aria/runtime/memory"
 )
 
 func quiet() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -1047,8 +1048,8 @@ func TestResetClearsWindowAndReturnsRaw(t *testing.T) {
 	w.Settle(context.Background(), qaTurn("C"), 900) // 压缩 A、B，保留 C
 	w.Wait()
 
-	if got := texts(w.Reset()); !equal(got, []string{"user:问C", "assistant:答C"}) {
-		t.Fatalf("应返回近轮原文 C：got %v", got)
+	if raw := w.Reset().Raw; !equal(texts(raw), []string{"user:问C", "assistant:答C"}) {
+		t.Fatalf("应返回近轮原文 C：got %v", texts(raw))
 	}
 	if got := texts(w.Assemble([]message.Message{message.NewUser("新输入")})); !equal(got, []string{"user:新输入"}) {
 		t.Fatalf("Reset 后组装应只含新输入：got %v", got)
@@ -1076,8 +1077,8 @@ func TestResetDiscardsInFlightCompressionResult(t *testing.T) {
 	<-bc.entered
 
 	want := []string{"user:问A", "assistant:答A", "user:问B", "assistant:答B", "user:问C", "assistant:答C"}
-	if got := texts(w.Reset()); !equal(got, want) {
-		t.Fatalf("应返回在途与近轮：want %v got %v", want, got)
+	if raw := w.Reset().Raw; !equal(texts(raw), want) {
+		t.Fatalf("应返回在途与近轮：want %v got %v", want, texts(raw))
 	}
 	w.Settle(ctx, qaTurn("D"), 100)
 	close(bc.gate)
@@ -1103,5 +1104,369 @@ func TestResetCancelsCompressionWithoutFallback(t *testing.T) {
 	w.Wait()
 	if mem, recent := w.Snapshot(); len(mem) != 0 || len(recent) != 0 {
 		t.Fatalf("Reset 后窗口应为空：memory %v recent %v", texts(mem), texts(recent))
+	}
+}
+
+// ---------- 长期记忆：要点上报（PointExtractor）与会话开始时的召回（SetRecalled） ----------
+
+// pointCompressor 实现 PointExtractor：输出固定摘要，要点为本批第一条消息的文本；gate 非 nil 时
+// 首次调用阻塞至 gate 关闭（entered 发出进入信号）。
+type pointCompressor struct {
+	gate    chan struct{}
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (c *pointCompressor) Compress(ctx context.Context, memory, turn []message.Message) ([]message.Message, error) {
+	out, _, err := c.CompressWithPoints(ctx, memory, turn)
+	return out, err
+}
+
+func (c *pointCompressor) CompressWithPoints(_ context.Context, _, turn []message.Message) ([]message.Message, []memory.Point, error) {
+	if c.gate != nil {
+		c.once.Do(func() { c.entered <- struct{}{} })
+		<-c.gate
+	}
+	return []message.Message{message.NewUser("摘要")}, []memory.Point{{Text: "要点:" + turn[0].Text()}}, nil
+}
+
+func (c *pointCompressor) ExtractPoints(_ context.Context, _, turn []message.Message) ([]memory.Point, error) {
+	return []memory.Point{{Text: "切换要点:" + turn[0].Text()}}, nil
+}
+
+type pointReport struct {
+	seq    int
+	points []string
+}
+
+func pointTexts(ps []memory.Point) []string {
+	out := make([]string, 0, len(ps))
+	for _, p := range ps {
+		out = append(out, p.Text)
+	}
+	return out
+}
+
+// 每批压缩成功且要点非空时上报，seq 从 1 递增；Reset 后重新从 1 起。
+func TestPointsReportedWithSeqResetByReset(t *testing.T) {
+	w := eagerWin(&pointCompressor{})
+	var mu sync.Mutex
+	var got []pointReport
+	w.SetOnPoints(func(_ context.Context, seq int, points []memory.Point) {
+		mu.Lock()
+		got = append(got, pointReport{seq, pointTexts(points)})
+		mu.Unlock()
+	})
+	w.Settle(context.Background(), qaTurn("1"), 0)
+	w.Wait()
+	w.Settle(context.Background(), qaTurn("2"), 0)
+	w.Wait()
+	w.Reset()
+	w.Settle(context.Background(), qaTurn("3"), 0)
+	w.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []pointReport{{1, []string{"要点:问1"}}, {2, []string{"要点:问2"}}, {1, []string{"要点:问3"}}}
+	if len(got) != len(want) {
+		t.Fatalf("上报次数不符：want %v got %v", want, got)
+	}
+	for i := range want {
+		if got[i].seq != want[i].seq || !equal(got[i].points, want[i].points) {
+			t.Fatalf("第 %d 次上报不符：want %v got %v", i+1, want[i], got[i])
+		}
+	}
+}
+
+// 压缩期间 Reset：该批的要点不上报。
+func TestPointsNotReportedWhenResetDuringCompression(t *testing.T) {
+	pc := &pointCompressor{gate: make(chan struct{}), entered: make(chan struct{}, 1)}
+	w := eagerWin(pc)
+	reported := false
+	w.SetOnPoints(func(context.Context, int, []memory.Point) { reported = true })
+	w.Settle(context.Background(), qaTurn("1"), 0)
+	<-pc.entered
+	w.Reset()
+	close(pc.gate)
+	w.Wait()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if reported {
+		t.Fatal("Reset 期间完成的批次不应上报要点")
+	}
+}
+
+// 召回位于 system 之后、压缩记忆之前，不参与压缩；Reset 清除。
+func TestRecalledPrecedesMemoryAndSkipsCompression(t *testing.T) {
+	rc := &recordingCompressor{out: []message.Message{message.NewUser("摘要")}}
+	w := eagerWin(rc)
+	w.SetSystem("人设")
+	w.SetRecalled([]message.Message{message.NewUser("召回")})
+	w.Settle(context.Background(), qaTurn("1"), 0)
+	w.Wait()
+
+	want := []string{"system:人设", "user:召回", "user:摘要", "user:新输入"}
+	if got := texts(w.Assemble([]message.Message{message.NewUser("新输入")})); !equal(got, want) {
+		t.Fatalf("assemble: want %v got %v", want, got)
+	}
+	for _, s := range rc.seen() {
+		if s == "user:召回" {
+			t.Fatalf("召回不应进入压缩输入：%v", rc.seen())
+		}
+	}
+	w.Reset()
+	if got := texts(w.Assemble(nil)); !equal(got, []string{"system:人设"}) {
+		t.Fatalf("Reset 后应只剩 system：got %v", got)
+	}
+}
+
+// Reset 返回清除前的摘要与最后上报的批次序号；ExtractPoints 委托给当前压缩实现，不改变窗口状态。
+func TestResetReturnsSeqAndExtractPointsDelegates(t *testing.T) {
+	w := eagerWin(&pointCompressor{})
+	w.SetOnPoints(func(context.Context, int, []memory.Point) {})
+	w.Settle(context.Background(), qaTurn("1"), 0)
+	w.Wait()
+	if c := w.Reset(); c.Seq != 1 || !equal(texts(c.Memory), []string{"user:摘要"}) {
+		t.Fatalf("应返回摘要与最后的序号 1：%v %d", texts(c.Memory), c.Seq)
+	}
+	pts, err := w.ExtractPoints(context.Background(), nil, qaTurn("2"))
+	if err != nil || !equal(pointTexts(pts), []string{"切换要点:问2"}) || !w.ExtractsPoints() {
+		t.Fatalf("ExtractPoints: %v %v", pointTexts(pts), err)
+	}
+	w.SetCompressor(KeepLast(10))
+	if w.ExtractsPoints() {
+		t.Fatal("KeepLast 不是 PointExtractor")
+	}
+	if pts, err := w.ExtractPoints(context.Background(), nil, qaTurn("3")); pts != nil || err != nil {
+		t.Fatalf("非 PointExtractor 应返回 nil：%v %v", pts, err)
+	}
+}
+
+// textProvider 记录请求并以 reply 作为回复正文。
+type textProvider struct {
+	provider.NoLimits
+	reply string
+	req   provider.Request
+}
+
+func (p *textProvider) Stream(_ context.Context, req provider.Request) (<-chan provider.StreamEvent, error) {
+	p.req = req
+	ch := make(chan provider.StreamEvent, 1)
+	ch <- provider.MessageComplete{Message: message.NewAssistant(p.reply)}
+	close(ch)
+	return ch, nil
+}
+
+func fixedNow() time.Time { return time.Date(2026, 10, 2, 15, 0, 0, 0, time.UTC) }
+
+// 一次调用同时输出摘要与要点：摘要进入 memory 块，要点按字段解析；提示词带当前时间与 JSON 格式。
+func TestProviderCompressorParsesSummaryAndPoints(t *testing.T) {
+	tp := &textProvider{reply: "```json\n" + `{"summary": "聊了周末安排", "points": [` +
+		`{"text": "用户计划周日去大阪", "kind": "event", "speakers": ["小明"]},` +
+		`{"text": "周六晚上提醒用户订票", "kind": "commitment", "due": "2026-10-03T20:00:00+08:00"}]}` + "\n```"}
+	pe := &ProviderCompressor{Provider: tp, Now: fixedNow}
+	out, pts, err := pe.CompressWithPoints(context.Background(), []message.Message{message.NewUser("旧摘要")}, qaTurn("1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 || !strings.Contains(out[0].Text(), "聊了周末安排") || strings.Contains(out[0].Text(), "points") {
+		t.Fatalf("摘要不符：%v", texts(out))
+	}
+	if len(pts) != 2 || pts[0].Kind != memory.KindEvent || !equal(pts[0].Speakers, []string{"小明"}) ||
+		pts[1].Kind != memory.KindCommitment || pts[1].Due.IsZero() {
+		t.Fatalf("要点不符：%+v", pts)
+	}
+	sys := tp.req.Messages[0].Text()
+	for _, want := range []string{"2026-10-02T15:00:00Z", `"points"`, "800 字", "要点只从「本批对话」提取"} {
+		if !strings.Contains(sys, want) {
+			t.Fatalf("提示词缺少 %q：%s", want, sys)
+		}
+	}
+	body := tp.req.Messages[1].Text()
+	if i, j := strings.Index(body, "【既往摘要】"), strings.Index(body, "【本批对话】"); i < 0 || j < i ||
+		!strings.Contains(body[i:j], "旧摘要") || !strings.Contains(body[j:], "问1") {
+		t.Fatalf("输入应分为既往摘要与本批对话两段：%s", body)
+	}
+}
+
+// 输出不是合法 JSON 对象：CompressWithPoints 返回错误，由窗口按压缩失败回退。
+func TestProviderCompressorInvalidPointsOutputFails(t *testing.T) {
+	pe := &ProviderCompressor{Provider: &textProvider{reply: "用户聊了周末安排"}}
+	if out, pts, err := pe.CompressWithPoints(context.Background(), nil, qaTurn("1")); err == nil {
+		t.Fatalf("不合法输出应返回错误：out %v pts %v", texts(out), pts)
+	}
+}
+
+// 会话切换时只提取要点：提示词不要求摘要，输出不合法时返回错误。
+func TestProviderCompressorExtractPointsOnly(t *testing.T) {
+	tp := &textProvider{reply: `{"points": [{"text": "用户喜欢猫", "kind": "preference"}]}`}
+	pe := &ProviderCompressor{Provider: tp}
+	pts, err := pe.ExtractPoints(context.Background(), []message.Message{message.NewUser("会话内摘要")}, qaTurn("1"))
+	if err != nil || len(pts) != 1 || pts[0].Kind != memory.KindPreference {
+		t.Fatalf("ExtractPoints: %+v %v", pts, err)
+	}
+	if strings.Contains(tp.req.Messages[0].Text(), `"summary"`) {
+		t.Fatalf("只提取要点时提示词不应要求摘要：%s", tp.req.Messages[0].Text())
+	}
+	if body := tp.req.Messages[1].Text(); !strings.Contains(body, "【既往摘要】") || !strings.Contains(body, "会话内摘要") {
+		t.Fatalf("应附上会话内摘要作上下文：%s", body)
+	}
+	tp.reply = "没有 JSON"
+	if pts, err := pe.ExtractPoints(context.Background(), nil, qaTurn("1")); pts != nil || err == nil {
+		t.Fatalf("不合法输出应返回错误：%v %v", pts, err)
+	}
+}
+
+// 要点逐条校验：字段类型不符与空文本跳过、未知类别置空、非 commitment 不解析 due、不合法 due 置零、
+// 超过上限截去；对象之后的文本忽略。
+func TestParseExtractionValidatesPoints(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("```json\n" + `{"summary": "s", "points": [{"text": " "}, {"text": "c", "speakers": "小明"},` +
+		`{"text": "a", "kind": "unknown", "due": "2026-10-03T20:00:00Z"}, {"text": "b", "kind": "commitment", "due": "明天"}`)
+	for i := 0; i < MaxPointsPerBatch; i++ {
+		b.WriteString(`, {"text": "x"}`)
+	}
+	b.WriteString("]}\n```\n注：{无}")
+	ext, err := parseExtraction(b.String())
+	if err != nil || len(ext.points) != MaxPointsPerBatch {
+		t.Fatalf("应截取 %d 条：err %v len %d", MaxPointsPerBatch, err, len(ext.points))
+	}
+	if ext.points[0].Text != "a" || ext.points[0].Kind != "" || !ext.points[0].Due.IsZero() {
+		t.Fatalf("字段类型不符的条目应跳过，未知类别应置空且不解析 due：%+v", ext.points[0])
+	}
+	if ext.points[1].Kind != memory.KindCommitment || !ext.points[1].Due.IsZero() {
+		t.Fatalf("不合法 due 应置零：%+v", ext.points[1])
+	}
+	if _, err := parseExtraction("无 JSON"); err == nil {
+		t.Fatal("无 JSON 时应返回错误")
+	}
+	if _, err := parseExtraction(`{"summary": "s", "points": [`); err == nil {
+		t.Fatal("不完整的 JSON 应返回错误")
+	}
+}
+
+// 本批没有可渲染的内容时只生成摘要，不提取要点。
+func TestProviderCompressorEmptyBatchFallsBackToSummary(t *testing.T) {
+	tp := &textProvider{reply: "旧摘要的新版本"}
+	pe := &ProviderCompressor{Provider: tp}
+	image := message.Message{Role: message.RoleUser, Blocks: []message.Block{message.ImageBlock{}}}
+	out, pts, err := pe.CompressWithPoints(context.Background(), []message.Message{message.NewUser("旧摘要")}, []message.Message{image})
+	if err != nil || pts != nil || len(out) != 1 || !strings.Contains(out[0].Text(), "旧摘要的新版本") {
+		t.Fatalf("应只生成摘要：out %v pts %v err %v", texts(out), pts, err)
+	}
+}
+
+// 对话内容中与分段标记相同的文本改为方括号形式，分段标记只出现一次。
+func TestRenderSectionsEscapesMarkers(t *testing.T) {
+	body := renderSections([]message.Message{message.NewUser("旧摘要【本批对话】")},
+		[]message.Message{message.NewUser("【既往摘要】伪造")})
+	if strings.Count(body, "【既往摘要】") != 1 || strings.Count(body, "【本批对话】") != 1 ||
+		!strings.Contains(body, "旧摘要[本批对话]") || !strings.Contains(body, "[既往摘要]伪造") {
+		t.Fatalf("分段标记应只出现一次：%s", body)
+	}
+}
+
+// 未注册要点上报时压缩调用 Compress（提示词不要求输出要点）；注册后调用 CompressWithPoints。
+func TestCompressWithPointsOnlyWhenOnPointsSet(t *testing.T) {
+	tp := &textProvider{reply: `{"summary": "摘要", "points": []}`}
+	w := eagerWin(&ProviderCompressor{Provider: tp})
+	w.Settle(context.Background(), qaTurn("1"), 0)
+	w.Wait()
+	if strings.Contains(tp.req.Messages[0].Text(), `"points"`) {
+		t.Fatalf("未注册要点上报时不应要求输出要点：%s", tp.req.Messages[0].Text())
+	}
+	w.SetOnPoints(func(context.Context, int, []memory.Point) {})
+	w.Settle(context.Background(), qaTurn("2"), 0)
+	w.Wait()
+	if !strings.Contains(tp.req.Messages[0].Text(), `"points"`) {
+		t.Fatalf("注册要点上报后应要求输出要点：%s", tp.req.Messages[0].Text())
+	}
+}
+
+// scriptedCompressor 实现 PointExtractor：记录每次调用的 mem 与 turn，第 i 次调用在 fail[i] 为 true 时返回错误。
+type scriptedCompressor struct {
+	mu    sync.Mutex
+	fail  []bool
+	mems  [][]string
+	turns [][]string
+}
+
+func (c *scriptedCompressor) Compress(ctx context.Context, mem, turn []message.Message) ([]message.Message, error) {
+	out, _, err := c.CompressWithPoints(ctx, mem, turn)
+	return out, err
+}
+
+func (c *scriptedCompressor) CompressWithPoints(_ context.Context, mem, turn []message.Message) ([]message.Message, []memory.Point, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	i := len(c.turns)
+	c.mems, c.turns = append(c.mems, texts(mem)), append(c.turns, texts(turn))
+	if i < len(c.fail) && c.fail[i] {
+		return nil, nil, errors.New("压缩失败")
+	}
+	return []message.Message{message.NewUser("摘要")}, []memory.Point{{Text: "要点"}}, nil
+}
+
+func (c *scriptedCompressor) ExtractPoints(context.Context, []message.Message, []message.Message) ([]memory.Point, error) {
+	return nil, nil
+}
+
+// 压缩失败的批次并入记忆后，下一批压缩把它移回本批对话（要点从中提取），旧摘要仍作为 mem。
+func TestFailedBatchMovedBackToTurn(t *testing.T) {
+	sc := &scriptedCompressor{fail: []bool{false, true}}
+	w := eagerWin(sc)
+	w.SetOnPoints(func(context.Context, int, []memory.Point) {})
+	for _, n := range []string{"1", "2", "3"} { // 1 成功，2 失败并入记忆，3 与 2 同批
+		w.Settle(context.Background(), qaTurn(n), 0)
+		w.Wait()
+	}
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if want := []string{"user:问2", "assistant:答2", "user:问3", "assistant:答3"}; len(sc.turns) != 3 ||
+		!equal(sc.mems[2], []string{"user:摘要"}) || !equal(sc.turns[2], want) {
+		t.Fatalf("第 3 批应为 mem [摘要]、turn %v：mems %v turns %v", want, sc.mems, sc.turns)
+	}
+}
+
+// 压缩失败的批次在 Reset 时作为原文返回，不计入摘要。
+func TestResetReturnsFailedBatchAsRaw(t *testing.T) {
+	w := eagerWin(&scriptedCompressor{fail: []bool{false, true}})
+	w.SetOnPoints(func(context.Context, int, []memory.Point) {})
+	for _, n := range []string{"1", "2"} {
+		w.Settle(context.Background(), qaTurn(n), 0)
+		w.Wait()
+	}
+	c := w.Reset()
+	if !equal(texts(c.Memory), []string{"user:摘要"}) || !equal(texts(c.Raw), []string{"user:问2", "assistant:答2"}) {
+		t.Fatalf("Memory 应为摘要、Raw 应为失败批次：memory %v raw %v", texts(c.Memory), texts(c.Raw))
+	}
+}
+
+// Reset 清除待压缩批次的 ctx：其后结算的轮次以自身的 ctx 压缩并上报要点。
+func TestResetClearsPendingCtx(t *testing.T) {
+	pc := &pointCompressor{gate: make(chan struct{}), entered: make(chan struct{}, 1)}
+	w := eagerWin(pc)
+	var mu sync.Mutex
+	var sessions []string
+	w.SetOnPoints(func(ctx context.Context, _ int, _ []memory.Point) {
+		sc, _ := ctxx.ScopeFrom(ctx)
+		mu.Lock()
+		sessions = append(sessions, sc.SessionID)
+		mu.Unlock()
+	})
+	at := func(sid string) context.Context {
+		return ctxx.WithScope(context.Background(), ctxx.Scope{SessionID: sid})
+	}
+	w.Settle(at("s1"), qaTurn("1"), 0)
+	<-pc.entered
+	w.Settle(at("s1"), qaTurn("2"), 0) // 压缩在途：记为待压缩批次的 ctx
+	w.Reset()
+	w.Settle(at("s2"), qaTurn("3"), 0)
+	close(pc.gate)
+	w.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	if !equal(sessions, []string{"s2"}) {
+		t.Fatalf("Reset 后的批次应以 s2 上报：%v", sessions)
 	}
 }

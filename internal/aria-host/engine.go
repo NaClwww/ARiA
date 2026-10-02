@@ -181,7 +181,7 @@ func NewEngine(opts Options) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("agent 装配失败: %w", err)
 	}
-	sess, err := ag.NewSession(ctxx.Scope{SessionID: sessionID, UserID: cfg.Session.DefaultUser})
+	sess, err := ag.NewSession(ctxx.Scope{SessionID: sessionID, UserID: cfg.Session.DefaultUser, Namespace: cfg.Session.Namespace})
 	if err != nil {
 		return nil, fmt.Errorf("会话建立失败: %w", err)
 	}

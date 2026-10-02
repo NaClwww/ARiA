@@ -1,6 +1,6 @@
 // Package window 负责每轮上下文组装（docs/03 §5）：
 //
-//	每轮进 core 的历史 = 压缩记忆 + 未压缩近轮 + 新输入
+//	每轮进 core 的历史 = 会话开始时的召回 + 压缩记忆 + 未压缩近轮 + 新输入
 //
 // 压缩（一次 LLM 调用）不在组装快路径上：轮次结束后由 Settle 在间隙里异步做，
 // 未就绪时下一轮继续用旧记忆——慢一点，但组装路径永远没有 LLM 调用。
@@ -8,6 +8,9 @@
 // 压缩按上下文用量触发（见 Budget）：上下文剩余量低于预留量时，压缩触发时刻
 // 近轮中除最近 K 轮以外的轮次；压缩进行中结算的轮次不计入 K，保留原文。
 // 会话切换时由 Reset 清空记忆与近轮：新会话不带入上一会话的摘要与原文。
+//
+// 压缩实现同时实现 PointExtractor、且已由 SetOnPoints 注册回调时，压缩调用一并输出待写入长期记忆的
+// 要点并交给该回调（docs/memory/options.md「写入与召回流程」）。
 package window
 
 import (
@@ -21,6 +24,7 @@ import (
 	"aria/core/provider"
 	"aria/pkg/ctxx"
 	"aria/pkg/message"
+	"aria/runtime/memory"
 )
 
 // Budget 是按上下文用量触发压缩的预算（单位 token）。
@@ -51,6 +55,17 @@ const (
 	defaultFallbackCap = 4 * DefaultKeepLast
 )
 
+// PointExtractor 是 Compressor 的可选扩展（docs/memory/options.md「要点的格式」）：
+//   - CompressWithPoints：会话内压缩，一次调用同时输出新记忆与待写入长期记忆的要点；本批不需要写入时
+//     points 为空；错误与空输出的处理与 Compress 相同；
+//   - ExtractPoints：会话切换时对清除的原文只提取要点，不生成摘要；mem 为会话内的压缩摘要，只用于理解上下文。
+//
+// 两个方法的要点都只从 turn 提取，mem 只用于理解上下文；实现不得修改传入的消息切片。
+type PointExtractor interface {
+	CompressWithPoints(ctx context.Context, mem, turn []message.Message) (out []message.Message, points []memory.Point, err error)
+	ExtractPoints(ctx context.Context, mem, turn []message.Message) ([]memory.Point, error)
+}
+
 // Compressor 把「旧记忆 + 本轮消息」压成新记忆（03 §5 间隙压缩）。
 //
 // 契约：输出不得为空——空输出按失败处理（窗口退回未压缩形态，绝不静默清空）。
@@ -67,6 +82,7 @@ type Window struct {
 	system      string // 每轮置顶的 system 内容（可信文本；装配期设置）
 
 	mu          sync.Mutex
+	recalled    []message.Message // 会话开始时召回的长期记忆：整个会话内不变，不参与压缩，见 SetRecalled
 	memory      []message.Message // 已压缩的记忆
 	inflight    []message.Message // 正被压缩的消息：仍参与组装，压完才被替换
 	recent      []message.Message // 尚未压缩的近轮（此前输入与产出）
@@ -75,9 +91,12 @@ type Window struct {
 	budget      Budget            // 按用量触发压缩的预算，见 SetBudget
 	used        int               // 最近一次判定得到的上下文用量（token）
 	epoch       uint64            // Reset 次数：在途压缩据此判定结果是否仍属于当前窗口
+	pointSeq    int               // 本次 Reset 以来已上报要点的批次数（SetOnPoints 回调的 seq）
+	unextracted int               // memory 末尾未提取要点的原文条数：压缩失败回退时并入，下一批压缩时移回本批对话
 	compressing bool
 	pendingCtx  context.Context // 触发待压缩批次的 Settle 的 ctx：下一轮压缩换用它的身份
 	onCompress  func(context.Context, loop.WindowCompressedData)
+	onPoints    func(ctx context.Context, seq int, points []memory.Point)
 	closed      bool
 	cancel      context.CancelFunc // 在途压缩的取消（Close 用）
 	compDone    chan struct{}      // 在途压缩的完成信号：结束即关闭（Wait 用）
@@ -110,6 +129,25 @@ func (w *Window) SetSystem(text string) {
 func (w *Window) SetOnCompress(fn func(ctx context.Context, rep loop.WindowCompressedData)) {
 	w.mu.Lock()
 	w.onCompress = fn
+	w.mu.Unlock()
+}
+
+// SetOnPoints 注册要点上报（装配期调用）：fn 非 nil 且压缩实现为 PointExtractor 时，压缩改用
+// CompressWithPoints，某批压缩成功且输出的要点非空时调用 fn；seq 为本次 Reset 以来上报的批次序号（从 1 起），
+// ctx 为该批压缩使用的 ctx。压缩期间窗口被 Reset 的批次不上报。fn 在持有窗口锁时同步执行，以保证
+// 同一窗口的上报先于其后 Reset 返回：fn 只能做非阻塞操作（例如投递到队列），不得调用窗口方法或可能
+// 等待窗口锁的方法。nil 关闭要点上报，压缩改回 Compress。
+func (w *Window) SetOnPoints(fn func(ctx context.Context, seq int, points []memory.Point)) {
+	w.mu.Lock()
+	w.onPoints = fn
+	w.mu.Unlock()
+}
+
+// SetRecalled 设置会话开始时召回的长期记忆（RecallMessage 等），组装时位于 system 之后、
+// 压缩记忆之前；整个会话内不变，不参与压缩，Reset 时清除。
+func (w *Window) SetRecalled(msgs []message.Message) {
+	w.mu.Lock()
+	w.recalled = cloneAll(msgs)
 	w.mu.Unlock()
 }
 
@@ -153,12 +191,13 @@ func (w *Window) cutTurnsLocked() int {
 	return n
 }
 
-// estimateLocked 按 budget.Count 估算当前上下文（system、记忆、在途与近轮）的 token 数（调用方持有 w.mu）。
+// estimateLocked 按 budget.Count 估算当前上下文（system、召回、记忆、在途与近轮）的 token 数（调用方持有 w.mu）。
 func (w *Window) estimateLocked() int {
-	ms := make([]message.Message, 0, len(w.memory)+len(w.inflight)+len(w.recent)+1)
+	ms := make([]message.Message, 0, len(w.recalled)+len(w.memory)+len(w.inflight)+len(w.recent)+1)
 	if w.system != "" {
 		ms = append(ms, message.NewSystem(w.system))
 	}
+	ms = append(ms, w.recalled...)
 	ms = append(ms, w.memory...)
 	ms = append(ms, w.inflight...)
 	ms = append(ms, w.recent...)
@@ -184,7 +223,7 @@ func (w *Window) SetCompressor(c Compressor) {
 //
 // 顺序固定（03 §5 分层规范，稳定前缀利于 provider 缓存）：
 //
-//	[system] → [<memory>] → 近轮 → 新输入
+//	[system] → [<memory> 会话开始时的召回] → [<memory> 压缩记忆] → 近轮 → 新输入
 //
 // inflight（正被压缩的消息）也参与组装：压缩在途时用户又说了话，
 // 那些消息必须仍在上下文里，否则会短暂失忆。
@@ -194,10 +233,11 @@ func (w *Window) SetCompressor(c Compressor) {
 func (w *Window) Assemble(input []message.Message) []message.Message {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	head := make([]message.Message, 0, len(w.memory)+1)
+	head := make([]message.Message, 0, len(w.recalled)+len(w.memory)+1)
 	if w.system != "" {
 		head = append(head, message.NewSystem(w.system))
 	}
+	head = append(head, cloneAll(w.recalled)...)
 	head = append(head, cloneAll(w.memory)...)
 	raw := append(cloneAll(w.inflight), cloneAll(w.recent)...)
 	tail := cloneAll(input)
@@ -275,20 +315,63 @@ func (w *Window) Settle(ctx context.Context, turn []message.Message, used int) {
 	w.mu.Unlock()
 }
 
-// Reset 清空记忆、在途与近轮（会话切换：新会话不带入上一会话的摘要与原文），返回被清除的
-// 原文（在途在前、近轮在后），供调用方另行处理。在途压缩被取消，其结果与失败回退一律丢弃；
-// Reset 之后结算的轮次照常参与组装与压缩。
-func (w *Window) Reset() []message.Message {
+// Cleared 是 Reset 清除的内容。
+type Cleared struct {
+	Memory []message.Message // 压缩摘要（不含会话开始时的召回与压缩失败回退时并入的原文）
+	Raw    []message.Message // 原文，按时间先后：压缩失败回退时并入记忆的原文、在途、近轮
+	Seq    int               // 清除前最后上报的要点批次序号；0 = 未上报过
+}
+
+// Reset 清空召回、记忆、在途与近轮（会话切换：新会话不带入上一会话的摘要与原文），返回被清除的内容
+// 供调用方另行处理（例如以摘要为上下文对原文提取要点，以 Seq+1 暂存）。在途压缩被取消，其结果与失败
+// 回退一律丢弃，待压缩批次的 ctx 一并清除；Reset 之后结算的轮次照常参与组装与压缩。
+func (w *Window) Reset() Cleared {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	raw := append(cloneAll(w.inflight), cloneAll(w.recent)...)
-	w.memory, w.inflight, w.recent, w.recentTurns = nil, nil, nil, nil
+	summary, unextracted := w.splitMemoryLocked()
+	raw := append(cloneAll(unextracted), cloneAll(w.inflight)...)
+	c := Cleared{
+		Memory: cloneAll(summary),
+		Raw:    append(raw, cloneAll(w.recent)...),
+		Seq:    w.pointSeq,
+	}
+	w.recalled, w.memory, w.inflight, w.recent, w.recentTurns = nil, nil, nil, nil, nil
+	w.unextracted = 0
 	w.used = 0
 	w.epoch++
+	w.pointSeq = 0
+	w.pendingCtx = nil // 上一会话轮次的 ctx：不得用于其后结算的轮次
 	if w.cancel != nil {
 		w.cancel()
 	}
-	return raw
+	return c
+}
+
+// splitMemoryLocked 把 memory 分为摘要与末尾未提取要点的原文（见 unextracted；调用方持有 w.mu）。
+func (w *Window) splitMemoryLocked() (summary, unextracted []message.Message) {
+	n := len(w.memory) - w.unextracted
+	return w.memory[:n], w.memory[n:]
+}
+
+// ExtractsPoints 报告当前压缩实现是否为 PointExtractor。
+func (w *Window) ExtractsPoints() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_, ok := w.compressor.(PointExtractor)
+	return ok
+}
+
+// ExtractPoints 用当前压缩实现对 msgs 只提取要点（PointExtractor.ExtractPoints），mem 只用于理解上下文；
+// 不改变窗口状态，mem 与 msgs 不复制、直接交给压缩实现；压缩实现不是 PointExtractor 时返回 nil。
+func (w *Window) ExtractPoints(ctx context.Context, mem, msgs []message.Message) ([]memory.Point, error) {
+	w.mu.Lock()
+	comp := w.compressor
+	w.mu.Unlock()
+	pe, ok := comp.(PointExtractor)
+	if !ok {
+		return nil, nil
+	}
+	return pe.ExtractPoints(ctx, mem, msgs)
 }
 
 // startLocked 标记压缩在途并启动压缩 goroutine（调用方持有 w.mu）。
@@ -344,15 +427,27 @@ func (w *Window) compress(ctx context.Context) {
 		for _, n := range w.recentTurns[:cutTurns] {
 			cut += n
 		}
-		mem, turn := cloneAll(w.memory), cloneAll(w.recent[:cut])
+		// 压缩失败回退时并入 memory 的原文未曾提取要点，移回本批对话：要点只从本批对话提取。
+		summary, unextracted := w.splitMemoryLocked()
+		turn := append(cloneAll(unextracted), cloneAll(w.recent[:cut])...)
+		w.memory, w.unextracted = summary, 0
+		mem := cloneAll(summary)
 		w.recent = slices.Clone(w.recent[cut:]) // recent 只由窗口持有：浅拷贝即可释放旧底层数组
 		w.recentTurns = slices.Clone(w.recentTurns[cutTurns:])
 		w.inflight = turn
 		comp := w.compressor // 持锁取出：SetCompressor 可能并发替换字段
 		onCompress := w.onCompress
+		extract := w.onPoints != nil // 注册了要点上报时才提取要点（SetOnPoints）
 		w.mu.Unlock()
 
-		out, err := comp.Compress(ctx, mem, turn)
+		var out []message.Message
+		var points []memory.Point
+		var err error
+		if pe, ok := comp.(PointExtractor); ok && extract {
+			out, points, err = pe.CompressWithPoints(ctx, mem, turn)
+		} else {
+			out, err = comp.Compress(ctx, mem, turn)
+		}
 		if err == nil && len(out) == 0 {
 			err = errors.New("window: compressor returned empty memory")
 		}
@@ -380,11 +475,15 @@ func (w *Window) compress(ctx context.Context) {
 				report.FallbackDropped = len(mem) - len(trimmed)
 				mem = trimmed
 			}
-			w.memory = mem
+			w.memory, w.unextracted = mem, min(len(turn), len(mem)) // 本批原文未提取要点，见 unextracted
 			report.Err = err.Error()
 			report.OutMessages, report.OutChars = len(mem), charsOf(mem)
 		default:
 			w.memory = cloneAll(out) // 不持有 Compressor 的切片
+			if len(points) > 0 && w.onPoints != nil {
+				w.pointSeq++
+				w.onPoints(ctx, w.pointSeq, slices.Clone(points)) // 持锁回调：见 SetOnPoints 的约束
+			}
 		}
 		w.inflight = nil
 		// 成功：按压缩后的内容重新估算用量，仍满足触发条件（近轮仍过长，或压缩期间又有新结算）
@@ -423,11 +522,12 @@ func charsOf(ms []message.Message) int {
 	return n
 }
 
-// Snapshot 返回记忆（含在途）与近轮的副本（调试与测试用）。
+// Snapshot 返回记忆（含会话开始时的召回与在途）与近轮的副本（调试与测试用）。
 func (w *Window) Snapshot() (memory, recent []message.Message) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	mem := cloneAll(w.memory)
+	mem := cloneAll(w.recalled)
+	mem = append(mem, cloneAll(w.memory)...)
 	mem = append(mem, cloneAll(w.inflight)...)
 	return mem, cloneAll(w.recent)
 }
@@ -470,8 +570,8 @@ func (w *Window) Close() {
 // 之类的摘要实现。
 type KeepLast int
 
-func (k KeepLast) Compress(_ context.Context, memory, turn []message.Message) ([]message.Message, error) {
-	all := append(cloneAll(memory), cloneAll(turn)...)
+func (k KeepLast) Compress(_ context.Context, mem, turn []message.Message) ([]message.Message, error) {
+	all := append(cloneAll(mem), cloneAll(turn)...)
 	return trimKeepLast(all, int(k)), nil
 }
 

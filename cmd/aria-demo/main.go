@@ -171,7 +171,7 @@ func main() {
 		log.Error("agent new failed", "err", err)
 		os.Exit(1)
 	}
-	sess, err := ag.NewSession(ctxx.Scope{SessionID: sessionID, UserID: cfg.Session.DefaultUser})
+	sess, err := ag.NewSession(ctxx.Scope{SessionID: sessionID, UserID: cfg.Session.DefaultUser, Namespace: cfg.Session.Namespace})
 	if err != nil {
 		log.Error("session new failed", "err", err)
 		os.Exit(1)
