@@ -22,6 +22,7 @@ import (
 	"aria/pkg/ctxx"
 	"aria/pkg/message"
 	"aria/runtime/artifact"
+	"aria/runtime/memory"
 	"aria/runtime/persist"
 	"aria/runtime/toolkit"
 	"aria/runtime/window"
@@ -63,6 +64,21 @@ type Config struct {
 	// nil → SessionIDAt(NewSession 传入的 SessionID, 切换时刻)。
 	NewSessionID func(now time.Time) string
 
+	// Memory 是可选的记忆服务（docs/memory/options.md「记忆服务接口」）；nil → 不调用、不提取要点。
+	// NewSession 与会话切换时通知会话开始（Start，结果写入窗口的召回位置），会话切换时先通知
+	// 上一会话结束（End，结束时刻为该会话最近一轮的结算时刻）。压缩实现为 window.PointExtractor
+	// （window.ProviderCompressor 已实现）时，会话内压缩与会话切换时提取要点并暂存（Stage）。
+	// 调用经 memory.Client 的重试与超时，由每个 Session 的一个后台 goroutine 按投递顺序执行，
+	// ctx 带该调用所属会话的 Scope；队列容量 MemoryQueueSize，队列满时丢弃该次调用并输出 Error 日志。
+	// 调用使用 NewSession 传入的 Scope.Namespace。
+	Memory memory.Service
+
+	// RecallWait 是会话首轮等待会话开始召回（Start）的上限，同时作为 Start 的超时；0 = 首轮不等待，
+	// Start 的超时取 memory.DefaultStartTimeout。召回结果写入窗口后首轮立即开始组装；到达上限仍未返回时
+	// 首轮不带召回，由 s.log 输出 Warn 日志 agent: recall not ready, first turn proceeds without recall，
+	// 结果到达后自下一轮起出现在组装结果中。只在配置了 Memory 时生效。
+	RecallWait time.Duration
+
 	// Store 是可选的会话历史落盘（v1 只写不恢复）；nil → 不落盘。
 	// 实现必须尊重 ctx 取消，否则关停时尾部事件可能写不完（见 CloseGrace）。
 	Store persist.Store
@@ -99,6 +115,12 @@ type Config struct {
 
 // DefaultArtifactEntries 是默认内存 artifact 存储的条数上限（FIFO 淘汰）。
 const DefaultArtifactEntries = 64
+
+// MemoryQueueSize 是记忆服务调用队列的容量（见 Config.Memory）。
+const MemoryQueueSize = 64
+
+// extractRetryDelays 是会话切换时要点提取失败后的重试间隔，与 Stage、End 相同（memory.DefaultRetryDelays）。
+var extractRetryDelays = memory.DefaultRetryDelays
 
 // SessionIDAt 返回以 base 为前缀、以 t 为开始时刻的会话标识：
 // <base>-<YYYYMMDD>-<hhmmss.mmm>（t 所在时区）。
@@ -272,20 +294,21 @@ func (a *Agent) NewSession(scope ctxx.Scope) (*Session, error) {
 	win.SetSystem(a.cfg.SystemPrompt)
 	win.SetKeepRecentTurns(a.cfg.KeepRecentTurns)
 	s := &Session{
-		loop:    l,
-		win:     win,
-		scope:   scope,
-		ctx:     base,
-		cancel:  cancel,
-		closed:  make(chan struct{}),
-		dead:    make(chan struct{}),
-		grace:   a.grace,
-		log:     a.log,
-		store:   a.cfg.Store,
-		prov:    a.cfg.Provider,
-		compact: a.cfg.Compact,
-		idle:    a.cfg.IdleTimeout,
-		newID:   a.cfg.NewSessionID,
+		loop:       l,
+		win:        win,
+		scope:      scope,
+		ctx:        base,
+		cancel:     cancel,
+		closed:     make(chan struct{}),
+		dead:       make(chan struct{}),
+		grace:      a.grace,
+		log:        a.log,
+		store:      a.cfg.Store,
+		prov:       a.cfg.Provider,
+		compact:    a.cfg.Compact,
+		idle:       a.cfg.IdleTimeout,
+		recallWait: a.cfg.RecallWait,
+		newID:      a.cfg.NewSessionID,
 	}
 	if s.newID == nil {
 		base := scope.SessionID
@@ -349,7 +372,31 @@ func (a *Agent) NewSession(scope ctxx.Scope) (*Session, error) {
 			}
 		}()
 	}
+	if a.cfg.Memory != nil {
+		s.startMemory(a.cfg.Memory, scope)
+	}
 	return s, nil
+}
+
+// startMemory 启动记忆服务调用的后台 goroutine，注册要点上报，并通知首个会话开始。
+func (s *Session) startMemory(svc memory.Service, scope ctxx.Scope) {
+	s.mem = memory.NewClient(svc, s.log)
+	s.mem.SetStartTimeout(s.recallWait)
+	s.memJobs = make(chan memJob, MemoryQueueSize)
+	ctx, cancel := context.WithCancel(context.Background())
+	s.memCancel = cancel
+	s.memDone = make(chan struct{})
+	go s.memLoop(ctx)
+	s.win.SetOnPoints(func(bctx context.Context, seq int, points []memory.Point) {
+		// 持窗口锁执行：只做非阻塞投递（见 window.SetOnPoints）。批次所属的会话取自该批压缩的 ctx。
+		sc, ok := ctxx.ScopeFrom(bctx)
+		if !ok {
+			s.log.Warn("agent: points without scope dropped", "points", len(points))
+			return
+		}
+		s.enqueueMemory(s.memStage(sc, seq, points))
+	})
+	s.enqueueStart(scope, time.Now())
 }
 
 // Session 是一个会话的全部运行时状态。并发安全：Input 之间互斥（03 §5）。
@@ -385,12 +432,21 @@ type Session struct {
 	noWindow  bool              // 已记录过「窗口未知」告警
 
 	idle         time.Duration          // 会话切换的无操作时长，见 Config.IdleTimeout
+	recallWait   time.Duration          // 会话首轮等待召回的上限，见 Config.RecallWait
+	recallReady  chan struct{}          // 当前会话 Start 的完成信号：首轮 Input 取走并等待，见 waitRecall
 	newID        func(time.Time) string // 会话切换后的会话标识生成
 	idleTimer    *time.Timer            // 无操作计时：每轮结算时启动，Input 开始时停止
 	idleGen      uint64                 // 计时代号：每次启动或停止递增，到期回调据此判定是否作废
 	sessionTurns int                    // 当前会话已结算的轮数
-	runEnd       chan struct{}          // 本轮已结算的信号
-	err          error                  // 首个后台错误
+	lastCtx      context.Context        // 当前会话最近一轮的 run ctx（会话切换时提取要点使用其值）
+	lastActive   time.Time              // 当前会话最近一轮的结算时刻（End 的结束时刻）
+
+	mem       *memory.Client     // 记忆服务调用（含重试与超时）；nil = 未配置
+	memJobs   chan memJob        // 记忆服务调用队列，由 memLoop 按投递顺序执行
+	memCancel context.CancelFunc // 停止 memLoop（Close 用）
+	memDone   chan struct{}      // memLoop 退出信号
+	runEnd    chan struct{}      // 本轮已结算的信号
+	err       error              // 首个后台错误
 }
 
 // Input 阻塞跑完一轮：组装 → core.Run → 等本轮结算进窗口 → 返回。
@@ -410,7 +466,12 @@ func (s *Session) Input(ctx context.Context, msg message.Message) (loop.RunResul
 	}
 	s.mu.Lock()
 	s.stopIdleLocked() // 有新输入：当前会话继续，无操作计时作废
+	ready := s.recallReady
+	s.recallReady = nil // 只有会话的首轮等待召回
 	s.mu.Unlock()
+	if ready != nil {
+		s.waitRecall(ctx, ready)
+	}
 
 	runCtx, cancel := s.runContext(ctx)
 	defer cancel()
@@ -463,7 +524,7 @@ func (s *Session) Subscribe(buf int) (<-chan loop.Event, func()) { return s.loop
 // Artifacts 暴露超长工具结果的存放处（宿主可自行读回或预置内容）。
 func (a *Agent) Artifacts() artifact.Store { return a.artifacts }
 
-// History 返回窗口当前内容的只读快照（记忆含在途 + 近轮）。
+// History 返回窗口当前内容的只读快照：记忆（会话开始时的召回、压缩记忆与在途）与近轮。
 // v1 无窗口命令（03 §5）：宿主只能看，不能据此改窗口。
 func (s *Session) History() (memory, recent []message.Message) { return s.win.Snapshot() }
 
@@ -516,6 +577,7 @@ func (s *Session) Err() error {
 //  5. 退订 —— 总线把已排队事件投递完再关闭 channel
 //  6. 有界等落盘排空（CloseGrace），超时则取消落盘并 warn
 //  7. 等内部消费者收尾、取消并等在途压缩
+//  8. 停止记忆服务调用（Config.Memory），队列中尚未执行的调用丢弃
 func (s *Session) Close() error {
 	s.once.Do(func() {
 		close(s.closed)
@@ -542,6 +604,14 @@ func (s *Session) Close() error {
 		}
 		s.wg.Wait()
 		s.win.Close()
+		if s.memDone != nil {
+			// 关闭缺口搁置（docs/memory/options.md 已定第 9 项）：队列中尚未执行的调用丢弃。
+			s.memCancel()
+			<-s.memDone
+			if n := len(s.memJobs); n > 0 {
+				s.log.Warn("agent: memory calls dropped on close", "session", s.SessionID(), "pending", n)
+			}
+		}
 	})
 	return nil
 }
@@ -689,6 +759,7 @@ func (s *Session) settle() {
 	}
 	s.win.Settle(ctx, turn, used)
 	s.mu.Lock()
+	s.lastCtx, s.lastActive = ctx, time.Now()
 	s.sessionTurns++
 	s.armIdleLocked()
 	s.mu.Unlock()
@@ -726,7 +797,9 @@ func (s *Session) armIdleLocked() {
 
 // onIdle 是无操作计时到期的回调。持 runMu 与 Input 互斥：在途轮次结束后才执行，期间开始的
 // Input 已使计时代号改变，回调随之作废。代号未变且当前会话有已结算的轮次时切换会话：
-// 改用新的 SessionID，并清空窗口（window.Reset，新会话不带入上一会话的摘要与原文）。
+// 改用新的 SessionID，并清空窗口（window.Reset，新会话不带入上一会话的摘要与原文）；
+// 配置了记忆服务时依次投递：清除原文的要点提取与暂存（压缩实现为 window.PointExtractor 时）、
+// End（上一会话）、Start（新会话）。
 // 切换由 s.log 输出一条 Info 日志 agent: session switched，dropped_messages 为清除的原文条数。
 func (s *Session) onIdle(gen uint64) {
 	s.runMu.Lock()
@@ -740,7 +813,8 @@ func (s *Session) onIdle(gen uint64) {
 		s.mu.Unlock()
 		return
 	}
-	prev := s.scope.SessionID
+	prevScope, lastCtx, lastActive := s.scope, s.lastCtx, s.lastActive
+	prev := prevScope.SessionID
 	next := s.newID(now)
 	if next == "" || next == prev {
 		s.log.Warn("agent: NewSessionID returned an empty or unchanged id, SessionIDAt used",
@@ -748,13 +822,167 @@ func (s *Session) onIdle(gen uint64) {
 		next = SessionIDAt(prev, now)
 	}
 	s.scope.SessionID = next
+	nextScope := s.scope
 	s.sessionTurns = 0
+	s.lastCtx, s.lastActive = nil, time.Time{}
 	s.idleTimer = nil
 	idle := s.idle
 	s.mu.Unlock()
 
-	dropped := len(s.win.Reset())
+	cleared := s.win.Reset()
+	dropped := len(cleared.Raw)
+	if s.mem != nil {
+		// Reset 返回前，上一会话已完成批次的要点已投递（window.SetOnPoints）；清除的原文以会话内摘要
+		// 为上下文提取要点，以下一个序号暂存；End 排在两者之后。
+		if len(cleared.Raw) > 0 && s.win.ExtractsPoints() {
+			// 身份与会话内批次一致：取最近一轮 run ctx 的 Scope（含该轮说话人的 UserID）。
+			batchScope := prevScope
+			if lastCtx == nil {
+				lastCtx = ctxx.WithScope(s.ctx, prevScope)
+			} else if sc, ok := ctxx.ScopeFrom(lastCtx); ok && sc.SessionID == prev {
+				batchScope = sc
+			}
+			s.enqueueMemory(s.memExtract(lastCtx, batchScope, cleared.Seq+1, cleared.Memory, cleared.Raw))
+		}
+		if lastActive.IsZero() {
+			lastActive = now
+		}
+		s.enqueueMemory(s.memEnd(prevScope, lastActive))
+		s.enqueueStart(nextScope, now)
+	}
 	s.log.Info("agent: session switched", "session", prev, "next", next, "idle", idle, "dropped_messages", dropped)
+}
+
+// memJob 是一次记忆服务调用：memLoop 以带 scope 的 ctx 执行 run；kind 与 scope.SessionID 用于日志。
+type memJob struct {
+	kind  string // stage、extract、end、start
+	scope ctxx.Scope
+	run   func(ctx context.Context)
+}
+
+// memStage 返回一批要点的暂存（Stage），batch_id 在此生成。
+func (s *Session) memStage(sc ctxx.Scope, seq int, points []memory.Point) memJob {
+	req := memory.StageRequest{
+		Namespace: sc.Namespace, SessionID: sc.SessionID, BatchID: ctxx.NewTrace().TraceID, Seq: seq, Points: points,
+	}
+	return memJob{kind: "stage", scope: sc, run: func(ctx context.Context) { _ = s.mem.Stage(ctx, req) }}
+}
+
+// memExtract 返回会话切换时对清除原文的要点提取：提取使用 vctx 的值（该会话最近一轮的 run ctx），
+// 生存期随执行时的 ctx（Close 时取消）；mem（会话内摘要）只用于理解上下文，要点从 msgs 提取，非空时
+// 以 seq 暂存到 sc 所指的会话。提取失败后按 extractRetryDelays 重试 3 次（间隔 1 s / 2 s / 4 s），期间
+// 队列中其后的调用（End、Start）等待；仍失败时由 s.log 输出 Error 日志
+// agent: session-end point extraction failed, points dropped，不暂存。
+func (s *Session) memExtract(vctx context.Context, sc ctxx.Scope, seq int, mem, msgs []message.Message) memJob {
+	return memJob{kind: "extract", scope: sc, run: func(ctx context.Context) {
+		ectx, cancel := context.WithCancel(ctxx.Detached(vctx))
+		stop := context.AfterFunc(ctx, cancel)
+		var points []memory.Point
+		err := memory.Retry(ctx, extractRetryDelays, func(context.Context) error {
+			var err error
+			points, err = s.win.ExtractPoints(ectx, mem, msgs)
+			return err
+		})
+		stop()
+		cancel()
+		if err != nil {
+			s.log.Error("agent: session-end point extraction failed, points dropped",
+				"session", sc.SessionID, "messages", len(msgs), "err", err)
+			return
+		}
+		if len(points) > 0 {
+			s.memStage(sc, seq, points).run(ctx)
+		}
+	}}
+}
+
+// memEnd 返回会话结束的通知（End），at 为该会话的结束时刻。
+func (s *Session) memEnd(sc ctxx.Scope, at time.Time) memJob {
+	req := memory.SessionRequest{Namespace: sc.Namespace, SessionID: sc.SessionID, At: at}
+	return memJob{kind: "end", scope: sc, run: func(ctx context.Context) { _ = s.mem.End(ctx, req) }}
+}
+
+// memStart 返回会话开始的通知（Start），成功时召回结果写入窗口（injectRecall）；结束时（成功、失败或
+// ctx 取消）关闭 ready。
+func (s *Session) memStart(sc ctxx.Scope, at time.Time, ready chan struct{}) memJob {
+	req := memory.SessionRequest{Namespace: sc.Namespace, SessionID: sc.SessionID, At: at}
+	return memJob{kind: "start", scope: sc, run: func(ctx context.Context) {
+		defer close(ready)
+		if items, err := s.mem.Start(ctx, req); err == nil {
+			s.injectRecall(req.SessionID, items)
+		}
+	}}
+}
+
+// enqueueStart 投递会话开始的通知（Start），并把其完成信号设为会话首轮的等待对象（见 Config.RecallWait）；
+// 队列满未投递时立即关闭完成信号，首轮不等待。
+func (s *Session) enqueueStart(sc ctxx.Scope, at time.Time) {
+	ready := make(chan struct{})
+	s.mu.Lock()
+	s.recallReady = ready
+	s.mu.Unlock()
+	if !s.enqueueMemory(s.memStart(sc, at, ready)) {
+		close(ready)
+	}
+}
+
+// waitRecall 在会话首轮组装前等待 Start 结束（ready 关闭），上限 s.recallWait；到达上限时由 s.log 输出
+// Warn 日志 agent: recall not ready, first turn proceeds without recall。ctx 取消或会话关闭时停止等待。
+func (s *Session) waitRecall(ctx context.Context, ready <-chan struct{}) {
+	if s.recallWait <= 0 {
+		return
+	}
+	t := time.NewTimer(s.recallWait)
+	defer t.Stop()
+	select {
+	case <-ready:
+	case <-t.C:
+		s.log.Warn("agent: recall not ready, first turn proceeds without recall",
+			"session", s.SessionID(), "wait", s.recallWait)
+	case <-ctx.Done():
+	case <-s.closed:
+	}
+}
+
+// enqueueMemory 非阻塞地投递一次记忆服务调用，返回是否已投递；队列满时丢弃并由 s.log 输出 Error 日志
+// agent: memory queue full, call dropped。可在持窗口锁时调用（不获取会话锁）。
+func (s *Session) enqueueMemory(j memJob) bool {
+	select {
+	case s.memJobs <- j:
+		return true
+	default:
+		s.log.Error("agent: memory queue full, call dropped", "kind", j.kind, "session", j.scope.SessionID)
+		return false
+	}
+}
+
+// memLoop 按投递顺序执行记忆服务调用，直至 ctx 取消（Close）；每次调用的 ctx 带该调用所属会话的 Scope。
+// 失败的日志由 memory.Client 输出。
+func (s *Session) memLoop(ctx context.Context) {
+	defer close(s.memDone)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case j := <-s.memJobs:
+			j.run(ctxx.WithScope(ctx, j.scope))
+		}
+	}
+}
+
+// injectRecall 把 Start 返回的召回结果写入窗口的召回位置（window.SetRecalled）；sessionID 已不是
+// 当前会话时丢弃。持会话锁调用窗口方法（锁顺序：会话锁在前、窗口锁在后）。
+func (s *Session) injectRecall(sessionID string, items []memory.Item) {
+	if len(items) == 0 {
+		return
+	}
+	msg := window.RecallMessage(memory.Render(items))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.scope.SessionID != sessionID {
+		return
+	}
+	s.win.SetRecalled([]message.Message{msg})
 }
 
 // budget 按本轮 ctx 的模型与输出上限计算窗口预算。Provider 报告窗口未知时返回零值

@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"aria/pkg/ctxx"
 	"aria/pkg/message"
 	"aria/runtime/artifact"
+	"aria/runtime/memory"
 	"aria/runtime/window"
 )
 
@@ -1572,5 +1574,394 @@ func TestIdleTimerStoppedBySetIdleTimeoutAndClose(t *testing.T) {
 	_ = s.Close()
 	if timer() != nil {
 		t.Fatal("Close 后计时应停止")
+	}
+}
+
+// ---------- 长期记忆服务（Config.Memory） ----------
+
+// fakeMemory 记录调用顺序（「kind:会话」），Start 按会话返回预置的召回结果；ctx 的 Scope 与请求的会话
+// 不一致时记入 mismatch。startGate 非 nil 时，s1 的 Start 阻塞至 startGate 关闭或 ctx 取消。
+type fakeMemory struct {
+	startGate chan struct{}
+
+	mu       sync.Mutex
+	calls    []string
+	stages   []memory.StageRequest
+	ends     []memory.SessionRequest
+	starts   []memory.SessionRequest
+	items    map[string][]memory.Item
+	mismatch []string
+	users    []string        // 每次 Stage 时 ctx 的 Scope.UserID
+	budgets  []time.Duration // 每次 Start 开始时 ctx 的剩余时限
+}
+
+// checkScope 记录 ctx 的 Scope 与请求会话不一致的调用（调用方持有 f.mu）。
+func (f *fakeMemory) checkScope(ctx context.Context, kind, session string) {
+	if sc, ok := ctxx.ScopeFrom(ctx); !ok || sc.SessionID != session {
+		f.mismatch = append(f.mismatch, kind+":"+session+" ctx="+sc.SessionID)
+	}
+}
+
+func (f *fakeMemory) Stage(ctx context.Context, r memory.StageRequest) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.checkScope(ctx, "stage", r.SessionID)
+	sc, _ := ctxx.ScopeFrom(ctx)
+	f.users = append(f.users, sc.UserID)
+	f.calls = append(f.calls, "stage:"+r.SessionID)
+	f.stages = append(f.stages, r)
+	return nil
+}
+
+func (f *fakeMemory) End(ctx context.Context, r memory.SessionRequest) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.checkScope(ctx, "end", r.SessionID)
+	f.calls = append(f.calls, "end:"+r.SessionID)
+	f.ends = append(f.ends, r)
+	return nil
+}
+
+func (f *fakeMemory) Start(ctx context.Context, r memory.SessionRequest) ([]memory.Item, error) {
+	if dl, ok := ctx.Deadline(); ok {
+		f.mu.Lock()
+		f.budgets = append(f.budgets, time.Until(dl))
+		f.mu.Unlock()
+	}
+	if f.startGate != nil && r.SessionID == "s1" {
+		select {
+		case <-f.startGate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.checkScope(ctx, "start", r.SessionID)
+	f.calls = append(f.calls, "start:"+r.SessionID)
+	f.starts = append(f.starts, r)
+	return f.items[r.SessionID], nil
+}
+
+func (f *fakeMemory) Recall(context.Context, memory.RecallRequest) ([]memory.Item, error) {
+	return nil, nil
+}
+
+func (f *fakeMemory) snapshot() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
+}
+
+func (f *fakeMemory) has(call string) bool {
+	for _, c := range f.snapshot() {
+		if c == call {
+			return true
+		}
+	}
+	return false
+}
+
+// pointsCompressor 实现 window.PointExtractor：输出固定摘要，要点为本批第一条消息的文本。
+type pointsCompressor struct{}
+
+func (pointsCompressor) Compress(ctx context.Context, memory, turn []message.Message) ([]message.Message, error) {
+	out, _, err := pointsCompressor{}.CompressWithPoints(ctx, memory, turn)
+	return out, err
+}
+
+func (pointsCompressor) CompressWithPoints(_ context.Context, _, turn []message.Message) ([]message.Message, []memory.Point, error) {
+	return []message.Message{message.NewUser("摘要")}, []memory.Point{{Text: "要点:" + turn[0].Text()}}, nil
+}
+
+func (pointsCompressor) ExtractPoints(_ context.Context, _, turn []message.Message) ([]memory.Point, error) {
+	return []memory.Point{{Text: "切换要点:" + turn[0].Text()}}, nil
+}
+
+// NewSession 通知首个会话开始；召回结果写入窗口，组装时位于最前（未设置 SystemPrompt）。
+func TestSessionMemoryStartInjectsRecall(t *testing.T) {
+	fm := &fakeMemory{items: map[string][]memory.Item{"s1": {{Text: "喜欢猫"}}}}
+	s, rp := newTestSession(t, Config{
+		Provider: provider.NewFake(provider.FakeStep{Text: []string{"好"}}),
+		Memory:   fm,
+	})
+	waitUntil(t, "召回结果写入窗口", func() bool { mem, _ := s.History(); return len(mem) == 1 })
+	if _, err := s.Input(context.Background(), message.NewUser("早上好")); err != nil {
+		t.Fatal(err)
+	}
+	msgs := rp.at(0).Messages
+	if len(msgs) != 2 || !strings.Contains(msgs[0].Text(), "喜欢猫") || !strings.Contains(msgs[0].Text(), "<memory>") {
+		t.Fatalf("首条应为召回的 memory 块：%v", rendered(msgs))
+	}
+	if got := fm.snapshot(); len(got) != 1 || got[0] != "start:s1" {
+		t.Fatalf("应只调用 start:s1，实际 %v", got)
+	}
+}
+
+// 会话切换：先 End(上一会话) 再 Start(新会话)，新会话的召回结果写入清空后的窗口；End 的结束时刻为
+// 最近一轮的结算时刻，每次调用的 ctx 带所属会话的 Scope。
+func TestSessionMemoryEndThenStartOnSwitch(t *testing.T) {
+	fm := &fakeMemory{items: map[string][]memory.Item{"s2": {{Text: "上次聊到旅行"}}}}
+	s, _ := newTestSession(t, Config{
+		Provider:     provider.NewFake(provider.FakeStep{Text: []string{"一"}}),
+		Memory:       fm,
+		IdleTimeout:  20 * time.Millisecond,
+		NewSessionID: func(time.Time) string { return "s2" },
+	})
+	if _, err := s.Input(context.Background(), message.NewUser("第一轮")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "start:s2", func() bool { return fm.has("start:s2") })
+	if got, want := fm.snapshot(), []string{"start:s1", "end:s1", "start:s2"}; !slices.Equal(got, want) {
+		t.Fatalf("调用顺序：want %v got %v", want, got)
+	}
+	waitUntil(t, "s2 的召回写入窗口", func() bool {
+		mem, recent := s.History()
+		return len(mem) == 1 && strings.Contains(mem[0].Text(), "旅行") && len(recent) == 0
+	})
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	if gap := fm.starts[1].At.Sub(fm.ends[0].At); gap < 20*time.Millisecond {
+		t.Fatalf("End 的结束时刻应为最近一轮的结算时刻，早于切换时刻至少一个超时时长：相差 %v", gap)
+	}
+	if len(fm.mismatch) > 0 {
+		t.Fatalf("ctx 的 Scope 应与请求的会话一致：%v", fm.mismatch)
+	}
+}
+
+// 压缩输出要点时 Stage：会话、命名空间取自该批的 ctx，seq 从 1 起，batch_id 非空。
+func TestSessionMemoryStagesPoints(t *testing.T) {
+	fm := &fakeMemory{}
+	a, err := New(Config{
+		Provider:   provider.NewFake(provider.FakeStep{Text: []string{"好"}}).WithLimits(eagerLimits),
+		Compressor: pointsCompressor{},
+		Memory:     fm,
+		Logger:     quiet(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := a.NewSession(ctxx.Scope{UserID: "u1", SessionID: "s1", Namespace: "home"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if _, err := s.Input(context.Background(), message.NewUser("家里养了一只猫")); err != nil {
+		t.Fatal(err)
+	}
+	s.WaitCompress()
+	waitUntil(t, "stage:s1", func() bool { return fm.has("stage:s1") })
+
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	st := fm.stages[0]
+	if st.Namespace != "home" || st.SessionID != "s1" || st.Seq != 1 || st.BatchID == "" ||
+		len(st.Points) != 1 || st.Points[0].Text != "要点:家里养了一只猫" {
+		t.Fatalf("Stage 请求不符：%+v", st)
+	}
+	if fm.starts[0].Namespace != "home" {
+		t.Fatalf("Start 应带命名空间 home：%+v", fm.starts[0])
+	}
+}
+
+// 召回结果所属的会话已不是当前会话时丢弃。
+func TestInjectRecallSkipsSwitchedSession(t *testing.T) {
+	s, _ := newTestSession(t, Config{Provider: provider.NewFake(), Memory: &fakeMemory{}})
+	s.injectRecall("other", []memory.Item{{Text: "旧会话"}})
+	if mem, _ := s.History(); len(mem) != 0 {
+		t.Fatalf("不应写入其他会话的召回：%v", rendered(mem))
+	}
+}
+
+// 会话切换：清除的原文提取要点后以下一个序号暂存，顺序为 Stage → End → Start。
+func TestSessionMemoryExtractsOnSwitch(t *testing.T) {
+	fm := &fakeMemory{}
+	s, _ := newTestSession(t, Config{
+		Provider:     provider.NewFake(provider.FakeStep{Text: []string{"一"}}),
+		Compressor:   pointsCompressor{},
+		Memory:       fm,
+		IdleTimeout:  20 * time.Millisecond,
+		NewSessionID: func(time.Time) string { return "s2" },
+	})
+	if _, err := s.Input(context.Background(), message.NewUser("第一轮")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "start:s2", func() bool { return fm.has("start:s2") })
+	if got, want := fm.snapshot(), []string{"start:s1", "stage:s1", "end:s1", "start:s2"}; !slices.Equal(got, want) {
+		t.Fatalf("调用顺序：want %v got %v", want, got)
+	}
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	st := fm.stages[0]
+	if st.Seq != 1 || len(st.Points) != 1 || st.Points[0].Text != "切换要点:第一轮" {
+		t.Fatalf("切换时的 Stage 不符：%+v", st)
+	}
+	if len(fm.mismatch) > 0 {
+		t.Fatalf("ctx 的 Scope 应与请求的会话一致：%v", fm.mismatch)
+	}
+}
+
+// 会话切换时只在压缩实现为 window.PointExtractor 时投递要点提取任务。s1 的 Start 阻塞 memLoop，
+// 切换投递的任务留在队列中，按投递顺序读出其类型。
+func TestSessionMemoryExtractJobOnlyForPointExtractor(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		comp window.Compressor
+		want []string
+	}{
+		{"keeplast", window.KeepLast(10), []string{"end", "start"}},
+		{"extractor", pointsCompressor{}, []string{"extract", "end", "start"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gate := make(chan struct{})
+			fm := &fakeMemory{startGate: gate}
+			s, _ := newTestSession(t, Config{
+				Provider:     provider.NewFake(provider.FakeStep{Text: []string{"一"}}),
+				Compressor:   tc.comp,
+				Memory:       fm,
+				IdleTimeout:  20 * time.Millisecond,
+				NewSessionID: func(time.Time) string { return "s2" },
+			})
+			defer close(gate)
+			waitUntil(t, "memLoop 取出 start:s1", func() bool { return len(s.memJobs) == 0 })
+			if _, err := s.Input(context.Background(), message.NewUser("第一轮")); err != nil {
+				t.Fatal(err)
+			}
+			waitUntil(t, "切换到 s2", func() bool { return s.currentScope().SessionID == "s2" })
+			s.runMu.Lock() // onIdle 持 runMu 执行：取得 runMu 即投递完毕
+			s.runMu.Unlock()
+			var got []string
+			for len(s.memJobs) > 0 {
+				got = append(got, (<-s.memJobs).kind)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("切换投递的任务：want %v got %v", tc.want, got)
+			}
+		})
+	}
+}
+
+// failingExtractor 实现 window.PointExtractor：ExtractPoints 的前 fails 次调用返回错误。
+type failingExtractor struct {
+	pointsCompressor
+	fails int
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *failingExtractor) ExtractPoints(ctx context.Context, mem, turn []message.Message) ([]memory.Point, error) {
+	c.mu.Lock()
+	c.calls++
+	n := c.calls
+	c.mu.Unlock()
+	if n <= c.fails {
+		return nil, errors.New("提取失败")
+	}
+	return c.pointsCompressor.ExtractPoints(ctx, mem, turn)
+}
+
+// 会话切换时的要点提取失败后按 extractRetryDelays 重试 3 次；全部失败时不暂存，End 与 Start 照常执行。
+func TestSessionMemoryExtractRetries(t *testing.T) {
+	prev := extractRetryDelays
+	extractRetryDelays = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
+	t.Cleanup(func() { extractRetryDelays = prev })
+	for _, tc := range []struct {
+		name      string
+		fails     int
+		wantCalls int
+		want      []string
+	}{
+		{"third-attempt", 2, 3, []string{"start:s1", "stage:s1", "end:s1", "start:s2"}},
+		{"all-failed", 10, 4, []string{"start:s1", "end:s1", "start:s2"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fe := &failingExtractor{fails: tc.fails}
+			fm := &fakeMemory{}
+			s, _ := newTestSession(t, Config{
+				Provider:     provider.NewFake(provider.FakeStep{Text: []string{"一"}}),
+				Compressor:   fe,
+				Memory:       fm,
+				IdleTimeout:  20 * time.Millisecond,
+				NewSessionID: func(time.Time) string { return "s2" },
+			})
+			if _, err := s.Input(context.Background(), message.NewUser("第一轮")); err != nil {
+				t.Fatal(err)
+			}
+			waitUntil(t, "start:s2", func() bool { return fm.has("start:s2") })
+			if got := fm.snapshot(); !slices.Equal(got, tc.want) {
+				t.Fatalf("调用顺序：want %v got %v", tc.want, got)
+			}
+			fe.mu.Lock()
+			defer fe.mu.Unlock()
+			if fe.calls != tc.wantCalls {
+				t.Fatalf("提取调用次数：want %d got %d", tc.wantCalls, fe.calls)
+			}
+		})
+	}
+}
+
+// 会话切换批次的 Stage 与会话内批次一致：ctx 的身份取最近一轮 run ctx（该轮说话人的 UserID）。
+func TestSessionMemorySwitchStageUsesLastTurnScope(t *testing.T) {
+	fm := &fakeMemory{}
+	s, _ := newTestSession(t, Config{
+		Provider:     provider.NewFake(provider.FakeStep{Text: []string{"一"}}),
+		Compressor:   pointsCompressor{},
+		Memory:       fm,
+		IdleTimeout:  20 * time.Millisecond,
+		NewSessionID: func(time.Time) string { return "s2" },
+	})
+	ctx := ctxx.WithScope(context.Background(), ctxx.Scope{UserID: "u2"}) // 本轮说话人
+	if _, err := s.Input(ctx, message.NewUser("第一轮")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "start:s2", func() bool { return fm.has("start:s2") })
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	if !slices.Equal(fm.users, []string{"u2"}) || len(fm.mismatch) > 0 {
+		t.Fatalf("切换批的 Stage 应带本轮说话人 u2：users %v mismatch %v", fm.users, fm.mismatch)
+	}
+}
+
+// 会话首轮等待会话开始的召回结果（Config.RecallWait），结果写入窗口后再组装。
+func TestFirstTurnWaitsForRecall(t *testing.T) {
+	gate := make(chan struct{})
+	fm := &fakeMemory{startGate: gate, items: map[string][]memory.Item{"s1": {{Text: "喜欢猫"}}}}
+	s, rp := newTestSession(t, Config{
+		Provider:   provider.NewFake(provider.FakeStep{Text: []string{"好"}}),
+		Memory:     fm,
+		RecallWait: 5 * time.Second,
+	})
+	time.AfterFunc(50*time.Millisecond, func() { close(gate) })
+	if _, err := s.Input(context.Background(), message.NewUser("按平时的口味点外卖")); err != nil {
+		t.Fatal(err)
+	}
+	if msgs := rp.at(0).Messages; len(msgs) != 2 || !strings.Contains(msgs[0].Text(), "喜欢猫") {
+		t.Fatalf("首轮应等待召回并带上：%v", rendered(msgs))
+	}
+}
+
+// 到达上限仍未返回时首轮不带召回；Start 的超时取 RecallWait。
+func TestFirstTurnRecallWaitTimeout(t *testing.T) {
+	fm := &fakeMemory{startGate: make(chan struct{}), items: map[string][]memory.Item{"s1": {{Text: "喜欢猫"}}}}
+	s, rp := newTestSession(t, Config{
+		Provider:   provider.NewFake(provider.FakeStep{Text: []string{"好"}}),
+		Memory:     fm,
+		RecallWait: 50 * time.Millisecond,
+	})
+	begin := time.Now()
+	if _, err := s.Input(context.Background(), message.NewUser("早上好")); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(begin); d > 2*time.Second {
+		t.Fatalf("等待应在上限附近结束：%v", d)
+	}
+	if msgs := rp.at(0).Messages; len(msgs) != 1 {
+		t.Fatalf("超时后首轮不应带召回：%v", rendered(msgs))
+	}
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	if len(fm.budgets) != 1 || fm.budgets[0] > time.Second {
+		t.Fatalf("Start 的超时应取 RecallWait：%v", fm.budgets)
 	}
 }

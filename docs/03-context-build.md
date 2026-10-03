@@ -139,6 +139,7 @@ Host(语音识别中) → Speculate(base=transcript快照, 猜测输入)
 |---|---|---|
 | `runtime/window` | 每轮组装 + 间隙压缩 | `Window.Assemble/Settle/Reset`、`Compressor`、`KeepLast`（缺省回退）、`ProviderCompressor`（LLM 摘要） |
 | `runtime/persist` | durable 事件 → Store 写路（只写不恢复） | `Store`（窄接口，实现注入）、`Recorder.Consume` |
+| `runtime/memory` | 记忆服务的接口与调用策略（重试、超时） | `Service`（窄接口，实现注入）、`Client` |
 | `runtime/artifact` | 大中间产物存放与读回（artifact+ref） | `Store`（窄接口）、`Memory`（默认实现）、`OpenTool`（`artifact_open`） |
 | `runtime/toolkit` | 工具装饰器（挂点 4/5） | `Truncate`（超长结果 → 预览+引用） |
 | `runtime/agent` | 总装：零件盒 + 长寿命 Session（无操作超时切换会话） | `Agent.New/NewSession`、`Session.Input/Queue/Interrupt/Subscribe/History/SessionID` |
@@ -149,7 +150,7 @@ Host(语音识别中) → Speculate(base=transcript快照, 猜测输入)
 
 ```
 [system]               宿主人设/规则/标签声明（可信，唯一进 system 的内容）
-[<memory>]             压缩记忆（数据，非 system role）
+[<memory>]             会话开始时的长期记忆召回、压缩记忆（数据，非 system role）
 [近轮对话]              原文
 [<context source="…">] 检索内容（M3 ContextSource）
 [当前感知]              照片等 ImageBlock

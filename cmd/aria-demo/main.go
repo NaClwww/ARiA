@@ -43,6 +43,7 @@ import (
 	"aria/plugins/persist/jsonl"
 	"aria/plugins/tool/basic"
 	"aria/runtime/agent"
+	"aria/runtime/memory"
 	"aria/runtime/persist"
 	"aria/runtime/window"
 )
@@ -151,6 +152,17 @@ func main() {
 		log.Error("tools build failed", "err", err)
 		os.Exit(2)
 	}
+	// 记忆服务（可空）：接入时装入 memory_recall 工具并在人设后追加使用规则（与 aria-host 同源）。
+	mem, err := assemble.Memory(cfg.Memory, log)
+	if err != nil {
+		log.Error("memory assemble failed", "err", err)
+		os.Exit(2)
+	}
+	if mem.Service != nil {
+		tools = append(tools, mem.Tool)
+		systemPrompt += "\n" + memory.RecallToolInstruction
+		log.Info("memory", "engine", cfg.Memory.Engine, "base_url", cfg.Memory.BaseURL, "dir", cfg.Memory.Dir, "members", len(cfg.Memory.Members))
+	}
 
 	sessionID, newSessionID := assemble.SessionIDs(cfg.Session, time.Now())
 	ag, err := agent.New(agent.Config{
@@ -160,6 +172,8 @@ func main() {
 		KeepRecentTurns: cfg.Compress.KeepRecentTurns,
 		Compact:         assemble.CompactBudget(cfg.Compress),
 		IdleTimeout:     assemble.IdleTimeout(cfg.Session),
+		RecallWait:      assemble.RecallWait(cfg.Session),
+		Memory:          mem.Service,
 		NewSessionID:    newSessionID,
 		Store:           store,
 		SystemPrompt:    systemPrompt,
@@ -171,7 +185,7 @@ func main() {
 		log.Error("agent new failed", "err", err)
 		os.Exit(1)
 	}
-	sess, err := ag.NewSession(ctxx.Scope{SessionID: sessionID, UserID: cfg.Session.DefaultUser})
+	sess, err := ag.NewSession(ctxx.Scope{SessionID: sessionID, UserID: cfg.Session.DefaultUser, Namespace: cfg.Session.Namespace})
 	if err != nil {
 		log.Error("session new failed", "err", err)
 		os.Exit(1)
@@ -220,6 +234,14 @@ func main() {
 	unsub()
 	if err := sess.Close(); err != nil {
 		log.Error("session close", "err", err)
+	}
+	if mem.Close != nil {
+		// 记忆服务的后台提交以 agent.DefaultCloseGrace 为上限等待，超时放行（下一次启动重做）。
+		ctx, cancel := context.WithTimeout(context.Background(), agent.DefaultCloseGrace)
+		if err := mem.Close(ctx); err != nil {
+			log.Warn("memory: background commit still running at close", "err", err)
+		}
+		cancel()
 	}
 	<-printerDone
 	if store != nil {

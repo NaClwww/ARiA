@@ -64,9 +64,12 @@ func EnsureTrace(ctx context.Context) (context.Context, Trace) {
 	if t, ok := TraceFrom(ctx); ok {
 		return ctx, t
 	}
-	t := Trace{TraceID: newID(), SpanID: newID()}
+	t := NewTrace()
 	return WithTrace(ctx, t), t
 }
+
+// NewTrace 生成新的 Trace：TraceID 与 SpanID 各为 8 字节随机数的 hex 表示。
+func NewTrace() Trace { return Trace{TraceID: newID(), SpanID: newID()} }
 
 // ---------- Credentials ----------
 
