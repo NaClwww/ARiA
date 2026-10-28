@@ -1,6 +1,6 @@
 # 01 · pkg —— 基础件层
 
-零依赖的公共基础件，供所有上层使用。只放「与 agent 语义无关、但层层都要用」的东西。
+零依赖（只用标准库）的公共基础件，供所有上层使用。只放「与 agent 语义无关、但层层都要用」的东西。
 
 ## 1. ctxx —— ctx 传播基础件
 
@@ -81,6 +81,15 @@ Message{Role: assistant, Blocks: [Text{"今天 22 度，晴"}]}
 
 各 provider 适配器做 规范形 ↔ 厂商格式 互转（pi 的 convertToLlm 模式）。ToolResult 双标志（IsError + 内容块）支撑错误三分法：工具失败是喂回模型的内容，不是系统故障。`ThoughtBlock` 为 GLM/R1/o 系 reasoning 预留（原 05 A1）；默认不入窗，入窗策略随 G2（[notes/context-planning-draft.md](notes/context-planning-draft.md)）重论定稿。
 
-## 3. 测试要求
+## 3. modelcard —— 模型元数据卡（2026-10-28）
+
+`pkg/modelcard`：模型卡 = 上下文窗口 / 最大输出、输入输出模态、思考与工具能力、价格、发布日期等。数据源是 [models.dev](https://models.dev/api.json)（OpenCode 维护的开放目录，按 provider 键分组；同一模型在不同 provider 下的卡可不同，如 OpenCode Zen 与 Go 的模型集合不同）。
+
+- 只依赖标准库：`Card` 类型 + `Fetch(ctx, hc, url, provider)` 一次性拉取某 provider 的全部卡（顶层只解 RawMessage，只结构化解码所需 provider）；
+- **配置覆盖规则归本包**：`Card.Override(Limit)` 把非零项覆盖到卡上（配置写了用配置，没写沿用目录值）。适配器对外返回的是覆盖后的生效卡，`Limits` 从生效卡读出，不再各自实现一遍合并；
+- **不做缓存与后台刷新**：何时拉、拉到前怎么办归调用方（provider 适配器）。现役消费者 `plugins/provider/opencode`：创建时后台拉一次，`Limits` 不阻塞（未就绪 = 窗口未知），配置的 `context_window` / `max_output` 经 `Override` 叠加到主模型（`provider.model`）的卡上，其他模型用目录原卡；`Card(model)` 返回生效卡供宿主查能力（如是否接受图片）；
+- `Limit.Output` 是模型的最大输出，不是请求不设 max_tokens 时的服务端默认值——拿来做压缩预算时偏保守。
+
+## 4. 测试要求
 
 与其他层同标准：表驱动、无网络无磁盘、`-race` 干净；Budget 并发扣减有专门竞争测试。

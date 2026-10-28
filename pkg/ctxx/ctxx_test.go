@@ -9,7 +9,7 @@ import (
 	"aria/pkg/message"
 )
 
-// 01 §3：Budget 并发扣减的专门竞争测试（-race 下运行）。
+// 01 §4：Budget 并发扣减的专门竞争测试（-race 下运行）。
 func TestBudgetConcurrentConsume(t *testing.T) {
 	b := NewBudget(1000, 10.0)
 	var wg sync.WaitGroup
