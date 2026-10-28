@@ -16,9 +16,10 @@ import (
 // Sink 是引擎投递口（gowild.Input 的 InputSink 实现）：Inject 对应 Session.Queue
 // （轮间注入，非阻塞），Start 对应 Session.Input（起一轮并阻塞到本轮结算）。
 // 投递顺序由 gowild.Input 保证；说话人标签与当次模型参数在这里写入。
+// 模型参数每轮从 Config 现取：配置热更新后下一轮即生效。
 type Sink struct {
 	Session *agent.Session
-	Cfg     config.Config
+	Config  *config.Manager
 }
 
 // Inject 尝试轮间注入：无在途轮次或本轮已判定收敛时返回 (false, nil)。
@@ -38,7 +39,7 @@ func (s Sink) Inject(text, speaker string) (bool, error) {
 // Start 以该输入起一轮，阻塞到本轮结算。Scope 只带 UserID（说话人），SessionID 由会话锚定。
 func (s Sink) Start(text, speaker string) error {
 	ctx := ctxx.WithScope(context.Background(), ctxx.Scope{UserID: speaker})
-	ctx = ctxx.WithOptions(ctx, llmOptions(s.Cfg))
+	ctx = ctxx.WithOptions(ctx, llmOptions(s.Config.Effective()))
 	_, err := s.Session.Input(ctx, message.NewUser(message.TagSpeaker(speaker, text)))
 	return err
 }

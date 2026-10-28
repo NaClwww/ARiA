@@ -58,7 +58,7 @@ func (f *fakeService) Recall(ctx context.Context, _ RecallRequest) ([]Item, erro
 func fastClient(svc Service) *Client {
 	c := NewClient(svc, quiet())
 	c.retryDelays = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
-	c.startTimeout = 20 * time.Millisecond
+	c.SetStartTimeout(20 * time.Millisecond)
 	return c
 }
 

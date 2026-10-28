@@ -25,11 +25,11 @@ speak_tool = true    # TTS 改为 speak 工具：模型显式调用出声（可�
 listen = "127.0.0.1:8080"      # 只绑本机；暴露局域网需显式修改（本口能触发 LLM 花费）
 
 [provider]
-kind = "deepseek"                        # deepseek（官方端点特化：思考等级/流式 toolcall 细节/官方 finish_reason）| openai 或留空（OpenAI 兼容端点通用，含 DeepSeek/GLM/Kimi/Ollama）
-base_url = "https://api.deepseek.com"   # deepseek kind 可省略（默认官方端点；/v1 别名亦可）；openai kind 默认官方 OpenAI
+kind = "deepseek"                        # deepseek（官方端点特化：思考等级/流式 toolcall 细节/官方 finish_reason）| openai 或留空（OpenAI 兼容端点通用，含 DeepSeek/GLM/Kimi/Ollama）| opencode（OpenCode Zen 按量付费）| opencode-go（OpenCode Go 订阅）
+base_url = "https://api.deepseek.com"   # deepseek kind 可省略（默认官方端点；/v1 别名亦可）；openai kind 默认官方 OpenAI；opencode / opencode-go 默认 OpenCode 官方端点（须写 model，如 kimi-k3）
 model = "deepseek-flash"                 # 稳定默认：V4.1-Flash（tool calls + 视觉 + 思考，并发 2500，输入 1 元/M 档）；备选 deepseek-v4-pro（无视觉，勿用于摄像头注入）；deepseek kind 留空也用它
-api_key_env = "ARIA_API_KEY"   # key 本体永远在环境变量，不落任何文件；deepseek kind 另兜底 DEEPSEEK_API_KEY
-# context_window = 0             # 模型上下文窗口（token）；0 = 适配器内置值（deepseek 按模型名查表；openai 无内置值，未配置时不按用量压缩）
+api_key_env = "ARIA_API_KEY"   # key 本体永远在环境变量，不落任何文件；deepseek kind 另兜底 DEEPSEEK_API_KEY，opencode / opencode-go 兜底 OPENCODE_API_KEY
+# context_window = 0             # 模型上下文窗口（token）；0 = 适配器内置值（deepseek 按模型名查表；openai 无内置值，未配置时不按用量压缩；opencode / opencode-go 启动时从 models.dev 按模型名自动获取）
 # max_output = 0                 # 请求未设 max_tokens 时的输出上限（token）；0 = 适配器内置值
 
 [persona]

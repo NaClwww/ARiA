@@ -4,15 +4,17 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 
 	"aria/core/provider"
 	"aria/internal/config"
 	deepseek "aria/plugins/provider/deepseek"
 	openai "aria/plugins/provider/openai"
+	opencode "aria/plugins/provider/opencode"
 )
 
 // ProviderNames 返回可用 provider kind（网页面板下拉框与错误提示用，顺序即推荐顺序）。
-func ProviderNames() []string { return []string{"deepseek", "openai"} }
+func ProviderNames() []string { return []string{"deepseek", "openai", "opencode", "opencode-go"} }
 
 // ProviderResult 是 Provider 装配结果。Model 是生效模型名（kind=deepseek 且
 // 未配置时为 deepseek.DefaultModel）——日志与 Engine.ModelName 都用它，
@@ -30,10 +32,13 @@ type ProviderResult struct {
 //     分片细节 / 官方 finish_reason，见 plugins/provider/deepseek 包注释）；
 //   - "openai"（默认，空 = openai）：OpenAI 兼容端点通用适配器
 //     （DeepSeek/GLM/Kimi/Ollama 等同构端点也走它，只是没有上述特化）；
+//   - "opencode" / "opencode-go"：OpenCode Zen（按量付费）/ Go（订阅制），
+//     复用 openai 适配器并补 OpenCode 要求的请求头（见 plugins/provider/opencode）；
 //   - 未知名字报错而不是静默退化——配置里写了不存在的 kind，应该显式失败。
 //
 // apiKey 非空优先（flag）；否则读 cfg.Provider.APIKeyEnv 指的环境变量，再兜底
-// kind 对应的默认变量（openai=OPENAI_API_KEY / deepseek=DEEPSEEK_API_KEY）。
+// kind 对应的默认变量（openai=OPENAI_API_KEY / deepseek=DEEPSEEK_API_KEY /
+// opencode、opencode-go=OPENCODE_API_KEY）。
 // key 本体永远不落配置文件。
 func Provider(cfg config.Config, apiKey string) (ProviderResult, error) {
 	kind := cfg.Provider.Kind
@@ -82,6 +87,27 @@ func Provider(cfg config.Config, apiKey string) (ProviderResult, error) {
 			Kind:  kind,
 			Model: cfg.Provider.Model,
 		}, nil
+	case "opencode", "opencode-go":
+		if key == "" {
+			key = os.Getenv("OPENCODE_API_KEY")
+		}
+		if key == "" {
+			return ProviderResult{}, fmt.Errorf("provider %q 缺少 API key：设环境变量 %s 或由宿主显式传入",
+				kind, orDefaultStr(envHint, "OPENCODE_API_KEY"))
+		}
+		if cfg.Provider.Model == "" {
+			return ProviderResult{}, fmt.Errorf("provider %q 需要 provider.model（如 kimi-k3，模型列表见 OpenCode 文档）", kind)
+		}
+		plan := opencode.PlanZen
+		if kind == "opencode-go" {
+			plan = opencode.PlanGo
+		}
+		return ProviderResult{
+			Impl: opencode.New(opencode.Config{Plan: plan, BaseURL: cfg.Provider.BaseURL, APIKey: key, Model: cfg.Provider.Model,
+				ContextWindow: cfg.Provider.ContextWindow, MaxOutput: cfg.Provider.MaxOutput}),
+			Kind:  kind,
+			Model: cfg.Provider.Model,
+		}, nil
 	default:
 		return ProviderResult{}, fmt.Errorf("未知 provider kind %q（可选：%v）", kind, ProviderNames())
 	}
@@ -93,3 +119,39 @@ func orDefaultStr(s, def string) string {
 	}
 	return s
 }
+
+// ProviderCache 缓存 Provider 装配结果：[provider] 段与 key 不变时复用同一实例（热更新的
+// 每次重新装配不重建 Provider——opencode 等适配器创建时还要拉模型卡）。并发安全。
+type ProviderCache struct {
+	APIKey string // 宿主显式传入的 key（--api-key）
+
+	mu  sync.Mutex
+	key config.Provider
+	res ProviderResult
+	ok  bool
+}
+
+// Get 返回 cfg 对应的 Provider；[provider] 段变化时重新装配，失败时不替换缓存。
+func (c *ProviderCache) Get(cfg config.Config) (ProviderResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ok && c.key == cfg.Provider {
+		return c.res, nil
+	}
+	res, err := Provider(cfg, c.APIKey)
+	if err != nil {
+		return ProviderResult{}, err
+	}
+	c.key, c.res, c.ok = cfg.Provider, res, true
+	return res, nil
+}
+
+// Model 返回当前缓存的生效模型名（尚未装配时为空）。
+func (c *ProviderCache) Model() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.res.Model
+}
+
+// Note 是装配结果的简短描述（reconfigured 事件与日志用）。
+func (r ProviderResult) Note() string { return fmt.Sprintf("provider=%s model=%s", r.Kind, r.Model) }

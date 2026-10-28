@@ -344,6 +344,13 @@ func marshalData(ev loop.Event) (json.RawMessage, error) {
 		return marshal(w)
 	case loop.WindowCompressedData:
 		return marshal(d) // 自带 json 标签，字段按原样落盘
+	case loop.ReconfiguredData:
+		return marshal(struct {
+			Note          string   `json:"note,omitempty"`
+			Tools         []string `json:"tools"`
+			MaxTurns      int      `json:"max_turns"`
+			ToolTimeoutMS int64    `json:"tool_timeout_ms"`
+		}{d.Note, d.Tools, d.MaxTurns, d.ToolTimeout.Milliseconds()})
 	default:
 		return json.RawMessage("null"), nil
 	}

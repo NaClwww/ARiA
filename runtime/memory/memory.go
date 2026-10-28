@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync/atomic"
 	"time"
 )
 
@@ -98,7 +99,7 @@ type Client struct {
 	svc          Service
 	log          *slog.Logger
 	retryDelays  []time.Duration
-	startTimeout time.Duration
+	startTimeout atomic.Int64 // time.Duration；SetStartTimeout 可随时替换
 }
 
 // NewClient 用缺省的重试间隔与超时包装 svc；log 为 nil 时使用 slog.Default()。
@@ -106,18 +107,20 @@ func NewClient(svc Service, log *slog.Logger) *Client {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Client{
-		svc:          svc,
-		log:          log,
-		retryDelays:  DefaultRetryDelays,
-		startTimeout: DefaultStartTimeout,
+	c := &Client{
+		svc:         svc,
+		log:         log,
+		retryDelays: DefaultRetryDelays,
 	}
+	c.startTimeout.Store(int64(DefaultStartTimeout))
+	return c
 }
 
-// SetStartTimeout 在 d > 0 时以 d 替换 Start 的超时（缺省 DefaultStartTimeout）；须在首次调用 Start 前设置。
+// SetStartTimeout 在 d > 0 时以 d 替换 Start 的超时（缺省 DefaultStartTimeout）；可随时调用，
+// 对之后发起的 Start 生效（配置热更新）。
 func (c *Client) SetStartTimeout(d time.Duration) {
 	if d > 0 {
-		c.startTimeout = d
+		c.startTimeout.Store(int64(d))
 	}
 }
 
@@ -145,7 +148,7 @@ func (c *Client) End(ctx context.Context, req SessionRequest) error {
 // Start 通知会话开始并返回召回结果，超时 startTimeout；超时或失败时输出 Warn 日志
 // memory: start failed, session begins without recall，返回 nil 与错误。
 func (c *Client) Start(ctx context.Context, req SessionRequest) ([]Item, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.startTimeout)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(c.startTimeout.Load()))
 	defer cancel()
 	items, err := c.svc.Start(ctx, req)
 	if err != nil {

@@ -24,7 +24,7 @@
 │core（agent-loop）        │◀────────────│plugins                │
 │单线程飞轮                │             │Provider 适配          │
 │Run/Queue/Interrupt/      │             │Tool / ToolSource      │
-│  Subscribe 四入口        │             │  （含 MCP 桥，M4）    │
+│Subscribe/Reconfigure     │             │  （含 MCP 桥，M4）    │
 │槽1 Assembler/槽2 Guard   │             │ContextSource          │
 │事件总线 durable/volatile │             │（记忆/RAG/画像/知识） │
 └───────────┬──────────────┘             └──────────┬────────────┘
@@ -71,7 +71,7 @@ pkg ──── agent-loop（agent-core）──── context-build（runtime�
 ## 关键决策速览
 
 1. **ctx 是脊柱**：Scope/Trace/Credentials/Budget/Options 经 `pkg/ctxx` 类型化存取，业务层贯穿到底层；run ctx 父级是 session 而非触发请求；Scope 缺失 fail-closed。
-2. **core = 单线程飞轮**：一次 Run 的全部可变状态归一个 goroutine，无锁；入口只有 Run/Queue/Interrupt/Subscribe；loop 零磁盘 I/O。
+2. **core = 单线程飞轮**：一次 Run 的全部可变状态归一个 goroutine，无锁；入口只有 Run/Queue/Interrupt/Subscribe/Reconfigure（配置每轮开头现取，2026-10-28）；loop 零磁盘 I/O。
 3. **事件分级**：durable（载荷完整、存活订阅者内不丢、可重放重建会话）与 volatile（可合并丢）；一切 UI/服务/持久化都是事件消费者。
 4. **core 只有两个钩子槽**：Assembler（窗口组装/记忆注入唯一入口）+ ToolGuard（审批）；其余一切在 runtime 层组合。
 5. **ContextWindow 是一等可编程状态，非线性规划是方向**：选择非线性、呈现线性稳定（importance ≠ recency）。v1 窗口 = **每轮组装**（压缩记忆 + 当前感知 + 新输入，间隙异步压缩，03 §5）；非线性 Planner 细节未定稿——草稿 notes/context-planning-draft.md，M3 前重论（05 G2）。
@@ -80,7 +80,7 @@ pkg ──── agent-loop（agent-core）──── context-build（runtime�
 8. **插件契约极简（5 接口 12 方法）**：Provider / Tool / Assembler / ToolSource / **ContextSource**（Name/Collect/Observe——窗口生成契约：记忆、RAG、画像、静态知识都是给窗口供给 Unit 的源；Collect 快路径同步、Observe 慢路径异步幂等；蒸馏是源内部管线而非契约）。依赖 = 类型化构造注入，**Go 类型系统即校验**；数据 = 契约类型 / artifact+ref / ctx，插件间不直接调用、无万能信封。 记忆写路修订中（2026-10-02）：记忆服务改用独立接口 Stage / End / Start / Recall，见 [memory/options.md](memory/options.md)「写入与召回流程」。
 9. **扩展 = 普通 Go 组合，无 Hook 抽象（03 §3）**：core 运行中不可变——读 = 事件订阅，改 = 挂点上的链/装饰器（ChainAssembler/ChainGuard + Tool/Provider 装饰 + 窗口命令），控制 = Interrupt/Queue；tool hook 三层分工：工具内部 / 全局装饰 / Guard 决策；core 只见折叠后的单个实现。
 10. **一切构件确定性可测**：FakeProvider 表驱动，无网络无磁盘，`-race` 干净。
-11. **宿主薄壳与配置分层（2026-09-14）**：薄壳只做三件事——制造 Scope、订阅事件流、**输入插头**（把各路输入加工成「一句完整的话 + 谁说的」）。配置**启动读一次、运行期只写回**：web 是操作面（内存即真相）、文件是持久化载体；生效优先级 = 启动 flag（进程内）> override 文件（网页保存目标，机器写）> base 文件（人写，程序**永不重写**、注释安全）> 默认值。写回只碰 override 层（viper 写回必丢注释），原子写；外部手改走 `Reload()`/重启。详见 [06](06-host-shell.md)。
+11. **宿主薄壳与配置分层（2026-09-14）**：薄壳只做三件事——制造 Scope、订阅事件流、**输入插头**（把各路输入加工成「一句完整的话 + 谁说的」）。配置**启动读一次、运行期只写回**：web 是操作面（内存即真相）、文件是持久化载体；生效优先级 = 启动 flag（进程内）> override 文件（网页保存目标，机器写）> base 文件（人写，程序**永不重写**、注释安全）> 默认值。写回只碰 override 层（viper 写回必丢注释），原子写；外部手改走 `Reload()`/重启——2026-10-28 起宿主另挂文件监听自动触发 `Reload()`，变更统一经 `assemble.Live` 用宿主的装配函数整份重新装配会话（参照 pi 的 reload：会话与上下文窗口不动；记忆服务与落盘除外）。详见 [06](06-host-shell.md) §3。
 12. **组装层 = 骨架 + 可换零件（2026-09-14）**：`runtime/window` 的身份是**组装层**（每轮该给模型看什么由它拼），压缩只是它的一个零件位。排列顺序与「压缩中不丢内容 / 失败退回原文」是骨架；压缩策略是**可点菜的零件**（已实现：`internal/assemble` 装配表 + `Session.SetCompressor` 热切换；将来两段式 compact 就是表里加一行）。详见 [03](03-context-build.md) §5。
 
 **当前实现全景（2026-09-14）**：

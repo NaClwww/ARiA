@@ -30,6 +30,8 @@ const (
 	// 落盘可审计（否则只能从 token 量间接推断）。
 	KindWindowCompressed Kind = "window_compressed"
 	KindAgentEnd         Kind = "agent_end"
+	// KindReconfigured：Reconfigure 的新配置在本轮开头生效（durable，回放时可见配置在哪一轮换过）。
+	KindReconfigured Kind = "reconfigured"
 )
 
 // Durable 报告事件级别。两个 volatile 词汇之外全部 durable。
@@ -51,6 +53,15 @@ type AgentStartData struct {
 }
 
 type UserMessageInjectedData struct{ Message message.Message }
+
+// ReconfiguredData 描述生效的新配置。Note 由 Reconfigure 的调用方给出（provider / 模型等
+// loop 不认识的部分）；其余字段取自配置本身。
+type ReconfiguredData struct {
+	Note        string
+	Tools       []string
+	MaxTurns    int
+	ToolTimeout time.Duration
+}
 
 type TurnStartData struct {
 	Turn          int
@@ -145,6 +156,9 @@ func cloneEvent(ev Event) Event {
 		ev.Data = d
 	case UserMessageInjectedData:
 		d.Message = d.Message.Clone()
+		ev.Data = d
+	case ReconfiguredData:
+		d.Tools = append([]string(nil), d.Tools...)
 		ev.Data = d
 	case MessageEndData:
 		d.Message = d.Message.Clone()

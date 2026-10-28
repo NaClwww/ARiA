@@ -10,10 +10,10 @@
 // （viper#1104，官方无修复计划）。所以 base 永远只读、由人写；只有 override
 // （只含被改的键、程序独占写）会被重写——机器文件没有注释无所谓。
 //
-// **不做自动监听**：外部手改文件后要生效，调 Reload（面板「重新读取」按钮）
-// 或重启进程。不监听也就不存在「漏事件」：文件级 fsnotify 对原子保存失明
-// （vim 写临时文件再改名会换掉监听对象，viper#142），mtime 也不行——实测本机
-// 时间戳粒度粗到 tmp+rename 前后完全相同。
+// Manager 本身**不做自动监听**：外部手改文件后要生效，调 Reload（面板「重新
+// 读取」按钮 / 终端 /reload）或重启进程。要自动生效，宿主另挂 Watch（watch.go）
+// 在文件变化时调 Reload——监听与重读解耦，换监听方式不动 Manager；变化与否
+// 由 Reload 比对内容判定（mtime 不可靠：实测 tmp+rename 前后同纳秒）。
 package config
 
 import (
@@ -67,13 +67,14 @@ type Server struct {
 
 type Provider struct {
 	// Kind 是适配器名（internal/assemble.Provider 的装配键）：
-	// "deepseek"（官方端点特化）| "openai"/空（OpenAI 兼容端点通用）。
+	// "deepseek"（官方端点特化）| "openai"/空（OpenAI 兼容端点通用）|
+	// "opencode"（OpenCode Zen 按量付费）| "opencode-go"（OpenCode Go 订阅）。
 	Kind      string
 	BaseURL   string
 	Model     string
 	APIKeyEnv string // key 本体永远在环境变量；这里只存变量名
 	// ContextWindow / MaxOutput 覆盖适配器的模型限额（token）；0 = 适配器内置值
-	// （kind=deepseek 按模型名查表；kind=openai 无内置值，未配置时不按上下文用量压缩）。
+	// （kind=deepseek 按模型名查表；kind=opencode/opencode-go 启动时从 models.dev 获取；kind=openai 无内置值，未配置时不按上下文用量压缩）。
 	ContextWindow int
 	MaxOutput     int
 }
@@ -303,13 +304,13 @@ func (m *Manager) OnChange(fn func(Config)) {
 	m.listenersMu.Unlock()
 }
 
-// Reload 显式重读两层文件（不做任何自动监听）：外部手改了配置、想让改动生效
-// 时调它（web 面板给一个「重新读取」按钮）。返回是否有实际变化。
+// Reload 显式重读两层文件：外部手改了配置、想让改动生效时调它（web 面板
+// 「重新读取」按钮、终端 /reload、Watch 回调）。返回是否有实际变化。
 //
 // 设计取向（2026-09-14 定稿）：**启动时读一次，运行期只写回**——web 是配置的
 // 操作面（内存即真相），文件是持久化载体（下次启动还原）。
-// 免去监听后，文件级监听的原子保存盲区（viper#142）、mtime 粒度（实测同纳秒）
-// 这些坑随之消失。base 仍永不被程序重写，注释安全。
+// 重复调用无害（内容未变即返回 false），所以监听方多报也没关系。
+// base 仍永不被程序重写，注释安全。
 func (m *Manager) Reload() bool {
 	baseChanged := m.reloadIfChanged(m.basePath, true)
 	overChanged := m.reloadIfChanged(m.overPath, false)

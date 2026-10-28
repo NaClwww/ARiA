@@ -58,6 +58,8 @@
 **F4 · 成本报表 `[M3]`** —— usage 计量落库表结构与查询接口（Budget 已有，报表未设计）。
 **F5 · 命名 `[ anytime ]`** —— ARiA 的含义/全称（影响 README 第一行与 module path）。:)
 
+**F6 · 记忆服务与落盘的热替换 `[ anytime ]`** —— 2026-10-28 配置热更新改为「整份重新装配」（06 §3、[discussions/2026-10-28-runtime-reload.md](discussions/2026-10-28-runtime-reload.md)）：Provider、工具、人设、轮数/超时、压缩、会话计时都已热改。剩下两项仍需重启，原因在会话生命周期：记忆服务按会话 Start/Stage/End，中途换引擎会把暂存要点留在旧引擎；落盘是常驻 durable 订阅者，中途换文件需退订再订阅，衔接处可能丢事件。候选：`Reconfigure` 暂存新的 Memory/Store，**会话切换时**替换（参照 pi 的 `session_shutdown` / `session_start(reason: reload)`）；待定是否允许宿主显式「立即结束会话并切换」以缩短等待。
+
 ## G. 从 03 降级的设计（待重论）
 
 **G0 · 输入预测（speculate）`[优先级最低 · 已实现未接线]`** —— 2026-09-11 用户定调：实现难度高（成轮置信度判定、猜测内容生成、与语音链路耦合），**v1 不接入，Session 不依赖它**。代码已就绪（runtime/speculate，设计见 03 §4），等语音链路跑通、收益可量化后再启用；届时需补 ingress 的投机闸门（03 §6）。此条不阻塞任何里程碑。

@@ -20,6 +20,7 @@
 ## 2. Provider 适配器
 
 - **openai-compatible**（M1）：一个适配器覆盖 DeepSeek/GLM/Qwen/Ollama 的 OpenAI 端点；规范形互转（pkg/message ↔ OpenAI 格式）；流式 SSE 解析 → PartDelta/MessageComplete。
+- **opencode**（2026-10-28）：`plugins/provider/opencode`，OpenCode Console 的 Zen（按量付费，kind=`opencode`）与 Go（订阅制，kind=`opencode-go`）。两者都走 chat/completions（Console 在 API 风格间互译），直接复用 openai 适配器，只在 RoundTripper 层补 OpenCode 要求的请求头：自有 User-Agent 与会话头 `x-opencode-session`（取 Scope.SessionID）。key 兜底 `OPENCODE_API_KEY`。模型限额：OpenCode 的 `/v1/models` 只给 ID，改取 `pkg/modelcard`（models.dev，键 `opencode` / `opencode-go`，见 01 §3）——适配器创建时后台拉一次，`Limits` 不阻塞，拉到前/失败时为零值（该轮不按用量压缩，下一轮起生效）；`provider.context_window` / `max_output` 非零时优先，只作用于 `provider.model` 这一个模型（经 Options 用到的其他模型按各自的卡）；`Card(model)` 暴露完整模型卡。
 - **anthropic / gemini**（M1 后补齐）：官方 Go SDK 或自写 HTTP，同样只做哑管道翻译。
 - 硬性义务（core/02 §5）：取消时以 `MessageComplete(interrupted=true)` 返回已收内容；Usage 必须上报（Budget 扣减依赖）；限流/超时错误标记 Retryable（错误三分法）。
 - 限流包装 `LimitedProvider` 属 runtime（并发调度草稿 notes/concurrency-draft.md，有需要再定），适配器本身不管限流。

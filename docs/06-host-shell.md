@@ -44,7 +44,12 @@
          △ 默认值     （代码内）
 ```
 
-**读一次，运行期只写回（2026-09-14 定稿）**：web 是配置的操作面（内存即真相），文件是持久化载体（下次启动还原）。**不做任何自动监听**——文件级监听的原子保存盲区（[viper#142](https://github.com/spf13/viper/issues/142)）、mtime 粒度（实测 tmp+rename 前后同纳秒）这些坑随之不再需要解决。外部手改文件后要生效：调 `Manager.Reload()`（面板给一个「重新读取」按钮）或重启进程。
+**读一次，运行期只写回（2026-09-14 定稿）**：web 是配置的操作面（内存即真相），文件是持久化载体（下次启动还原）。外部手改文件后要生效：调 `Manager.Reload()`（面板「重新读取」按钮 / 终端 `/reload`）或重启进程。
+
+**文件监听（2026-10-28 修订，原「不做任何自动监听」）**：宿主可另挂 `config.Watch` 自动触发 `Reload()`。三件事解耦——**监听**只报「文件可能变了」（`config.Watch`，不认识 Manager）；**重读**判定变没变、语法错误保留旧值（`Manager.Reload`，不变）；**应用**把变更作用到会话（`assemble.Live`，注册在 `OnChange` 上，面板 Set / `/reload` / 监听都走它）。换监听方式只换第一件。
+- 不用 viper 的 `WatchConfig`：它在自己的 goroutine 里改 viper 实例（绕过 Manager 的锁）、文件被删即永久停止监听（`Clear` 会删空的 override）、没有停止接口、建监听失败直接 `os.Exit(1)`、无防抖；
+- 原先担心的原子保存盲区（[viper#142](https://github.com/spf13/viper/issues/142)）靠**监听所在目录**解决（换 inode、删后重建都收得到）；mtime 粒度问题不涉及——是否变化由 `Reload` 比对内容；
+- 一次保存的多条事件静默 200ms 合并成一次回调；自己写回 override 触发的事件因内容已消化被 `Reload` 忽略；建监听失败只记日志，`/reload` 仍可用。
 
 - **网页改配置只写 override 层**：viper 实例只含被改的键。这是官方推荐的写法——`viper.WriteConfig()` 会把整个文件重写成 map（**注释必丢**，见 [viper#1104](https://github.com/spf13/viper/discussions/1104)，无修复计划），所以人写的 base 层必须让程序碰都不碰；
 - **写回是原子写**：先写同目录临时文件再改名覆盖，任何读者都看不到半截文件；
@@ -56,11 +61,18 @@
 
 | 配置 | 生效机制 | 热调 |
 |---|---|---|
-| model / temperature / max_tokens | `ctxx.Options` 每请求覆盖（引擎现成能力） | ✅ 白送 |
-| 压缩策略（`compress.strategy`：provider / keeplast / 将来 twopart） | 装配表造实例 + `Session.SetCompressor` 热切换（已实现；在途压缩用旧策略跑完） | ✅ 已实现 |
-| persona / system prompt | `window.SetSystem` | ⚠️ 可热改，代价是前缀缓存失效（切换不频繁可接受） |
-| 工具开关 | loop 工具表构建时固定 | ❌ v1 重启生效 |
-| base_url / api_key_env / listen / record | Agent 构建时定 | ❌ 重启 |
+**重新装配（2026-10-28，参照 pi 的 reload）**：配置有变化时，`assemble.Live` 调宿主的 `build(cfg)`——**与启动同一份**「配置 → `agent.Config`」装配函数——整份重新装配，交给 `Session.Reconfigure`。会话、上下文窗口、会话标识、事件订阅都不动，只换装配；装配失败保持原配置。Provider 由 `assemble.ProviderCache` 按 `[provider]` 段缓存（其余段变化不重建 Provider，opencode 的模型卡也不重拉）。所以「哪些能热改」不再逐项实现：**在 `build` 里读到的配置都能热改**。讨论与备选方案见 [discussions/2026-10-28-runtime-reload.md](discussions/2026-10-28-runtime-reload.md)。
+
+| 配置 | 生效时机 | 热调 |
+|---|---|---|
+| temperature / max_tokens / reasoning_effort | `ctxx.Options` 每请求现取 | ✅ 下一请求 |
+| `[provider]` / `[tools]` / `limits.*` / persona | loop 配置（`Loop.Reconfigure`）下一轮开头生效——运行中即下一次 LLM 请求前；生效时发 durable `reconfigured` 事件 | ✅ 下一轮 |
+| `[compress]` / persona 的窗口侧 | 下一次组装 / 压缩（在途压缩用旧策略跑完） | ✅ |
+| `session.idle_timeout_s` / `recall_wait_ms`、压缩预留 | 立即 | ✅ |
+| `[memory]` / `[record]` | 记忆服务随会话生命周期（Start/Stage/End）、落盘是常驻 durable 订阅者，`Reconfigure` 忽略这两项 | ❌ 重启（05 F6） |
+| listen / `[host]` / 会话标识 / 默认说话人 / 命名空间 | 宿主启动时定 | ❌ 重启 |
+
+不能热改的段变更时，`assemble.Live` 只记一条「需重启」日志（`restartOnly`）。persona 热改的代价是前缀缓存失效（切换不频繁可接受）。
 
 配置键与默认值见仓库根 [`aria.toml`](../aria.toml)（带注释样例）。
 
@@ -79,21 +91,22 @@
 
 | 位置 | 职责 |
 |---|---|
-| `internal/config` | 配置管理器（Load/Effective/Base/Set/Clear/SetLocal/Reload/OnChange/SetLogf）；启动读一次、运行期只写回 |
-| `internal/assemble` | 宿主侧「名字 → 零件」装配表（压缩策略等）：引擎只认接口，不认识配置里的名字 |
+| `internal/config` | 配置管理器（Load/Effective/Base/Set/Clear/SetLocal/Reload/OnChange/SetLogf/Paths）；启动读一次、运行期只写回；`Watch` 文件监听（与 Manager 解耦） |
+| `internal/assemble` | 宿主侧「名字 → 零件」装配表（provider / 压缩策略 / 记忆等）：引擎只认接口，不认识配置里的名字；`Live` 是配置变更的统一应用点（调宿主的 `build` 重新装配），`ProviderCache` 按 `[provider]` 段缓存 Provider |
 | `internal/aria-host` | aria-host 的定制组件集：`Engine`（配置→provider→agent→会话组装/收尾）、`Sink`（多插头投递纪律，本表 §2）、`StdinPlug`/`SplitSpeaker`、`ConsumeTerminal` 终端渲染、`ResolvePersona`、echo provider——main 只做接线 |
 | `runtime/app` | 宿主外设挂载与生命周期容器：`Mount`（事件流消费者：订阅+goroutine，收尾=退订+排干）、`Service`（后台服务：独立 ctx，收尾=取消+等待）、`OnShutdown`（链底钩子）。顺序纪律：挂载即订阅（消费者先挂、输入插头最后——事件不重放），收尾严格逆序 LIFO（输入先停→消费者排干→资产回收→会话/引擎关闭）；只依赖 core/loop，main 退化成一份挂载清单 |
 | `plugins/vision/gowild` | 视觉注入（discussions 2026-09-11 §1 拍板 B 形态，2026-09-28 落地）：`Vision` 实现 core 槽 1 的额外变换——每次 LLM 调用现拉 `GET /api/camera/frame`（2s 硬顶）追加在组装结果最底部（user 消息：说明 + `ImageBlock(Data)`）；不进窗口历史、不落盘、失败安静跳过。每请求恰好一张「此刻」帧，旧帧永不重发 |
-| `cmd/aria-demo` | 终端薄壳：**吃配置文件**（flag 只作进程内覆盖 = local 层）、stdin 行 = 成轮话语、`[名字]` 前缀切换说话人、流式打印、Ctrl+C 打断、`--record` JSONL、`/reload` 重读文件、`--print-config` 打印生效配置 |
+| `cmd/aria-demo` | 终端薄壳：**吃配置文件**（flag 只作进程内覆盖 = local 层）、stdin 行 = 成轮话语、`[名字]` 前缀切换说话人、流式打印、Ctrl+C 打断、`--record` JSONL、`/reload` 重读文件（另有文件监听自动触发）、`--print-config` 打印生效配置 |
 | `cmd/aria-web` | 浏览器薄壳（待做） |
 | `plugins/persist/jsonl` | durable 事件的 JSONL 落盘（格式 v1 带版本号，写路完整、读路随恢复需求） |
 | `plugins/voice/gowild` | Gowild-HE 语音插件全家桶：`Gate`（半双工闸门：引用计数 + 迁移订阅，控制流的信号源）、`Input`（半双工输入纪律，引擎投递口 `InputSink` 由宿主实现多插头纪律）、ASR 输入插头（backend SSE）、TTS 事件订阅者（流式合成 → launcher 三段式播放 / paplay）、`Light`（RGB 状态灯：订阅闸门迁移与 partial 心跳，事件驱动）、`MicMute`/`FollowGate`（闭耳：订阅闸门迁移 → backend `POST /asr/mute`，回合中源头丢 mic 流——自回声 final 不产生、省流式解码） |
 
-**同一进程内的即时生效**：面板保存 → `Set` 写入 override 层并更新内存 → 宿主下一轮 `Effective()` 就能拿到新值（demo 里模型/温度是每轮现取的，所以改完下一句就换模型）。压缩策略这类「构造期才注入」的部件由宿主在变更后重新装配并调 `Session.SetCompressor` 热切换（demo 的 `/reload` 就是这么做的）。这是「改配置不必重启」的实际含义；手改文件仍需 `Reload`/重启（见 §3）。
+**同一进程内的即时生效**：面板保存 → `Set` 写入 override 层并更新内存 → 宿主下一轮 `Effective()` 就能拿到新值（demo 里模型/温度是每轮现取的，所以改完下一句就换模型）。Provider、工具、压缩策略这类「构造期才注入」的部件由 `OnChange` 上的 `assemble.Live` 用宿主的 `build` 整份重新装配（两个宿主共用这套机制）。这是「改配置不必重启」的实际含义；手改文件由文件监听或 `/reload` 触发 `Reload`（见 §3）。
 
 ## 6. 未落地清单
 
 1. `cmd/aria-web`（设置面板 + 对话测试页 + 事件流/窗口状态）；
 2. 两段式压缩策略 `twopart`（引擎侧位置已备好，等 05 C4 拍板）；
 3. **认主 / 名册**：插件层与周边服务协商（03 §6），暂缓；
-4. **打断 / 小轮**：03 §7 设计已定稿，实现暂缓。
+4. **打断 / 小轮**：03 §7 设计已定稿，实现暂缓；
+5. **记忆服务与落盘的热替换**：其余部件已可热改（2026-10-28 重新装配），这两项仍需重启，见 05 F6。

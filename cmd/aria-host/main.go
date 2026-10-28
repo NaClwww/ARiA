@@ -34,7 +34,7 @@
 //	aria-host --fake                     # stdin + ASR + TTS（echo 冒烟）
 //	aria-host                            # 按 aria.toml 连真实模型
 //
-// 交互：[名字] 开头切换说话人；/quit 按收尾链退出；Ctrl+C 打断当前回答，2 秒内
+// 交互：[名字] 开头切换说话人；/reload 重读配置文件（文件监听也会自动触发）；/quit 按收尾链退出；Ctrl+C 打断当前回答，2 秒内
 // 再按一次按收尾链退出，收尾期间再按一次强制退出；SIGTERM 按收尾链退出。
 // stdin EOF 在 ASR 模式下不退出（常驻语音形态）。
 package main
@@ -235,7 +235,7 @@ func main() {
 
 	// 输入纪律（半双工：拦截 + 轮次份额）——策略在插件，引擎投递口在本壳。
 	input, ierr := gowild.NewInput(gowild.InputConfig{
-		Sink:         ariahost.Sink{Session: sess, Cfg: cfg},
+		Sink:         ariahost.Sink{Session: sess, Config: eng.Config},
 		Gate:         gate,
 		PlaybackGate: playbackGate,
 		Bypass:       h.NoInputGate,
@@ -277,6 +277,22 @@ func main() {
 	}()
 
 	// ---- 输入插头最后挂：所有消费者就位后才放输入进来 ----
+	// 配置热更新：文件监听与 stdin /reload 只负责「重读文件」，变更经 Config.OnChange
+	// 由 eng.Live 统一应用（docs/06 §3）。监听不是输入插头，挂在插头之前。
+	eng.Config.SetLogf(func(format string, args ...any) { log.Warn(fmt.Sprintf(format, args...)) })
+	app.Service("config-watch", func(ctx context.Context) {
+		if err := config.Watch(ctx, eng.Config.Paths(), 0, func() { eng.Config.Reload() }); err != nil {
+			log.Warn("配置文件监听未启用，改配置后用 /reload 或重启", "err", err)
+			return
+		}
+		<-ctx.Done()
+	})
+	reload := func() {
+		if !eng.Config.Reload() {
+			fmt.Fprintln(os.Stderr, "（配置文件无变化）")
+		}
+	}
+
 	var plugs []string
 	if !h.NoASR {
 		var onPartial func()
@@ -329,7 +345,7 @@ func main() {
 	if !h.NoStdin {
 		// stdin EOF 是否退出取决于有没有 ASR 插头：语音形态要常驻。
 		app.Service("stdin", func(ctx context.Context) {
-			ariahost.StdinPlug(ctx, os.Stdin, input.Deliver, cfg.Session.DefaultUser, h.NoASR, requestQuit)
+			ariahost.StdinPlug(ctx, os.Stdin, input.Deliver, cfg.Session.DefaultUser, h.NoASR, requestQuit, reload)
 		})
 		plugs = append(plugs, "stdin")
 	}
