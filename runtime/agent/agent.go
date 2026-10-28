@@ -234,6 +234,18 @@ func New(cfg Config) (*Agent, error) {
 	}, nil
 }
 
+// loopConfig 是本零件盒对应的 loop 配置（会话建立与 Reconfigure 共用）。
+func (a *Agent) loopConfig() loop.Config {
+	return loop.Config{
+		Provider:    a.cfg.Provider,
+		Tools:       a.buildTools(),
+		Assembler:   a.cfg.Assembler,
+		Guard:       a.cfg.Guard,
+		MaxTurns:    a.cfg.MaxTurns,
+		ToolTimeout: a.cfg.ToolTimeout,
+	}
+}
+
 // buildTools 组装本会话的工具表（registry 全局包装，03 §3 挂点 5）：
 // 启用截断时注册 artifact.open 读取工具，并对其他工具套上结果截断装饰器。
 // 读取工具自身不截断——否则「读大块」永远读不完。
@@ -274,14 +286,7 @@ func (a *Agent) NewSession(scope ctxx.Scope) (*Session, error) {
 	if !scope.Valid() {
 		return nil, loop.ErrNoScope
 	}
-	l, err := loop.New(loop.Config{
-		Provider:    a.cfg.Provider,
-		Tools:       a.buildTools(),
-		Assembler:   a.cfg.Assembler,
-		Guard:       a.cfg.Guard,
-		MaxTurns:    a.cfg.MaxTurns,
-		ToolTimeout: a.cfg.ToolTimeout,
-	})
+	l, err := loop.New(a.loopConfig())
 	if err != nil {
 		return nil, err
 	}
@@ -294,6 +299,7 @@ func (a *Agent) NewSession(scope ctxx.Scope) (*Session, error) {
 	win.SetSystem(a.cfg.SystemPrompt)
 	win.SetKeepRecentTurns(a.cfg.KeepRecentTurns)
 	s := &Session{
+		ag:         a,
 		loop:       l,
 		win:        win,
 		scope:      scope,
@@ -401,6 +407,7 @@ func (s *Session) startMemory(svc memory.Service, scope ctxx.Scope) {
 
 // Session 是一个会话的全部运行时状态。并发安全：Input 之间互斥（03 §5）。
 type Session struct {
+	ag     *Agent // 当前零件盒（Reconfigure 替换，读写持 mu）
 	loop   *loop.Loop
 	win    *window.Window
 	scope  ctxx.Scope // SessionID 在会话切换时改写，读写持 mu（见 currentScope）
@@ -421,9 +428,8 @@ type Session struct {
 
 	runMu sync.Mutex // 一 Session 同时只跑一轮
 
-	prov provider.Provider // 窗口预算的限额与 token 估算来源
-
 	mu        sync.Mutex
+	prov      provider.Provider // 窗口预算的限额与 token 估算来源（Reconfigure 替换）
 	inputBuf  []message.Message // 本轮的触发输入（Input 写入，结算时消费）
 	turnBuf   []message.Message // 本轮产出（消息事件累积）
 	turnCtx   context.Context   // 本轮 run ctx（压缩继承其身份）
@@ -551,6 +557,55 @@ func (s *Session) SetIdleTimeout(d time.Duration) {
 	defer s.mu.Unlock()
 	s.idle = d
 	s.armIdleLocked()
+}
+
+// Reconfigure 按新配置重新组装会话（参照 pi 的 reload：会话、上下文窗口、事件订阅都不动，
+// 只换装配）。生效时机：
+//
+//   - Provider / Tools / Assembler / Guard / MaxTurns / ToolTimeout：loop 下一轮开头（运行中即
+//     下一次 LLM 请求前），生效时发出 durable 的 reconfigured 事件，note 原样记入；
+//   - SystemPrompt / Compressor / KeepRecentTurns：下一次窗口组装 / 压缩（在途压缩用旧策略跑完）；
+//   - Compact / IdleTimeout / RecallWait：立即。
+//
+// 会话生命周期内固定、这里忽略的字段：Memory、Store、NewSessionID、Logger、SubscribeBuffer、
+// CloseGrace（记忆服务与落盘随会话起止，换它们需重启或等后续的会话级替换）。Artifacts 为空时
+// 沿用当前的工具结果存放处，已发出的 artifact 引用继续可读。
+//
+// 校验失败（缺 Provider、工具重名等）返回错误，会话保持原配置不变。
+func (s *Session) Reconfigure(cfg Config, note string) error {
+	s.mu.Lock()
+	cur := s.ag
+	s.mu.Unlock()
+	if cfg.Artifacts == nil {
+		cfg.Artifacts = cur.artifacts
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = cur.log
+	}
+	ag, err := New(cfg)
+	if err != nil {
+		return err
+	}
+	if err := s.loop.Reconfigure(ag.loopConfig(), note); err != nil {
+		return err
+	}
+	s.win.SetSystem(cfg.SystemPrompt)
+	s.win.SetCompressor(ag.compressor)
+	s.win.SetKeepRecentTurns(cfg.KeepRecentTurns)
+
+	s.mu.Lock()
+	s.ag = ag
+	s.prov = cfg.Provider
+	s.compact = cfg.Compact
+	s.recallWait = cfg.RecallWait
+	s.noWindow = false // 新 Provider 的窗口可能已知，重新判定并告警
+	s.idle = cfg.IdleTimeout
+	s.armIdleLocked()
+	s.mu.Unlock()
+	if s.mem != nil {
+		s.mem.SetStartTimeout(cfg.RecallWait)
+	}
+	return nil
 }
 
 // SessionID 返回当前会话标识（会话切换后为新标识）。
@@ -929,16 +984,19 @@ func (s *Session) enqueueStart(sc ctxx.Scope, at time.Time) {
 // waitRecall 在会话首轮组装前等待 Start 结束（ready 关闭），上限 s.recallWait；到达上限时由 s.log 输出
 // Warn 日志 agent: recall not ready, first turn proceeds without recall。ctx 取消或会话关闭时停止等待。
 func (s *Session) waitRecall(ctx context.Context, ready <-chan struct{}) {
-	if s.recallWait <= 0 {
+	s.mu.Lock()
+	wait := s.recallWait // Reconfigure 可改写
+	s.mu.Unlock()
+	if wait <= 0 {
 		return
 	}
-	t := time.NewTimer(s.recallWait)
+	t := time.NewTimer(wait)
 	defer t.Stop()
 	select {
 	case <-ready:
 	case <-t.C:
 		s.log.Warn("agent: recall not ready, first turn proceeds without recall",
-			"session", s.SessionID(), "wait", s.recallWait)
+			"session", s.SessionID(), "wait", wait)
 	case <-ctx.Done():
 	case <-s.closed:
 	}
@@ -990,7 +1048,10 @@ func (s *Session) injectRecall(sessionID string, items []memory.Item) {
 func (s *Session) budget(ctx context.Context, compact CompactBudget) window.Budget {
 	opts, _ := ctxx.OptionsFrom(ctx)
 	model := opts.Model
-	lim := s.prov.Limits(model)
+	s.mu.Lock()
+	prov := s.prov
+	s.mu.Unlock()
+	lim := prov.Limits(model)
 	if lim.ContextWindow <= 0 {
 		s.mu.Lock()
 		warn := !s.noWindow
@@ -1002,6 +1063,6 @@ func (s *Session) budget(ctx context.Context, compact CompactBudget) window.Budg
 		}
 		return window.Budget{}
 	}
-	count := func(ms []message.Message) int { return provider.CountTokens(s.prov, model, ms) }
+	count := func(ms []message.Message) int { return provider.CountTokens(prov, model, ms) }
 	return compact.windowBudget(lim, opts.MaxTokens, count)
 }

@@ -104,38 +104,7 @@ func main() {
 		return
 	}
 
-	var (
-		prov       provider.Provider
-		compressor window.Compressor
-	)
-	if *fake {
-		prov = newDemoProvider()
-		log.Info("provider: fake（无网络；压缩策略已改为 keeplast 以保持确定性）")
-	} else {
-		// 配置 → provider 走共享装配表（与 aria-host 同源；kind=deepseek
-		// 吃默认模型，openai 兼容端点保持原语义）。
-		res, perr := assemble.Provider(cfg, *apiKey)
-		if perr != nil {
-			log.Error("真实模式 provider 装配失败", "err", perr, "hint", "或用 --model/--api-key/--fake")
-			os.Exit(2)
-		}
-		prov = res.Impl
-		log.Info("provider", "kind", res.Kind, "model", res.Model, "base_url", orDefault(cfg.Provider.BaseURL, "(官方默认)"))
-	}
-
-	compressor, err = assemble.Compressor(cfg, prov)
-	if err != nil {
-		log.Error("compress assemble failed", "err", err)
-		os.Exit(2)
-	}
-	log.Info("compress", "strategy", cfg.Compress.Strategy)
-
-	systemPrompt, err := resolvePersona(cfg.Persona, defaultSystemPrompt)
-	if err != nil {
-		log.Error("persona load failed", "err", err)
-		os.Exit(2)
-	}
-
+	// 会话级部件：启动时建一次，热更新不换（docs/06 §3）。
 	var store persist.Store
 	if cfg.Record.Path != "" {
 		s, err := jsonl.New(cfg.Record.Path)
@@ -146,12 +115,6 @@ func main() {
 		store = s
 		log.Info("record", "path", cfg.Record.Path)
 	}
-
-	tools, err := buildTools(cfg.Tools.Builtin, log)
-	if err != nil {
-		log.Error("tools build failed", "err", err)
-		os.Exit(2)
-	}
 	// 记忆服务（可空）：接入时装入 memory_recall 工具并在人设后追加使用规则（与 aria-host 同源）。
 	mem, err := assemble.Memory(cfg.Memory, log)
 	if err != nil {
@@ -159,28 +122,67 @@ func main() {
 		os.Exit(2)
 	}
 	if mem.Service != nil {
-		tools = append(tools, mem.Tool)
-		systemPrompt += "\n" + memory.RecallToolInstruction
 		log.Info("memory", "engine", cfg.Memory.Engine, "base_url", cfg.Memory.BaseURL, "dir", cfg.Memory.Dir, "members", len(cfg.Memory.Members))
 	}
 
+	// build 是「配置 → agent.Config」的装配：启动与热更新（assemble.Live）共用这一份。
+	var fakeProv provider.Provider
+	if *fake {
+		fakeProv = newDemoProvider()
+		log.Info("provider: fake（无网络；压缩策略已改为 keeplast 以保持确定性）")
+	}
+	provs := &assemble.ProviderCache{APIKey: *apiKey}
+	build := func(cfg config.Config) (agent.Config, string, error) {
+		prov, note := fakeProv, "provider=fake"
+		if prov == nil {
+			// 配置 → provider 走共享装配表（与 aria-host 同源）；[provider] 不变时复用实例。
+			res, err := provs.Get(cfg)
+			if err != nil {
+				return agent.Config{}, "", fmt.Errorf("provider: %w", err)
+			}
+			prov, note = res.Impl, res.Note()
+		}
+		compressor, err := assemble.Compressor(cfg, prov)
+		if err != nil {
+			return agent.Config{}, "", fmt.Errorf("compress: %w", err)
+		}
+		systemPrompt, err := resolvePersona(cfg.Persona, defaultSystemPrompt)
+		if err != nil {
+			return agent.Config{}, "", fmt.Errorf("persona: %w", err)
+		}
+		tools, err := buildTools(cfg.Tools.Builtin, log)
+		if err != nil {
+			return agent.Config{}, "", fmt.Errorf("tools: %w", err)
+		}
+		if mem.Service != nil {
+			tools = append(tools, mem.Tool)
+			systemPrompt += "\n" + memory.RecallToolInstruction
+		}
+		return agent.Config{
+			Provider:        prov,
+			Tools:           tools,
+			Compressor:      compressor,
+			KeepRecentTurns: cfg.Compress.KeepRecentTurns,
+			Compact:         assemble.CompactBudget(cfg.Compress),
+			IdleTimeout:     assemble.IdleTimeout(cfg.Session),
+			RecallWait:      assemble.RecallWait(cfg.Session),
+			SystemPrompt:    systemPrompt,
+			MaxTurns:        cfg.Limits.MaxTurns,
+			ToolTimeout:     time.Duration(cfg.Limits.ToolTimeoutMS) * time.Millisecond,
+			Logger:          log,
+		}, note, nil
+	}
+
+	acfg, note, err := build(cfg)
+	if err != nil {
+		log.Error("装配失败", "err", err, "hint", "或用 --model/--api-key/--fake")
+		os.Exit(2)
+	}
+	log.Info("assembled", "note", note, "base_url", orDefault(cfg.Provider.BaseURL, "(官方默认)"),
+		"compress", cfg.Compress.Strategy, "tools", len(acfg.Tools))
 	sessionID, newSessionID := assemble.SessionIDs(cfg.Session, time.Now())
-	ag, err := agent.New(agent.Config{
-		Provider:        prov,
-		Tools:           tools,
-		Compressor:      compressor,
-		KeepRecentTurns: cfg.Compress.KeepRecentTurns,
-		Compact:         assemble.CompactBudget(cfg.Compress),
-		IdleTimeout:     assemble.IdleTimeout(cfg.Session),
-		RecallWait:      assemble.RecallWait(cfg.Session),
-		Memory:          mem.Service,
-		NewSessionID:    newSessionID,
-		Store:           store,
-		SystemPrompt:    systemPrompt,
-		MaxTurns:        cfg.Limits.MaxTurns,
-		ToolTimeout:     time.Duration(cfg.Limits.ToolTimeoutMS) * time.Millisecond,
-		Logger:          log,
-	})
+	acfg.Memory, acfg.Store, acfg.NewSessionID = mem.Service, store, newSessionID
+	ag, err := agent.New(acfg)
 	if err != nil {
 		log.Error("agent new failed", "err", err)
 		os.Exit(1)
@@ -189,6 +191,15 @@ func main() {
 	if err != nil {
 		log.Error("session new failed", "err", err)
 		os.Exit(1)
+	}
+
+	// 配置热更新：文件监听与 /reload 只负责「重读文件」，变更经 OnChange 由 Live 用同一份
+	// build 重新装配会话（docs/06 §3）。监听建不起来不致命，/reload 仍可用。
+	mgr.OnChange(assemble.NewLive(sess, build, cfg, log).Apply)
+	watchCtx, stopWatch := context.WithCancel(context.Background())
+	defer stopWatch()
+	if err := config.Watch(watchCtx, mgr.Paths(), 0, func() { mgr.Reload() }); err != nil {
+		log.Warn("配置文件监听未启用，改配置后用 /reload 或重启", "err", err)
 	}
 
 	// 事件流订阅：独立 goroutine 消费（Input 阻塞期间也要持续排空，
@@ -202,7 +213,7 @@ func main() {
 
 	fmt.Fprintf(os.Stderr, "ARiA demo · 配置 %s · 模型 %s · 会话 %s · 说话人 %s\n",
 		*configPath, modelName(*fake, cfg.Provider.Model), sess.SessionID(), cfg.Session.DefaultUser)
-	fmt.Fprintln(os.Stderr, "输入一句话回车发送；[名字] 开头切换说话人；Ctrl+C 打断；/quit 退出。")
+	fmt.Fprintln(os.Stderr, "输入一句话回车发送；[名字] 开头切换说话人；Ctrl+C 打断；/reload 重读配置（改文件也会自动生效）；/quit 退出。")
 
 	// Ctrl+C：打断当前回答（steering）；距上一次打断 2 秒内再按一次强制退出，
 	// 超出 2 秒按新的一次打断处理。
@@ -230,7 +241,8 @@ func main() {
 		}
 	}()
 
-	exit := run(sess, lines, mgr, prov, os.Stderr)
+	exit := run(sess, lines, mgr, os.Stderr)
+	stopWatch()
 	unsub()
 	if err := sess.Close(); err != nil {
 		log.Error("session close", "err", err)
@@ -255,9 +267,9 @@ func main() {
 // run 是主循环：每行 = 一句已结算话语。这里就是未来 ingress 的接入缝——
 // 成轮状态机（03 §6）产出的每条「有主人的输入」照同样方式调 Input。
 //
-// 每轮重新取一次生效配置：面板保存（写 override 层）或 Reload 之后，下一轮
-// 就用上新模型/新参数——这是「改配置不必重启」在本壳里的体现。
-func run(sess *agent.Session, lines <-chan string, mgr *config.Manager, prov provider.Provider, errw io.Writer) int {
+// 每轮重新取一次生效配置：面板保存（写 override 层）、/reload 或文件监听之后，下一轮
+// 就用上新模型/新参数；构造期部件（provider、压缩策略等）由 OnChange 上的 Live 热切换。
+func run(sess *agent.Session, lines <-chan string, mgr *config.Manager, errw io.Writer) int {
 	for line := range lines {
 		text := strings.TrimSpace(line)
 		if text == "" {
@@ -270,22 +282,7 @@ func run(sess *agent.Session, lines <-chan string, mgr *config.Manager, prov pro
 		if text == "/reload" {
 			if !mgr.Reload() {
 				fmt.Fprintln(errw, "（配置文件无变化）")
-				continue
 			}
-			cfg = mgr.Effective() // 重读后必须重新取快照：上面那份是 Reload 之前的
-			// 策略可能变了：重新装配并热切换（在途压缩用旧策略跑完）。
-			c, err := assemble.Compressor(cfg, prov)
-			if err != nil {
-				fmt.Fprintf(errw, "（压缩策略未变：%v）\n", err)
-				continue
-			}
-			sess.SetCompressor(c)
-			sess.SetKeepRecentTurns(cfg.Compress.KeepRecentTurns)
-			sess.SetCompactBudget(assemble.CompactBudget(cfg.Compress))
-			sess.SetIdleTimeout(assemble.IdleTimeout(cfg.Session))
-			fmt.Fprintf(errw, "（已重读配置；模型 %s，压缩策略 %s，保留近轮 %d，预留比例 %.2f，会话切换 %d s）\n",
-				cfg.Provider.Model, cfg.Compress.Strategy, cfg.Compress.KeepRecentTurns, cfg.Compress.ReserveRatio,
-				cfg.Session.IdleTimeoutS)
 			continue
 		}
 		defUser := orDefault(cfg.Session.DefaultUser, "user")

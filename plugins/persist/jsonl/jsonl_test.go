@@ -235,6 +235,28 @@ func TestStoreWindowCompressedShape(t *testing.T) {
 	}
 }
 
+func TestStoreReconfiguredShape(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.jsonl")
+	s, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	d := loop.ReconfiguredData{Note: "model=m", Tools: []string{"now"}, MaxTurns: 100, ToolTimeout: 30 * time.Second}
+	if err := s.Append(context.Background(), "aria", loop.Event{Kind: loop.KindReconfigured, Data: d}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"kind":"reconfigured"`, `"note":"model=m"`, `"tools":["now"]`, `"max_turns":100`, `"tool_timeout_ms":30000`} {
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("配置变更事件缺字段 %s：%s", want, b)
+		}
+	}
+}
+
 // initial_input 按内容去重：同一 Store 实例内重复出现的消息（含同一行内的重复）写为
 // {"ref":hash}，首次出现的消息写全文并带 hash；重新打开文件后去重状态清空。
 func TestStoreInitialInputDedupe(t *testing.T) {

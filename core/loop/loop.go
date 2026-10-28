@@ -108,12 +108,12 @@ type RunResult struct {
 // ---------- Loop ----------
 
 type Loop struct {
-	cfg      Config
-	tools    map[string]tool.Tool
-	toolDefs []tool.Def
-	bus      *bus
+	bus *bus
 
-	mu      sync.Mutex // 只守入口边界（队列、运行标志），不守飞轮状态
+	mu      sync.Mutex // 只守入口边界（队列、运行标志、待生效配置），不守飞轮状态
+	next    *runConfig // 最新配置：Reconfigure 写，Run 在每一轮开头取用
+	nextGen uint64     // next 的代号：每次 Reconfigure 递增
+	note    string     // next 的说明（ReconfiguredData.Note）
 	queue   []message.Message
 	running bool
 	// sealed：本轮已在收敛判定时封口，Queue 拒收。与 running 分开：running
@@ -126,6 +126,8 @@ type Loop struct {
 	interrupt atomic.Bool
 
 	// 以下为飞轮状态：仅 Run goroutine 触碰。
+	rc       *runConfig // 本轮生效的配置快照（每轮开头从 next 取，轮内不变）
+	rcGen    uint64     // rc 的代号：与 nextGen 不同即有新配置待生效
 	messages []message.Message
 	turn     int
 	runID    string
@@ -136,21 +138,28 @@ type Loop struct {
 
 type cancelBox struct{ fn context.CancelFunc }
 
-func New(cfg Config) (*Loop, error) {
+// runConfig 是校验后的配置：工具按名索引，默认值已填。构造后只读。
+type runConfig struct {
+	cfg      Config
+	tools    map[string]tool.Tool
+	toolDefs []tool.Def
+}
+
+func buildRunConfig(cfg Config) (*runConfig, error) {
 	if cfg.Provider == nil {
 		return nil, errors.New("loop: Provider is required")
 	}
-	l := &Loop{cfg: cfg, bus: newBus(), tools: make(map[string]tool.Tool, len(cfg.Tools))}
+	rc := &runConfig{tools: make(map[string]tool.Tool, len(cfg.Tools))}
 	for _, t := range cfg.Tools {
 		d := t.Def()
 		if !validToolName(d.Name) {
 			return nil, fmt.Errorf("loop: invalid tool name %q（OpenAI 工具名规范：1-64 个 ASCII 字母/数字/_/-，部分网关严格校验）", d.Name)
 		}
-		if _, dup := l.tools[d.Name]; dup {
+		if _, dup := rc.tools[d.Name]; dup {
 			return nil, fmt.Errorf("loop: duplicate tool name %q", d.Name)
 		}
-		l.tools[d.Name] = t
-		l.toolDefs = append(l.toolDefs, cloneToolDef(d))
+		rc.tools[d.Name] = t
+		rc.toolDefs = append(rc.toolDefs, cloneToolDef(d))
 	}
 	if cfg.MaxTurns == 0 {
 		cfg.MaxTurns = DefaultMaxTurns
@@ -158,8 +167,53 @@ func New(cfg Config) (*Loop, error) {
 	if cfg.MaxStreamRetries == 0 {
 		cfg.MaxStreamRetries = 3
 	}
-	l.cfg = cfg
-	return l, nil
+	rc.cfg = cfg
+	return rc, nil
+}
+
+func New(cfg Config) (*Loop, error) {
+	rc, err := buildRunConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &Loop{bus: newBus(), next: rc, rc: rc}, nil
+}
+
+// Reconfigure 替换配置（参照 pi：Agent 状态可随时改，loop 每轮现取）。校验失败返回错误、
+// 原配置不变。新配置在**下一轮开头**生效——空闲时即下一次 Run 的第一轮，运行中即本次 Run
+// 的下一轮（下一次 LLM 请求前）；轮内（流式输出、工具执行）不受影响。生效时发出 durable 的
+// KindReconfigured 事件，note 原样记入（如「provider=x model=y」，便于回放时看出换了什么）。
+//
+// 轮中途撤掉的工具：模型若仍调用它，得到 "unknown tool" 工具错误（内容，见 execTool），
+// 不会中断本轮。
+func (l *Loop) Reconfigure(cfg Config, note string) error {
+	rc, err := buildRunConfig(cfg)
+	if err != nil {
+		return err
+	}
+	l.mu.Lock()
+	l.next, l.note = rc, note
+	l.nextGen++
+	l.mu.Unlock()
+	return nil
+}
+
+// refreshConfig 在每一轮开头取最新配置；有新配置则切换并发出 KindReconfigured。仅 Run goroutine 调用。
+func (l *Loop) refreshConfig() {
+	l.mu.Lock()
+	rc, gen, note := l.next, l.nextGen, l.note
+	l.mu.Unlock()
+	if gen == l.rcGen {
+		return
+	}
+	l.rc, l.rcGen = rc, gen
+	names := make([]string, 0, len(rc.toolDefs))
+	for _, d := range rc.toolDefs {
+		names = append(names, d.Name)
+	}
+	l.emit(KindReconfigured, ReconfiguredData{
+		Note: note, Tools: names, MaxTurns: rc.cfg.MaxTurns, ToolTimeout: rc.cfg.ToolTimeout,
+	})
 }
 
 // ---------- 四个并发入口 ----------
@@ -202,6 +256,7 @@ func (l *Loop) Run(parent context.Context, input []message.Message) (RunResult, 
 	var total message.Usage
 	turns := 0
 	for l.turn = 0; ; l.turn++ {
+		l.refreshConfig()
 		if end, err := l.preFlight(parent); end != "" {
 			return l.finish(end, turns, total, err)
 		}
@@ -288,7 +343,7 @@ func (l *Loop) preFlight(parent context.Context) (EndReason, error) {
 	if err := parent.Err(); err != nil {
 		return EndCancelled, err
 	}
-	if l.cfg.MaxTurns >= 0 && l.turn >= l.cfg.MaxTurns {
+	if l.rc.cfg.MaxTurns >= 0 && l.turn >= l.rc.cfg.MaxTurns {
 		return EndMaxTurns, nil
 	}
 	if b := ctxx.BudgetFrom(parent); b != nil && b.Exceeded() {
@@ -299,12 +354,12 @@ func (l *Loop) preFlight(parent context.Context) (EndReason, error) {
 
 // assemble 调槽 1；默认恒等透传 transcript。
 func (l *Loop) assemble(ctx context.Context) []message.Message {
-	if l.cfg.Assembler == nil {
+	if l.rc.cfg.Assembler == nil {
 		return cloneMessages(l.messages)
 	}
 	st := State{Messages: cloneMessages(l.messages), Turn: l.turn, QueueLen: l.queueLen()}
 
-	out := l.cfg.Assembler.Assemble(ctx, st)
+	out := l.rc.cfg.Assembler.Assemble(ctx, st)
 	if out == nil {
 		return cloneMessages(l.messages)
 	}
@@ -320,7 +375,7 @@ func (l *Loop) streamLLM(ctx context.Context, msgs []message.Message) (message.M
 		return message.Message{}, message.Usage{}, fmt.Errorf("invalid transcript: %w", err)
 	}
 	opts, _ := ctxx.OptionsFrom(ctx)
-	req := provider.Request{Messages: cloneMessages(msgs), Tools: cloneToolDefs(l.toolDefs), Options: opts}
+	req := provider.Request{Messages: cloneMessages(msgs), Tools: cloneToolDefs(l.rc.toolDefs), Options: opts}
 
 	msgID := newID()
 	l.emit(KindMessageStart, MessageStartData{Role: message.RoleAssistant, MessageID: msgID})
@@ -340,7 +395,7 @@ attemptLoop:
 			l.opCancel.Store(&cancelBox{})
 			return l.partialAssistant(msgID, &text, &thought), message.Usage{}, nil
 		}
-		evCh, err := l.cfg.Provider.Stream(attemptCtx, cloneRequest(req))
+		evCh, err := l.rc.cfg.Provider.Stream(attemptCtx, cloneRequest(req))
 		if err != nil {
 			cancelled := attemptCtx.Err() != nil
 			attemptCancel()
@@ -348,7 +403,7 @@ attemptLoop:
 			if cancelled {
 				return l.partialAssistant(msgID, &text, &thought), message.Usage{}, nil
 			}
-			if provider.IsRetryable(err) && attempt < l.cfg.MaxStreamRetries && l.waitRetry(ctx, attempt) {
+			if provider.IsRetryable(err) && attempt < l.rc.cfg.MaxStreamRetries && l.waitRetry(ctx, attempt) {
 				continue
 			}
 			if l.interrupt.Load() {
@@ -385,7 +440,7 @@ attemptLoop:
 				if cancelled {
 					return l.partialAssistant(msgID, &text, &thought), message.Usage{}, nil
 				}
-				if e.Retryable && !received && attempt < l.cfg.MaxStreamRetries && l.waitRetry(ctx, attempt) {
+				if e.Retryable && !received && attempt < l.rc.cfg.MaxStreamRetries && l.waitRetry(ctx, attempt) {
 					continue attemptLoop
 				}
 				if l.interrupt.Load() {
@@ -431,8 +486,8 @@ func (l *Loop) execCalls(ctx context.Context, calls []message.ToolCall) {
 		}
 
 		d := Decision{Action: GuardAllow}
-		if l.cfg.Guard != nil {
-			d = l.cfg.Guard.Check(callCtx, tc.Clone())
+		if l.rc.cfg.Guard != nil {
+			d = l.rc.cfg.Guard.Check(callCtx, tc.Clone())
 			if callCtx.Err() != nil {
 				callCancel()
 				l.opCancel.Store(&cancelBox{})
@@ -449,7 +504,7 @@ func (l *Loop) execCalls(ctx context.Context, calls []message.ToolCall) {
 			effective.ID = tc.ID
 			d.Rewritten = effective
 		}
-		if l.cfg.Guard != nil {
+		if l.rc.cfg.Guard != nil {
 			var rewritten *tool.Call
 			if d.Action == GuardRewrite {
 				r := effective.Clone()
@@ -483,15 +538,15 @@ func (l *Loop) execCalls(ctx context.Context, calls []message.ToolCall) {
 // execTool 执行单个工具。cancel 已由 execCalls 入口注册（覆盖 Guard+Exec
 // 全程），这里只叠加可选的单工具超时，不再自装 opCancel。
 func (l *Loop) execTool(ctx context.Context, tc message.ToolCall) message.ToolResult {
-	t, ok := l.tools[tc.Name]
+	t, ok := l.rc.tools[tc.Name]
 	if !ok {
 		return message.ToolResult{CallID: tc.ID, IsError: true,
 			Blocks: []message.Block{message.TextBlock{Text: "unknown tool: " + tc.Name}}}
 	}
 	tctx := ctx
-	if l.cfg.ToolTimeout > 0 {
+	if l.rc.cfg.ToolTimeout > 0 {
 		var cancel context.CancelFunc
-		tctx, cancel = context.WithTimeout(ctx, l.cfg.ToolTimeout)
+		tctx, cancel = context.WithTimeout(ctx, l.rc.cfg.ToolTimeout)
 		defer cancel()
 	}
 

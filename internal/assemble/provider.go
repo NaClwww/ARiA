@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 
 	"aria/core/provider"
 	"aria/internal/config"
@@ -119,3 +120,38 @@ func orDefaultStr(s, def string) string {
 	return s
 }
 
+// ProviderCache 缓存 Provider 装配结果：[provider] 段与 key 不变时复用同一实例（热更新的
+// 每次重新装配不重建 Provider——opencode 等适配器创建时还要拉模型卡）。并发安全。
+type ProviderCache struct {
+	APIKey string // 宿主显式传入的 key（--api-key）
+
+	mu  sync.Mutex
+	key config.Provider
+	res ProviderResult
+	ok  bool
+}
+
+// Get 返回 cfg 对应的 Provider；[provider] 段变化时重新装配，失败时不替换缓存。
+func (c *ProviderCache) Get(cfg config.Config) (ProviderResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ok && c.key == cfg.Provider {
+		return c.res, nil
+	}
+	res, err := Provider(cfg, c.APIKey)
+	if err != nil {
+		return ProviderResult{}, err
+	}
+	c.key, c.res, c.ok = cfg.Provider, res, true
+	return res, nil
+}
+
+// Model 返回当前缓存的生效模型名（尚未装配时为空）。
+func (c *ProviderCache) Model() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.res.Model
+}
+
+// Note 是装配结果的简短描述（reconfigured 事件与日志用）。
+func (r ProviderResult) Note() string { return fmt.Sprintf("provider=%s model=%s", r.Kind, r.Model) }

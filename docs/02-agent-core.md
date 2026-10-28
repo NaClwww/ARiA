@@ -6,7 +6,7 @@
 
 一个 `Loop` 实例的一次 `Run`，全部可变状态——messages、轮次、预算消耗、队列消费位置——只归**一个 goroutine** 所有。飞轮内部零锁（Budget 原子扣减除外）。
 
-**并发安全入口只有四个**：
+**并发安全入口只有五个**（2026-10-28 加入 `Reconfigure`，原「四入口」）：
 
 | 入口 | 语义 |
 |---|---|
@@ -14,6 +14,9 @@
 | `Queue(msg)` | steering 输入，**轮间**注入 |
 | `Interrupt()` | 取消当前 LLM 调用/工具执行/Guard 等待，保留部分输出，可续 |
 | `Subscribe(buf)` | 事件订阅（channel + 分级丢弃；退订/停滞断开时关闭 channel） |
+| `Reconfigure(cfg, note)` | 替换配置（Provider / 工具表 / Assembler / Guard / MaxTurns / ToolTimeout），**下一轮开头**生效 |
+
+**配置每轮现取（2026-10-28，参照 pi）**：`Loop` 不再在构造时定死配置——`New` 与 `Reconfigure` 只把校验后的配置放进「待生效」位，`Run` 在**每一轮开头**取最新的一份作为本轮快照，轮内（流式输出、工具执行）不变。空闲时 Reconfigure = 下一次 Run 的第一轮生效；运行中 = 本次 Run 的下一次 LLM 请求前生效；连续多次只有最后一次生效。生效时发出 durable 的 `Reconfigured` 事件。轮中途撤掉的工具若仍被模型调用，得到 `unknown tool` 工具错误（内容，不中断）。这对应 pi 的做法：`Agent` 状态（model / tools）可随时赋值，loop 是每次运行从状态现取配置的无状态函数；与 pi 的差别是 ARiA 的 `Loop` 仍是长寿命对象（持有总线、队列、打断位），只把配置变成每轮现取，事件订阅者因此不受换配置影响。
 
 **core 没有也不需要投机/预测入口**：`Run` 无状态（每次由调用方传完整历史），「用预测输入提前生成、确认后复用」整体归 runtime（`runtime/speculate`，见 03 §4）——core 不为预测增加任何 API。**该能力已实现但优先级最低、v1 不接入**（2026-09-11）。
 
@@ -59,6 +62,7 @@ func (l *Loop) Run(parent context.Context, input []Message) (RunResult, error) {
 | ToolGuardDecision | CallID、Decision（Allow/Deny/Rewrite）、Reason | durable |
 | ToolExecStart / ToolExecEnd | ToolCall / 完整 ToolResult（Guard 拒绝也发 End 并标明被拒） | durable |
 | Progress | 工具进度（MCP progress 映射） | **volatile** |
+| Reconfigured | Note（调用方给的描述，如 provider/模型）、Tools、MaxTurns、ToolTimeout——新配置在本轮生效 | durable |
 | AgentEnd | RunResult（EndReason、总 usage、Error） | durable |
 
 **durable**：载荷完整、存活订阅者内不丢——runtime 靠它完整重建会话历史（事件溯源是「loop 零磁盘」的前提）。**volatile**：仅渲染用，缓冲满即合并/替换；MessageEnd 永远带全文，丢增量无损。
