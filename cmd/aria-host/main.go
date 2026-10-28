@@ -34,7 +34,7 @@
 //	aria-host --fake                     # stdin + ASR + TTS（echo 冒烟）
 //	aria-host                            # 按 aria.toml 连真实模型
 //
-// 交互：[名字] 开头切换说话人；/reload 重读配置文件（文件监听也会自动触发）；/quit 按收尾链退出；Ctrl+C 打断当前回答，2 秒内
+// 交互：[名字] 开头切换说话人；/reload 重读配置文件（文件监听也会自动触发）；/new 开始新会话；/quit 按收尾链退出；Ctrl+C 打断当前回答，2 秒内
 // 再按一次按收尾链退出，收尾期间再按一次强制退出；SIGTERM 按收尾链退出。
 // stdin EOF 在 ASR 模式下不退出（常驻语音形态）。
 package main
@@ -287,10 +287,20 @@ func main() {
 		}
 		<-ctx.Done()
 	})
-	reload := func() {
-		if !eng.Config.Reload() {
-			fmt.Fprintln(os.Stderr, "（配置文件无变化）")
-		}
+	commands := map[string]func(){
+		"/reload": func() {
+			if !eng.Config.Reload() {
+				fmt.Fprintln(os.Stderr, "（配置文件无变化）")
+			}
+		},
+		// 立即开始新会话（不等闲置超时）；记忆服务 / 落盘的变更随之生效。
+		"/new": func() {
+			if err := sess.Switch(); err != nil {
+				fmt.Fprintf(os.Stderr, "（切换会话失败：%v）\n", err)
+				return
+			}
+			fmt.Fprintf(os.Stderr, "（已开始新会话 %s）\n", sess.SessionID())
+		},
 	}
 
 	var plugs []string
@@ -345,7 +355,7 @@ func main() {
 	if !h.NoStdin {
 		// stdin EOF 是否退出取决于有没有 ASR 插头：语音形态要常驻。
 		app.Service("stdin", func(ctx context.Context) {
-			ariahost.StdinPlug(ctx, os.Stdin, input.Deliver, cfg.Session.DefaultUser, h.NoASR, requestQuit, reload)
+			ariahost.StdinPlug(ctx, os.Stdin, input.Deliver, cfg.Session.DefaultUser, h.NoASR, requestQuit, commands)
 		})
 		plugs = append(plugs, "stdin")
 	}

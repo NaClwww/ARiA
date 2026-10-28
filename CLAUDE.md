@@ -52,7 +52,7 @@ pkg ← core ← runtime ← plugins / internal / cmd
 ## 配置
 
 - 优先级：启动 flag（仅本进程）> `aria.override.toml`（机器写，gitignored）> `aria.toml`（人写，**程序永不重写**，注释安全）> 代码默认值。
-- 写回只碰 override 层且原子写。热更新三件事解耦：`config.Watch`（只报「文件可能变了」）→ `Manager.Reload()`（比对内容、语法错误保留旧值）→ `OnChange` 上的 `assemble.Live.Apply`（唯一应用点：用宿主的 `build(cfg)`——与启动同一份装配函数——整份重新装配，交给 `Session.Reconfigure`；会话、上下文窗口、事件订阅不动）。Provider 由 `assemble.ProviderCache` 按 `[provider]` 段缓存。记忆服务、落盘、`[host]` 只在启动时生效（`restartOnly` 记「需重启」）。新增配置项只要在宿主的 `build` 里读它，就自动可热改。
+- 写回只碰 override 层且原子写。热更新三件事解耦：`config.Watch`（只报「文件可能变了」）→ `Manager.Reload()`（比对内容、语法错误保留旧值）→ `OnChange` 上的 `assemble.Live.Apply`（唯一应用点：用宿主的 `build(cfg)`——与启动同一份装配函数——整份重新装配，交给 `Session.Reconfigure`；会话、上下文窗口、事件订阅不动）。Provider 由 `assemble.ProviderCache` 按 `[provider]` 段缓存。记忆服务与落盘（`MemoryCache` / `StoreCache`）的变更在下一次会话切换（闲置超时或 `/new` → `Session.Switch`）时换上；`[host]`、监听地址、会话标识只在启动时生效（`restartOnly` 记「需重启」）。新增配置项只要在宿主的 `build` 里读它，就自动可热改。
 - API key 永不落盘：配置只存环境变量名（`provider.api_key_env`，默认 `ARIA_API_KEY`），`start.sh` 会自动加载 `.env`。
 - aria-host 的装配项基准在 `aria.toml [host]`；新增 [host] 旋钮 = 在 `cmd/aria-host/main.go` 的 hostKnob 表里加一行。
 

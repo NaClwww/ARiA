@@ -3,6 +3,7 @@ package assemble
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"sync"
 
@@ -41,6 +42,11 @@ type ProviderResult struct {
 // opencode、opencode-go=OPENCODE_API_KEY）。
 // key 本体永远不落配置文件。
 func Provider(cfg config.Config, apiKey string) (ProviderResult, error) {
+	return buildProvider(cfg, apiKey, nil)
+}
+
+// buildProvider 同 Provider；log 交给需要日志的适配器（opencode 的模型卡拉取），nil = slog.Default()。
+func buildProvider(cfg config.Config, apiKey string, log *slog.Logger) (ProviderResult, error) {
 	kind := cfg.Provider.Kind
 	if kind == "" {
 		kind = "openai"
@@ -104,7 +110,7 @@ func Provider(cfg config.Config, apiKey string) (ProviderResult, error) {
 		}
 		return ProviderResult{
 			Impl: opencode.New(opencode.Config{Plan: plan, BaseURL: cfg.Provider.BaseURL, APIKey: key, Model: cfg.Provider.Model,
-				ContextWindow: cfg.Provider.ContextWindow, MaxOutput: cfg.Provider.MaxOutput}),
+				ContextWindow: cfg.Provider.ContextWindow, MaxOutput: cfg.Provider.MaxOutput, Log: log}),
 			Kind:  kind,
 			Model: cfg.Provider.Model,
 		}, nil
@@ -123,7 +129,8 @@ func orDefaultStr(s, def string) string {
 // ProviderCache 缓存 Provider 装配结果：[provider] 段与 key 不变时复用同一实例（热更新的
 // 每次重新装配不重建 Provider——opencode 等适配器创建时还要拉模型卡）。并发安全。
 type ProviderCache struct {
-	APIKey string // 宿主显式传入的 key（--api-key）
+	APIKey string       // 宿主显式传入的 key（--api-key）
+	Log    *slog.Logger // 交给适配器的日志（nil = slog.Default()）
 
 	mu  sync.Mutex
 	key config.Provider
@@ -138,7 +145,7 @@ func (c *ProviderCache) Get(cfg config.Config) (ProviderResult, error) {
 	if c.ok && c.key == cfg.Provider {
 		return c.res, nil
 	}
-	res, err := Provider(cfg, c.APIKey)
+	res, err := buildProvider(cfg, c.APIKey, c.Log)
 	if err != nil {
 		return ProviderResult{}, err
 	}

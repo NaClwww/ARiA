@@ -80,6 +80,12 @@ func (s *memStore) Append(_ context.Context, _ string, ev loop.Event) error {
 	return nil
 }
 
+func (s *memStore) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.got)
+}
+
 func (s *memStore) has(k loop.Kind) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

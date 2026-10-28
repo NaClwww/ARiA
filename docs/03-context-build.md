@@ -102,7 +102,7 @@ Host(语音识别中) → Speculate(base=transcript快照, 猜测输入)
 
 **Session** = 长寿命单例容器：压缩记忆 + ingress 状态（投机槽预留，v1 不接入）；`Input(ctx, msg) (RunResult, error)` 阻塞式，宿主经事件订阅拿增量（TTS 不等整句）。
 
-**会话切换**（2026-10-01 修订，取代原「不分会话」；2026-10-02 改为不带入上一会话内容）：一个伴侣实例 = 一个长寿命 Session 容器，会话由 `Scope.SessionID` 标识。最近一轮结算后 `Config.IdleTimeout`（配置 `session.idle_timeout_s`，缺省 1800 s，0 = 不切换）内没有新输入时切换会话：之后的输入使用新的 `SessionID`（`<session.id>-<开始时刻>`，`agent.SessionIDAt`），窗口清空（`Window.Reset`：记忆、在途与近轮一并清除，在途压缩取消且结果丢弃），新会话不带入上一会话的摘要与原文；跨会话的衔接由长期记忆的召回承担（见 [memory/options.md](memory/options.md)「写入与召回流程」）。进程启动即开始新会话（v1 只写不恢复）。计时以 `Input` 开始为「有操作」，每轮结算后重新计时；到期回调与 `Input` 经同一互斥锁串行。多人共享记忆（群聊语义）；未来「私聊模式」作为 Assembler 召回规则实现，不推翻模型。
+**会话切换**（2026-10-01 修订，取代原「不分会话」；2026-10-02 改为不带入上一会话内容）：一个伴侣实例 = 一个长寿命 Session 容器，会话由 `Scope.SessionID` 标识。最近一轮结算后 `Config.IdleTimeout`（配置 `session.idle_timeout_s`，缺省 1800 s，0 = 不切换）内没有新输入时切换会话：之后的输入使用新的 `SessionID`（`<session.id>-<开始时刻>`，`agent.SessionIDAt`），窗口清空（`Window.Reset`：记忆、在途与近轮一并清除，在途压缩取消且结果丢弃），新会话不带入上一会话的摘要与原文；跨会话的衔接由长期记忆的召回承担（见 [memory/options.md](memory/options.md)「写入与召回流程」）。进程启动即开始新会话（v1 只写不恢复）。**手动切换**（2026-10-28）：`Session.Switch()` 立即执行同样的切换（宿主的 `/new` 命令），不等闲置超时；`Reconfigure` 暂存的记忆服务与落盘在切换时换上（06 §3）。计时以 `Input` 开始为「有操作」，每轮结算后重新计时；到期回调与 `Input` 经同一互斥锁串行。多人共享记忆（群聊语义）；未来「私聊模式」作为 Assembler 召回规则实现，不推翻模型。
 
 **并发**：一 Session 同时只跑一轮（并发新输入由会话互斥串行）；轮间插话走 `Queue`，仅运行中接受（2026-09-28）。schedule/ 子包不建，G1 草稿维持。
 

@@ -69,7 +69,7 @@
 | `[provider]` / `[tools]` / `limits.*` / persona | loop 配置（`Loop.Reconfigure`）下一轮开头生效——运行中即下一次 LLM 请求前；生效时发 durable `reconfigured` 事件 | ✅ 下一轮 |
 | `[compress]` / persona 的窗口侧 | 下一次组装 / 压缩（在途压缩用旧策略跑完） | ✅ |
 | `session.idle_timeout_s` / `recall_wait_ms`、压缩预留 | 立即 | ✅ |
-| `[memory]` / `[record]` | 记忆服务随会话生命周期（Start/Stage/End）、落盘是常驻 durable 订阅者，`Reconfigure` 忽略这两项 | ❌ 重启（05 F6） |
+| `[memory]` / `[record]` | 记忆服务随会话生命周期（Start/Stage/End）、落盘是常驻 durable 订阅者：`Reconfigure` 暂存，**下一次会话切换**（闲置超时或 `/new`）时替换——旧会话的 End 发给旧服务、新会话的 Start 发给新服务，落盘按新会话重新订阅。宿主用 `assemble.MemoryCache` / `StoreCache` 按段缓存，换下的实例保留到退出时收尾 | ✅ 下个会话 |
 | listen / `[host]` / 会话标识 / 默认说话人 / 命名空间 | 宿主启动时定 | ❌ 重启 |
 
 不能热改的段变更时，`assemble.Live` 只记一条「需重启」日志（`restartOnly`）。persona 热改的代价是前缀缓存失效（切换不频繁可接受）。
@@ -96,6 +96,7 @@
 | `internal/aria-host` | aria-host 的定制组件集：`Engine`（配置→provider→agent→会话组装/收尾）、`Sink`（多插头投递纪律，本表 §2）、`StdinPlug`/`SplitSpeaker`、`ConsumeTerminal` 终端渲染、`ResolvePersona`、echo provider——main 只做接线 |
 | `runtime/app` | 宿主外设挂载与生命周期容器：`Mount`（事件流消费者：订阅+goroutine，收尾=退订+排干）、`Service`（后台服务：独立 ctx，收尾=取消+等待）、`OnShutdown`（链底钩子）。顺序纪律：挂载即订阅（消费者先挂、输入插头最后——事件不重放），收尾严格逆序 LIFO（输入先停→消费者排干→资产回收→会话/引擎关闭）；只依赖 core/loop，main 退化成一份挂载清单 |
 | `plugins/vision/gowild` | 视觉注入（discussions 2026-09-11 §1 拍板 B 形态，2026-09-28 落地）：`Vision` 实现 core 槽 1 的额外变换——每次 LLM 调用现拉 `GET /api/camera/frame`（2s 硬顶）追加在组装结果最底部（user 消息：说明 + `ImageBlock(Data)`）；不进窗口历史、不落盘、失败安静跳过。每请求恰好一张「此刻」帧，旧帧永不重发 |
+| `/new`（两个宿主的终端命令） | 立即结束当前会话并开始新会话（`Session.Switch`，与闲置超时切换相同），记忆服务 / 落盘的待生效变更随之换上 |
 | `cmd/aria-demo` | 终端薄壳：**吃配置文件**（flag 只作进程内覆盖 = local 层）、stdin 行 = 成轮话语、`[名字]` 前缀切换说话人、流式打印、Ctrl+C 打断、`--record` JSONL、`/reload` 重读文件（另有文件监听自动触发）、`--print-config` 打印生效配置 |
 | `cmd/aria-web` | 浏览器薄壳（待做） |
 | `plugins/persist/jsonl` | durable 事件的 JSONL 落盘（格式 v1 带版本号，写路完整、读路随恢复需求） |
@@ -109,4 +110,4 @@
 2. 两段式压缩策略 `twopart`（引擎侧位置已备好，等 05 C4 拍板）；
 3. **认主 / 名册**：插件层与周边服务协商（03 §6），暂缓；
 4. **打断 / 小轮**：03 §7 设计已定稿，实现暂缓；
-5. **记忆服务与落盘的热替换**：其余部件已可热改（2026-10-28 重新装配），这两项仍需重启，见 05 F6。
+5. **记忆服务换引擎时的数据迁移**：会话切换时换上新引擎（2026-10-28），但旧引擎里的正式记忆不会搬到新引擎——换引擎等于从空记忆开始，需要迁移时另做工具。

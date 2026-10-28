@@ -40,11 +40,9 @@ import (
 	"aria/internal/config"
 	"aria/pkg/ctxx"
 	"aria/pkg/message"
-	"aria/plugins/persist/jsonl"
 	"aria/plugins/tool/basic"
 	"aria/runtime/agent"
 	"aria/runtime/memory"
-	"aria/runtime/persist"
 	"aria/runtime/window"
 )
 
@@ -104,26 +102,9 @@ func main() {
 		return
 	}
 
-	// 会话级部件：启动时建一次，热更新不换（docs/06 §3）。
-	var store persist.Store
-	if cfg.Record.Path != "" {
-		s, err := jsonl.New(cfg.Record.Path)
-		if err != nil {
-			log.Error("record open failed", "err", err)
-			os.Exit(1)
-		}
-		store = s
-		log.Info("record", "path", cfg.Record.Path)
-	}
-	// 记忆服务（可空）：接入时装入 memory_recall 工具并在人设后追加使用规则（与 aria-host 同源）。
-	mem, err := assemble.Memory(cfg.Memory, log)
-	if err != nil {
-		log.Error("memory assemble failed", "err", err)
-		os.Exit(2)
-	}
-	if mem.Service != nil {
-		log.Info("memory", "engine", cfg.Memory.Engine, "base_url", cfg.Memory.BaseURL, "dir", cfg.Memory.Dir, "members", len(cfg.Memory.Members))
-	}
+	// 落盘与记忆服务按配置段缓存：段不变复用，变了重建，新实例在下一次会话切换时换上（docs/06 §3）。
+	stores := &assemble.StoreCache{}
+	mems := &assemble.MemoryCache{Log: log}
 
 	// build 是「配置 → agent.Config」的装配：启动与热更新（assemble.Live）共用这一份。
 	var fakeProv provider.Provider
@@ -131,7 +112,7 @@ func main() {
 		fakeProv = newDemoProvider()
 		log.Info("provider: fake（无网络；压缩策略已改为 keeplast 以保持确定性）")
 	}
-	provs := &assemble.ProviderCache{APIKey: *apiKey}
+	provs := &assemble.ProviderCache{APIKey: *apiKey, Log: log}
 	build := func(cfg config.Config) (agent.Config, string, error) {
 		prov, note := fakeProv, "provider=fake"
 		if prov == nil {
@@ -145,6 +126,14 @@ func main() {
 		compressor, err := assemble.Compressor(cfg, prov)
 		if err != nil {
 			return agent.Config{}, "", fmt.Errorf("compress: %w", err)
+		}
+		store, err := stores.Get(cfg.Record.Path)
+		if err != nil {
+			return agent.Config{}, "", fmt.Errorf("record: %w", err)
+		}
+		mem, err := mems.Get(cfg.Memory)
+		if err != nil {
+			return agent.Config{}, "", fmt.Errorf("memory: %w", err)
 		}
 		systemPrompt, err := resolvePersona(cfg.Persona, defaultSystemPrompt)
 		if err != nil {
@@ -166,6 +155,8 @@ func main() {
 			Compact:         assemble.CompactBudget(cfg.Compress),
 			IdleTimeout:     assemble.IdleTimeout(cfg.Session),
 			RecallWait:      assemble.RecallWait(cfg.Session),
+			Memory:          mem.Service,
+			Store:           store,
 			SystemPrompt:    systemPrompt,
 			MaxTurns:        cfg.Limits.MaxTurns,
 			ToolTimeout:     time.Duration(cfg.Limits.ToolTimeoutMS) * time.Millisecond,
@@ -179,9 +170,9 @@ func main() {
 		os.Exit(2)
 	}
 	log.Info("assembled", "note", note, "base_url", orDefault(cfg.Provider.BaseURL, "(官方默认)"),
-		"compress", cfg.Compress.Strategy, "tools", len(acfg.Tools))
+		"compress", cfg.Compress.Strategy, "tools", len(acfg.Tools), "record", cfg.Record.Path, "memory", cfg.Memory.Engine)
 	sessionID, newSessionID := assemble.SessionIDs(cfg.Session, time.Now())
-	acfg.Memory, acfg.Store, acfg.NewSessionID = mem.Service, store, newSessionID
+	acfg.NewSessionID = newSessionID
 	ag, err := agent.New(acfg)
 	if err != nil {
 		log.Error("agent new failed", "err", err)
@@ -213,7 +204,7 @@ func main() {
 
 	fmt.Fprintf(os.Stderr, "ARiA demo · 配置 %s · 模型 %s · 会话 %s · 说话人 %s\n",
 		*configPath, modelName(*fake, cfg.Provider.Model), sess.SessionID(), cfg.Session.DefaultUser)
-	fmt.Fprintln(os.Stderr, "输入一句话回车发送；[名字] 开头切换说话人；Ctrl+C 打断；/reload 重读配置（改文件也会自动生效）；/quit 退出。")
+	fmt.Fprintln(os.Stderr, "输入一句话回车发送；[名字] 开头切换说话人；Ctrl+C 打断；/reload 重读配置（改文件也会自动生效）；/new 开始新会话；/quit 退出。")
 
 	// Ctrl+C：打断当前回答（steering）；距上一次打断 2 秒内再按一次强制退出，
 	// 超出 2 秒按新的一次打断处理。
@@ -247,19 +238,15 @@ func main() {
 	if err := sess.Close(); err != nil {
 		log.Error("session close", "err", err)
 	}
-	if mem.Close != nil {
-		// 记忆服务的后台提交以 agent.DefaultCloseGrace 为上限等待，超时放行（下一次启动重做）。
-		ctx, cancel := context.WithTimeout(context.Background(), agent.DefaultCloseGrace)
-		if err := mem.Close(ctx); err != nil {
-			log.Warn("memory: background commit still running at close", "err", err)
-		}
-		cancel()
+	// 记忆服务的后台提交以 agent.DefaultCloseGrace 为上限等待，超时放行（下一次启动重做）。
+	ctx, cancel := context.WithTimeout(context.Background(), agent.DefaultCloseGrace)
+	if err := mems.Close(ctx); err != nil {
+		log.Warn("memory: background commit still running at close", "err", err)
 	}
+	cancel()
 	<-printerDone
-	if store != nil {
-		if s, ok := store.(io.Closer); ok {
-			s.Close()
-		}
+	if err := stores.Close(); err != nil {
+		log.Error("record close", "err", err)
 	}
 	os.Exit(exit)
 }
@@ -282,6 +269,14 @@ func run(sess *agent.Session, lines <-chan string, mgr *config.Manager, errw io.
 		if text == "/reload" {
 			if !mgr.Reload() {
 				fmt.Fprintln(errw, "（配置文件无变化）")
+			}
+			continue
+		}
+		if text == "/new" {
+			if err := sess.Switch(); err != nil {
+				fmt.Fprintf(errw, "（切换会话失败：%v）\n", err)
+			} else {
+				fmt.Fprintf(errw, "（已开始新会话 %s）\n", sess.SessionID())
 			}
 			continue
 		}
