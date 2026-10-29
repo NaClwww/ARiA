@@ -13,7 +13,9 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"aria/core/loop"
@@ -309,7 +311,6 @@ func (a *Agent) NewSession(scope ctxx.Scope) (*Session, error) {
 		dead:       make(chan struct{}),
 		grace:      a.grace,
 		log:        a.log,
-		store:      a.cfg.Store,
 		prov:       a.cfg.Provider,
 		compact:    a.cfg.Compact,
 		idle:       a.cfg.IdleTimeout,
@@ -322,22 +323,24 @@ func (a *Agent) NewSession(scope ctxx.Scope) (*Session, error) {
 	}
 	// 压缩观测 → durable 事件直写 store（压缩发生在 run 之间，不经飞轮总线；
 	// jsonl 单行锁串行化两路写入）。失败只响亮记日志——压缩本身已落地，
-	// 审计写失败不该连坐会话。
-	if a.cfg.Store != nil {
-		win.SetOnCompress(func(cctx context.Context, rep loop.WindowCompressedData) {
-			// 记在该批内容所属的会话下：会话切换后才完成的压缩仍属切换前的会话。
-			sid := s.SessionID()
-			if sc, ok := ctxx.ScopeFrom(cctx); ok {
-				sid = sc.SessionID
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			ev := loop.Event{Kind: loop.KindWindowCompressed, At: time.Now(), Data: rep}
-			if err := s.store.Append(ctx, sid, ev); err != nil {
-				s.log.Error("agent: window_compressed append failed", "session", sid, "err", err)
-			}
-		})
-	}
+	// 审计写失败不该连坐会话。store 取当时的（会话切换时可能已换，见 Reconfigure）。
+	win.SetOnCompress(func(cctx context.Context, rep loop.WindowCompressedData) {
+		st := s.currentStore()
+		if st == nil {
+			return
+		}
+		// 记在该批内容所属的会话下：会话切换后才完成的压缩仍属切换前的会话。
+		sid := s.SessionID()
+		if sc, ok := ctxx.ScopeFrom(cctx); ok {
+			sid = sc.SessionID
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		ev := loop.Event{Kind: loop.KindWindowCompressed, At: time.Now(), Data: rep}
+		if err := st.Append(ctx, sid, ev); err != nil {
+			s.log.Error("agent: window_compressed append failed", "session", sid, "err", err)
+		}
+	})
 
 	// 窗口订阅：durable 消息事件进本轮缓冲，AgentEnd 结算进窗口（03 §5）。
 	ch, unsub := l.Subscribe(a.buf)
@@ -345,54 +348,118 @@ func (a *Agent) NewSession(scope ctxx.Scope) (*Session, error) {
 	s.wg.Add(1)
 	go s.consumeWindow(ch)
 
-	// 可选落盘：自己一条订阅 + 单 goroutine 顺序写（03 §1 存储分账）。
-	// 落盘用独立 ctx——会话 ctx 在 Close 早期就被取消（用于终止在途轮），
-	// 落盘还要把总线里已排队的事件排空，不能跟着一起死。
 	if a.cfg.Store != nil {
-		rec, err := persist.New(a.cfg.Store, a.log)
-		if err != nil {
+		if err := s.startPersist(a.cfg.Store, scope); err != nil {
 			s.Close()
 			return nil, err
 		}
-		pch, punsub := l.Subscribe(a.buf)
-		s.unsubs = append(s.unsubs, punsub)
-		pbase, _ := ctxx.EnsureTrace(context.Background())
-		pctx, pcancel := context.WithCancel(ctxx.WithScope(pbase, scope))
-		s.persistDone = make(chan struct{})
-		s.persistCancel = pcancel
-		go func() {
-			defer close(s.persistDone)
-			// 消费者退出即摘除订阅：死订阅者会继续被克隆事件、积压到总线
-			// 上限才断开（bus overflowCap），并让「durable 不丢」静默失效。
-			defer punsub()
-			err := rec.Consume(pctx, scope.SessionID, pch)
-			switch {
-			case err != nil && pctx.Err() == nil:
-				s.log.Error("agent: persist stopped", "session", s.SessionID(), "err", err)
-				s.fail(err)
-			case err == nil && !s.isClosed():
-				// 会话没关但流断了：总线判定订阅者停滞并把我们断开，
-				// durable 承诺已破，必须让宿主看见（不能静默）。
-				s.log.Error("agent: persist stream closed unexpectedly", "session", s.SessionID())
-				s.fail(ErrStreamClosed)
-			}
-		}()
 	}
+	s.startMemoryLoop()
 	if a.cfg.Memory != nil {
-		s.startMemory(a.cfg.Memory, scope)
+		s.setMemory(a.cfg.Memory)
+		s.enqueueStart(s.mem.Load(), scope, time.Now())
 	}
 	return s, nil
 }
 
-// startMemory 启动记忆服务调用的后台 goroutine，注册要点上报，并通知首个会话开始。
-func (s *Session) startMemory(svc memory.Service, scope ctxx.Scope) {
-	s.mem = memory.NewClient(svc, s.log)
-	s.mem.SetStartTimeout(s.recallWait)
+// persistRun 是一条落盘订阅（一个 store、一个会话标识）。
+type persistRun struct {
+	unsub    func()
+	done     chan struct{}
+	cancel   context.CancelFunc
+	stopping atomic.Bool // 主动停止（会话切换换 store / Close）：流关闭不算故障
+}
+
+// startPersist 为 store 起一条落盘订阅：自己一条订阅 + 单 goroutine 顺序写（03 §1 存储分账）。
+// 落盘用独立 ctx——会话 ctx 在 Close 早期就被取消（用于终止在途轮），落盘还要把总线里已排队的
+// 事件排空，不能跟着一起死。调用方持有 runMu 或处于建会话阶段。
+func (s *Session) startPersist(store persist.Store, scope ctxx.Scope) error {
+	rec, err := persist.New(store, s.log)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	buf := s.ag.buf
+	s.mu.Unlock()
+	pch, punsub := s.loop.Subscribe(buf)
+	pbase, _ := ctxx.EnsureTrace(context.Background())
+	pctx, pcancel := context.WithCancel(ctxx.WithScope(pbase, scope))
+	pr := &persistRun{unsub: punsub, done: make(chan struct{}), cancel: pcancel}
+	s.persist = pr
+	s.storeBoxP.Store(&storeBox{store})
+	go func() {
+		defer close(pr.done)
+		// 消费者退出即摘除订阅：死订阅者会继续被克隆事件、积压到总线
+		// 上限才断开（bus overflowCap），并让「durable 不丢」静默失效。
+		defer punsub()
+		err := rec.Consume(pctx, scope.SessionID, pch)
+		switch {
+		case err != nil && pctx.Err() == nil:
+			s.log.Error("agent: persist stopped", "session", s.SessionID(), "err", err)
+			s.fail(err)
+		case err == nil && !s.isClosed() && !pr.stopping.Load():
+			// 会话没关但流断了：总线判定订阅者停滞并把我们断开，
+			// durable 承诺已破，必须让宿主看见（不能静默）。
+			s.log.Error("agent: persist stream closed unexpectedly", "session", s.SessionID())
+			s.fail(ErrStreamClosed)
+		}
+	}()
+	return nil
+}
+
+// stopPersist 停止当前落盘订阅：退订后等已排队的事件写完，至多 grace，超时则取消。
+func (s *Session) stopPersist() {
+	pr := s.persist
+	if pr == nil {
+		return
+	}
+	s.persist = nil
+	pr.stopping.Store(true)
+	pr.unsub()
+	select {
+	case <-pr.done:
+	case <-time.After(s.grace):
+		s.log.Warn("agent: persist drain timed out; tail events may be unsaved",
+			"session", s.SessionID(), "grace", s.grace)
+		pr.cancel()
+	}
+}
+
+// storeBox 让 store 能放进 atomic.Pointer（接口值不能直接原子替换）。
+type storeBox struct{ persist.Store }
+
+// currentStore 返回当前落盘 store（nil = 不落盘）。
+func (s *Session) currentStore() persist.Store {
+	if b := s.storeBoxP.Load(); b != nil {
+		return b.Store
+	}
+	return nil
+}
+
+// startMemoryLoop 启动记忆服务调用的后台 goroutine（未接入记忆服务时空转；会话切换时可能接入）。
+func (s *Session) startMemoryLoop() {
 	s.memJobs = make(chan memJob, MemoryQueueSize)
 	ctx, cancel := context.WithCancel(context.Background())
 	s.memCancel = cancel
 	s.memDone = make(chan struct{})
 	go s.memLoop(ctx)
+}
+
+// setMemory 换用记忆服务 svc（nil = 不接入）并注册 / 撤销要点上报。只在建会话与会话切换时调用：
+// 此后投递的调用发往新服务，已在队列中的调用仍发往投递时的服务。
+func (s *Session) setMemory(svc memory.Service) {
+	s.mu.Lock()
+	s.memSvc = svc
+	wait := s.recallWait
+	s.mu.Unlock()
+	if svc == nil {
+		s.mem.Store(nil)
+		s.win.SetOnPoints(nil)
+		return
+	}
+	c := memory.NewClient(svc, s.log)
+	c.SetStartTimeout(wait)
+	s.mem.Store(c)
 	s.win.SetOnPoints(func(bctx context.Context, seq int, points []memory.Point) {
 		// 持窗口锁执行：只做非阻塞投递（见 window.SetOnPoints）。批次所属的会话取自该批压缩的 ctx。
 		sc, ok := ctxx.ScopeFrom(bctx)
@@ -400,9 +467,8 @@ func (s *Session) startMemory(svc memory.Service, scope ctxx.Scope) {
 			s.log.Warn("agent: points without scope dropped", "points", len(points))
 			return
 		}
-		s.enqueueMemory(s.memStage(sc, seq, points))
+		s.enqueueMemory(s.memStage(c, sc, seq, points))
 	})
-	s.enqueueStart(scope, time.Now())
 }
 
 // Session 是一个会话的全部运行时状态。并发安全：Input 之间互斥（03 §5）。
@@ -422,9 +488,8 @@ type Session struct {
 	wg     sync.WaitGroup
 	log    *slog.Logger
 
-	persistDone   chan struct{}
-	persistCancel context.CancelFunc
-	store         persist.Store // 压缩事件直写用；主 durable 流仍走总线订阅
+	persist   *persistRun              // 当前落盘订阅（nil = 不落盘）；建会话、会话切换（持 runMu）、Close 时改写
+	storeBoxP atomic.Pointer[storeBox] // 当前 store：压缩事件直写用；主 durable 流走 persist 的总线订阅
 
 	runMu sync.Mutex // 一 Session 同时只跑一轮
 
@@ -447,12 +512,14 @@ type Session struct {
 	lastCtx      context.Context        // 当前会话最近一轮的 run ctx（会话切换时提取要点使用其值）
 	lastActive   time.Time              // 当前会话最近一轮的结算时刻（End 的结束时刻）
 
-	mem       *memory.Client     // 记忆服务调用（含重试与超时）；nil = 未配置
-	memJobs   chan memJob        // 记忆服务调用队列，由 memLoop 按投递顺序执行
-	memCancel context.CancelFunc // 停止 memLoop（Close 用）
-	memDone   chan struct{}      // memLoop 退出信号
-	runEnd    chan struct{}      // 本轮已结算的信号
-	err       error              // 首个后台错误
+	mem       atomic.Pointer[memory.Client] // 记忆服务调用（含重试与超时）；nil = 未接入；会话切换时可换
+	memSvc    memory.Service                // mem 对应的服务（Reconfigure 比对用，读写持 mu）
+	pending   sessionParts                  // 待会话切换时替换的会话级部件（读写持 mu），见 Reconfigure
+	memJobs   chan memJob                   // 记忆服务调用队列，由 memLoop 按投递顺序执行
+	memCancel context.CancelFunc            // 停止 memLoop（Close 用）
+	memDone   chan struct{}                 // memLoop 退出信号
+	runEnd    chan struct{}                 // 本轮已结算的信号
+	err       error                         // 首个后台错误
 }
 
 // Input 阻塞跑完一轮：组装 → core.Run → 等本轮结算进窗口 → 返回。
@@ -564,12 +631,16 @@ func (s *Session) SetIdleTimeout(d time.Duration) {
 //
 //   - Provider / Tools / Assembler / Guard / MaxTurns / ToolTimeout：loop 下一轮开头（运行中即
 //     下一次 LLM 请求前），生效时发出 durable 的 reconfigured 事件，note 原样记入；
+//
 //   - SystemPrompt / Compressor / KeepRecentTurns：下一次窗口组装 / 压缩（在途压缩用旧策略跑完）；
+//
 //   - Compact / IdleTimeout / RecallWait：立即。
 //
-// 会话生命周期内固定、这里忽略的字段：Memory、Store、NewSessionID、Logger、SubscribeBuffer、
-// CloseGrace（记忆服务与落盘随会话起止，换它们需重启或等后续的会话级替换）。Artifacts 为空时
-// 沿用当前的工具结果存放处，已发出的 artifact 引用继续可读。
+//   - Memory / Store：随会话起止，**下一次会话切换时**替换（闲置超时或 Switch）——旧会话的 End
+//     发给旧记忆服务、新会话的 Start 发给新的；落盘按新会话重新订阅。与当前相同则不动。
+//
+// 忽略的字段：NewSessionID、Logger、SubscribeBuffer、CloseGrace。Artifacts 为空时沿用当前的
+// 工具结果存放处，已发出的 artifact 引用继续可读。
 //
 // 校验失败（缺 Provider、工具重名等）返回错误，会话保持原配置不变。
 func (s *Session) Reconfigure(cfg Config, note string) error {
@@ -594,6 +665,14 @@ func (s *Session) Reconfigure(cfg Config, note string) error {
 	s.win.SetKeepRecentTurns(cfg.KeepRecentTurns)
 
 	s.mu.Lock()
+	s.pending = sessionParts{}
+	if !sameValue(cfg.Memory, s.memSvc) {
+		s.pending.memSet, s.pending.mem = true, cfg.Memory
+	}
+	if !sameValue(cfg.Store, s.currentStore()) {
+		s.pending.storeSet, s.pending.store = true, cfg.Store
+	}
+	pending := s.pending
 	s.ag = ag
 	s.prov = cfg.Provider
 	s.compact = cfg.Compact
@@ -602,10 +681,34 @@ func (s *Session) Reconfigure(cfg Config, note string) error {
 	s.idle = cfg.IdleTimeout
 	s.armIdleLocked()
 	s.mu.Unlock()
-	if s.mem != nil {
-		s.mem.SetStartTimeout(cfg.RecallWait)
+	if c := s.mem.Load(); c != nil {
+		c.SetStartTimeout(cfg.RecallWait)
+	}
+	if pending.memSet || pending.storeSet {
+		s.log.Info("agent: memory/store change takes effect at next session switch",
+			"session", s.SessionID(), "memory", pending.memSet, "store", pending.storeSet)
 	}
 	return nil
+}
+
+// sessionParts 是会话级部件的待替换值；*Set 为 true 表示该项要换（新值可为 nil = 停用）。
+type sessionParts struct {
+	memSet   bool
+	mem      memory.Service
+	storeSet bool
+	store    persist.Store
+}
+
+// sameValue 报告两个接口值是否为同一实现（动态类型不可比较时按不同处理，不 panic）。
+func sameValue(a, b any) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	ta := reflect.TypeOf(a)
+	if ta != reflect.TypeOf(b) || !ta.Comparable() {
+		return false
+	}
+	return a == b
 }
 
 // SessionID 返回当前会话标识（会话切换后为新标识）。
@@ -648,18 +751,10 @@ func (s *Session) Close() error {
 		for _, u := range s.unsubs {
 			u()
 		}
-		if s.persistDone != nil {
-			select {
-			case <-s.persistDone:
-			case <-time.After(s.grace):
-				s.log.Warn("agent: persist drain timed out; tail events may be unsaved",
-					"session", s.SessionID(), "grace", s.grace)
-				s.persistCancel()
-			}
-		}
+		s.stopPersist()
 		s.wg.Wait()
 		s.win.Close()
-		if s.memDone != nil {
+		{
 			// 关闭缺口搁置（docs/memory/options.md 已定第 9 项）：队列中尚未执行的调用丢弃。
 			s.memCancel()
 			<-s.memDone
@@ -862,12 +957,31 @@ func (s *Session) onIdle(gen uint64) {
 	if s.isClosed() {
 		return
 	}
-	now := time.Now()
 	s.mu.Lock()
-	if gen != s.idleGen || s.sessionTurns == 0 {
-		s.mu.Unlock()
-		return
+	due := gen == s.idleGen && s.sessionTurns > 0
+	s.mu.Unlock()
+	if due {
+		s.switchSession(time.Now(), "idle")
 	}
+}
+
+// Switch 立即结束当前会话并切换到新会话（不等闲置超时）：与闲置超时的切换相同——清空窗口、
+// 换会话标识、通知记忆服务（End / Start），并替换 Reconfigure 暂存的记忆服务与落盘。运行中的
+// 一轮先结算完。会话已关闭时返回 ErrClosed。
+func (s *Session) Switch() error {
+	s.runMu.Lock()
+	defer s.runMu.Unlock()
+	if err := s.checkOpen(); err != nil {
+		return err
+	}
+	s.switchSession(time.Now(), "manual")
+	return nil
+}
+
+// switchSession 执行一次会话切换（调用方持有 runMu）：上一会话的收尾调用发往切换前的记忆服务，
+// 随后替换暂存的会话级部件，新会话的 Start 发往替换后的记忆服务。
+func (s *Session) switchSession(now time.Time, reason string) {
+	s.mu.Lock()
 	prevScope, lastCtx, lastActive := s.scope, s.lastCtx, s.lastActive
 	prev := prevScope.SessionID
 	next := s.newID(now)
@@ -880,13 +994,16 @@ func (s *Session) onIdle(gen uint64) {
 	nextScope := s.scope
 	s.sessionTurns = 0
 	s.lastCtx, s.lastActive = nil, time.Time{}
+	s.stopIdleLocked()
 	s.idleTimer = nil
 	idle := s.idle
+	parts := s.pending
+	s.pending = sessionParts{}
 	s.mu.Unlock()
 
 	cleared := s.win.Reset()
 	dropped := len(cleared.Raw)
-	if s.mem != nil {
+	if c := s.mem.Load(); c != nil {
 		// Reset 返回前，上一会话已完成批次的要点已投递（window.SetOnPoints）；清除的原文以会话内摘要
 		// 为上下文提取要点，以下一个序号暂存；End 排在两者之后。
 		if len(cleared.Raw) > 0 && s.win.ExtractsPoints() {
@@ -897,15 +1014,32 @@ func (s *Session) onIdle(gen uint64) {
 			} else if sc, ok := ctxx.ScopeFrom(lastCtx); ok && sc.SessionID == prev {
 				batchScope = sc
 			}
-			s.enqueueMemory(s.memExtract(lastCtx, batchScope, cleared.Seq+1, cleared.Memory, cleared.Raw))
+			s.enqueueMemory(s.memExtract(c, lastCtx, batchScope, cleared.Seq+1, cleared.Memory, cleared.Raw))
 		}
 		if lastActive.IsZero() {
 			lastActive = now
 		}
-		s.enqueueMemory(s.memEnd(prevScope, lastActive))
-		s.enqueueStart(nextScope, now)
+		s.enqueueMemory(s.memEnd(c, prevScope, lastActive))
 	}
-	s.log.Info("agent: session switched", "session", prev, "next", next, "idle", idle, "dropped_messages", dropped)
+
+	if parts.memSet {
+		s.setMemory(parts.mem)
+		s.log.Info("agent: memory service replaced", "session", next, "enabled", parts.mem != nil)
+	}
+	if parts.storeSet {
+		s.stopPersist()
+		s.storeBoxP.Store(nil)
+		if parts.store != nil {
+			if err := s.startPersist(parts.store, nextScope); err != nil {
+				s.log.Error("agent: new store failed, persistence disabled", "session", next, "err", err)
+			}
+		}
+		s.log.Info("agent: store replaced", "session", next, "enabled", parts.store != nil)
+	}
+	if c := s.mem.Load(); c != nil {
+		s.enqueueStart(c, nextScope, now)
+	}
+	s.log.Info("agent: session switched", "session", prev, "next", next, "reason", reason, "idle", idle, "dropped_messages", dropped)
 }
 
 // memJob 是一次记忆服务调用：memLoop 以带 scope 的 ctx 执行 run；kind 与 scope.SessionID 用于日志。
@@ -916,11 +1050,11 @@ type memJob struct {
 }
 
 // memStage 返回一批要点的暂存（Stage），batch_id 在此生成。
-func (s *Session) memStage(sc ctxx.Scope, seq int, points []memory.Point) memJob {
+func (s *Session) memStage(c *memory.Client, sc ctxx.Scope, seq int, points []memory.Point) memJob {
 	req := memory.StageRequest{
 		Namespace: sc.Namespace, SessionID: sc.SessionID, BatchID: ctxx.NewTrace().TraceID, Seq: seq, Points: points,
 	}
-	return memJob{kind: "stage", scope: sc, run: func(ctx context.Context) { _ = s.mem.Stage(ctx, req) }}
+	return memJob{kind: "stage", scope: sc, run: func(ctx context.Context) { _ = c.Stage(ctx, req) }}
 }
 
 // memExtract 返回会话切换时对清除原文的要点提取：提取使用 vctx 的值（该会话最近一轮的 run ctx），
@@ -928,7 +1062,7 @@ func (s *Session) memStage(sc ctxx.Scope, seq int, points []memory.Point) memJob
 // 以 seq 暂存到 sc 所指的会话。提取失败后按 extractRetryDelays 重试 3 次（间隔 1 s / 2 s / 4 s），期间
 // 队列中其后的调用（End、Start）等待；仍失败时由 s.log 输出 Error 日志
 // agent: session-end point extraction failed, points dropped，不暂存。
-func (s *Session) memExtract(vctx context.Context, sc ctxx.Scope, seq int, mem, msgs []message.Message) memJob {
+func (s *Session) memExtract(c *memory.Client, vctx context.Context, sc ctxx.Scope, seq int, mem, msgs []message.Message) memJob {
 	return memJob{kind: "extract", scope: sc, run: func(ctx context.Context) {
 		ectx, cancel := context.WithCancel(ctxx.Detached(vctx))
 		stop := context.AfterFunc(ctx, cancel)
@@ -946,24 +1080,24 @@ func (s *Session) memExtract(vctx context.Context, sc ctxx.Scope, seq int, mem, 
 			return
 		}
 		if len(points) > 0 {
-			s.memStage(sc, seq, points).run(ctx)
+			s.memStage(c, sc, seq, points).run(ctx)
 		}
 	}}
 }
 
 // memEnd 返回会话结束的通知（End），at 为该会话的结束时刻。
-func (s *Session) memEnd(sc ctxx.Scope, at time.Time) memJob {
+func (s *Session) memEnd(c *memory.Client, sc ctxx.Scope, at time.Time) memJob {
 	req := memory.SessionRequest{Namespace: sc.Namespace, SessionID: sc.SessionID, At: at}
-	return memJob{kind: "end", scope: sc, run: func(ctx context.Context) { _ = s.mem.End(ctx, req) }}
+	return memJob{kind: "end", scope: sc, run: func(ctx context.Context) { _ = c.End(ctx, req) }}
 }
 
 // memStart 返回会话开始的通知（Start），成功时召回结果写入窗口（injectRecall）；结束时（成功、失败或
 // ctx 取消）关闭 ready。
-func (s *Session) memStart(sc ctxx.Scope, at time.Time, ready chan struct{}) memJob {
+func (s *Session) memStart(c *memory.Client, sc ctxx.Scope, at time.Time, ready chan struct{}) memJob {
 	req := memory.SessionRequest{Namespace: sc.Namespace, SessionID: sc.SessionID, At: at}
 	return memJob{kind: "start", scope: sc, run: func(ctx context.Context) {
 		defer close(ready)
-		if items, err := s.mem.Start(ctx, req); err == nil {
+		if items, err := c.Start(ctx, req); err == nil {
 			s.injectRecall(req.SessionID, items)
 		}
 	}}
@@ -971,12 +1105,12 @@ func (s *Session) memStart(sc ctxx.Scope, at time.Time, ready chan struct{}) mem
 
 // enqueueStart 投递会话开始的通知（Start），并把其完成信号设为会话首轮的等待对象（见 Config.RecallWait）；
 // 队列满未投递时立即关闭完成信号，首轮不等待。
-func (s *Session) enqueueStart(sc ctxx.Scope, at time.Time) {
+func (s *Session) enqueueStart(c *memory.Client, sc ctxx.Scope, at time.Time) {
 	ready := make(chan struct{})
 	s.mu.Lock()
 	s.recallReady = ready
 	s.mu.Unlock()
-	if !s.enqueueMemory(s.memStart(sc, at, ready)) {
+	if !s.enqueueMemory(s.memStart(c, sc, at, ready)) {
 		close(ready)
 	}
 }

@@ -23,13 +23,11 @@ import (
 	"aria/internal/assemble"
 	"aria/internal/config"
 	"aria/pkg/ctxx"
-	"aria/plugins/persist/jsonl"
 	"aria/plugins/tool/basic"
 	gowildvision "aria/plugins/vision/gowild"
 	gowildvoice "aria/plugins/voice/gowild"
 	"aria/runtime/agent"
 	"aria/runtime/memory"
-	"aria/runtime/persist"
 )
 
 // Options 是 Engine 的组装参数（flag 的物化）。
@@ -63,11 +61,11 @@ type Engine struct {
 	Session *agent.Session
 	Live    *assemble.Live
 
-	log        *slog.Logger
-	jsonlStore *jsonl.Store
-	memClose   func(context.Context) error // 记忆服务的后台提交等待（未接入时为 nil）
-	fake       bool
-	provs      *assemble.ProviderCache // 生效模型名的来源（热更新换模型后随之变化）
+	log    *slog.Logger
+	stores *assemble.StoreCache  // 建过的全部落盘 store（热更新换路径后旧的也在这里）
+	mems   *assemble.MemoryCache // 建过的全部记忆服务
+	fake   bool
+	provs  *assemble.ProviderCache // 生效模型名的来源（热更新换模型后随之变化）
 }
 
 // NewEngine 走完「配置 → provider → 压缩 → 人设 → 落盘 → agent → 会话」
@@ -91,7 +89,7 @@ func NewEngine(opts Options) (*Engine, error) {
 		log.Info("provider: echo（无网络冒烟）")
 	}
 
-	// 启动时建一次、热更新不换的部件：视觉（[host] 装配项）、落盘、记忆服务。
+	// 视觉（[host] 装配项）启动时建一次、热更新不换。
 	//
 	// 视觉注入（可空）：槽 1 的额外变换位，作用在窗口组装结果之上——
 	// 摄像头当前帧追加在组装结果最底部，不进历史不落盘。
@@ -104,27 +102,12 @@ func NewEngine(opts Options) (*Engine, error) {
 		vision = v
 		log.Info("vision: 固定视觉参考区启用（每次请求更新一张，不作为用户发言）", "device", opts.VisionBase)
 	}
-	var store persist.Store
-	var jsonlStore *jsonl.Store
-	if cfg.Record.Path != "" {
-		s, err := jsonl.New(cfg.Record.Path)
-		if err != nil {
-			return nil, fmt.Errorf("落盘打开失败 %s: %w", cfg.Record.Path, err)
-		}
-		store, jsonlStore = s, s
-		log.Info("record", "path", cfg.Record.Path)
-	}
-	mem, err := assemble.Memory(cfg.Memory, log)
-	if err != nil {
-		return nil, fmt.Errorf("记忆服务装配失败: %w", err)
-	}
-	if mem.Service != nil {
-		log.Info("memory", "engine", cfg.Memory.Engine, "base_url", cfg.Memory.BaseURL,
-			"dir", cfg.Memory.Dir, "members", len(cfg.Memory.Members))
-	}
+	// 落盘与记忆服务按配置段缓存：段不变复用，变了重建，新实例在下一次会话切换时换上。
+	stores := &assemble.StoreCache{}
+	mems := &assemble.MemoryCache{Log: log}
 
 	// build 是「配置 → agent.Config」的装配：启动与热更新（assemble.Live）共用这一份。
-	provs := &assemble.ProviderCache{APIKey: opts.APIKey}
+	provs := &assemble.ProviderCache{APIKey: opts.APIKey, Log: log}
 	build := func(cfg config.Config) (agent.Config, string, error) {
 		prov, note := fakeProv, "provider=echo"
 		if prov == nil {
@@ -138,6 +121,14 @@ func NewEngine(opts Options) (*Engine, error) {
 		compressor, err := assemble.Compressor(cfg, prov)
 		if err != nil {
 			return agent.Config{}, "", fmt.Errorf("压缩策略: %w", err)
+		}
+		store, err := stores.Get(cfg.Record.Path)
+		if err != nil {
+			return agent.Config{}, "", fmt.Errorf("落盘打开失败 %s: %w", cfg.Record.Path, err)
+		}
+		mem, err := mems.Get(cfg.Memory)
+		if err != nil {
+			return agent.Config{}, "", fmt.Errorf("记忆服务: %w", err)
 		}
 		systemPrompt, err := ResolvePersona(cfg.Persona)
 		if err != nil {
@@ -185,6 +176,8 @@ func NewEngine(opts Options) (*Engine, error) {
 			IdleTimeout:     assemble.IdleTimeout(cfg.Session),
 			RecallWait:      assemble.RecallWait(cfg.Session),
 			Assembler:       vision,
+			Memory:          mem.Service,
+			Store:           store,
 			SystemPrompt:    systemPrompt,
 			MaxTurns:        cfg.Limits.MaxTurns,
 			ToolTimeout:     time.Duration(toolTimeoutMS) * time.Millisecond,
@@ -201,10 +194,11 @@ func NewEngine(opts Options) (*Engine, error) {
 		names = append(names, t.Def().Name)
 	}
 	log.Info("assembled", "note", note, "base_url", orDefault(cfg.Provider.BaseURL, "(官方默认)"),
-		"compress", cfg.Compress.Strategy, "tools", names, "tool_timeout", acfg.ToolTimeout)
+		"compress", cfg.Compress.Strategy, "tools", names, "tool_timeout", acfg.ToolTimeout,
+		"record", cfg.Record.Path, "memory", cfg.Memory.Engine)
 
 	sessionID, newSessionID := assemble.SessionIDs(cfg.Session, time.Now())
-	acfg.Memory, acfg.Store, acfg.NewSessionID = mem.Service, store, newSessionID
+	acfg.NewSessionID = newSessionID
 	ag, err := agent.New(acfg)
 	if err != nil {
 		return nil, fmt.Errorf("agent 装配失败: %w", err)
@@ -215,8 +209,8 @@ func NewEngine(opts Options) (*Engine, error) {
 	}
 	live := assemble.NewLive(sess, build, cfg, log)
 	mgr.OnChange(live.Apply)
-	return &Engine{Cfg: cfg, Config: mgr, Session: sess, Live: live, log: log, jsonlStore: jsonlStore,
-		memClose: mem.Close, fake: opts.Fake, provs: provs}, nil
+	return &Engine{Cfg: cfg, Config: mgr, Session: sess, Live: live, log: log, stores: stores,
+		mems: mems, fake: opts.Fake, provs: provs}, nil
 }
 
 // ModelName 是对外展示的模型名（echo 冒烟时为 "echo"；deepseek kind 留空
@@ -231,19 +225,14 @@ func (e *Engine) ModelName() string {
 // Close 收尾落盘（会话本身的 Close 由宿主在等待消费者退出前先行调用，
 // 顺序是宿主的职责）。重复调用安全。
 func (e *Engine) Close() error {
-	if e.memClose != nil {
-		// 记忆服务的后台提交（遗留会话）以 agent.DefaultCloseGrace 为上限等待；超时则放行，
-		// 未完成的提交由下一次启动的 Start 重做（document_id 幂等）。
-		ctx, cancel := context.WithTimeout(context.Background(), agent.DefaultCloseGrace)
-		if err := e.memClose(ctx); err != nil {
-			e.log.Warn("memory: background commit still running at close", "err", err)
-		}
-		cancel()
+	// 记忆服务的后台提交（遗留会话）以 agent.DefaultCloseGrace 为上限等待；超时则放行，
+	// 未完成的提交由下一次启动的 Start 重做（document_id 幂等）。
+	ctx, cancel := context.WithTimeout(context.Background(), agent.DefaultCloseGrace)
+	if err := e.mems.Close(ctx); err != nil {
+		e.log.Warn("memory: background commit still running at close", "err", err)
 	}
-	if e.jsonlStore != nil {
-		return e.jsonlStore.Close()
-	}
-	return nil
+	cancel()
+	return e.stores.Close()
 }
 
 func orDefault(s, def string) string {

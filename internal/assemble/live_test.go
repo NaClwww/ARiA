@@ -97,12 +97,12 @@ func TestLiveRebuildsOnChange(t *testing.T) {
 func TestLiveRestartOnlyWarnings(t *testing.T) {
 	cfg := config.Config{Provider: config.Provider{Model: "a"}}
 	f := newLiveFixture(t, cfg)
-	cfg.Memory.Engine = "hindsight"
+	cfg.Server.Listen = "0.0.0.0:1"
 	cfg.Session.IdleTimeoutS = 60
 	cfg.Session.RecallWaitMs = 100
 	f.live.Apply(cfg)
 	out := f.logs.String()
-	if !strings.Contains(out, "section=memory") || strings.Contains(out, "section=session") {
+	if !strings.Contains(out, "section=server") || strings.Contains(out, "section=session") {
 		t.Fatalf("restart-only logs wrong:\n%s", out)
 	}
 }

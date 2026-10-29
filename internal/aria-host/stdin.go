@@ -12,17 +12,17 @@ import (
 )
 
 // StdinPlug 是终端输入插头：一行 = 一句已说完的话（06 §2 插头契约，
-// 「说完判定」= 按下回车）。[名字] 前缀切换说话人；/quit 退出；/reload 调 reload
-// （重读配置文件；nil = 不支持，当普通输入投递）。
+// 「说完判定」= 按下回车）。[名字] 前缀切换说话人；/quit 退出；cmds 是其余命令（如 /reload、
+// /new → 处理函数），不在表里的一律当普通输入投递。
 // eofQuits：无 ASR 插头时 EOF 即收工；语音形态要常驻（提示退出方式）。
 // quit 由宿主提供且须幂等（信号处理与 /quit 都可能触发退出）。
 // ctx 取消时立即返回（满足 app.Service 的契约）：r 的阻塞读不可取消，读取 goroutine
 // 保留到读取结束或进程退出，取消后读到的行不再投递。
-func StdinPlug(ctx context.Context, r io.Reader, deliver func(text, speaker string), defUser string, eofQuits bool, quit, reload func()) {
+func StdinPlug(ctx context.Context, r io.Reader, deliver func(text, speaker string), defUser string, eofQuits bool, quit func(), cmds map[string]func()) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		readLines(ctx, r, deliver, defUser, eofQuits, quit, reload)
+		readLines(ctx, r, deliver, defUser, eofQuits, quit, cmds)
 	}()
 	select {
 	case <-ctx.Done():
@@ -31,7 +31,7 @@ func StdinPlug(ctx context.Context, r io.Reader, deliver func(text, speaker stri
 }
 
 // readLines 是 StdinPlug 的读取循环，逐行解析说话人前缀并投递。
-func readLines(ctx context.Context, r io.Reader, deliver func(text, speaker string), defUser string, eofQuits bool, quit, reload func()) {
+func readLines(ctx context.Context, r io.Reader, deliver func(text, speaker string), defUser string, eofQuits bool, quit func(), cmds map[string]func()) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	for sc.Scan() {
@@ -46,8 +46,8 @@ func readLines(ctx context.Context, r io.Reader, deliver func(text, speaker stri
 			quit()
 			return
 		}
-		if text == "/reload" && reload != nil {
-			reload()
+		if fn, ok := cmds[text]; ok {
+			fn()
 			continue
 		}
 		speaker, utterance := message.SplitSpeaker(text, defUser)

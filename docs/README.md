@@ -95,8 +95,8 @@ Session.Input ─▶ 组装层 window ─▶ core 飞轮 ─▶ 事件流 ─▶
                   └ 零件位：压缩策略（配置点菜，可热换）
 ```
 
-已实现：pkg + core（M1）、runtime 主线三包 + artifact/toolkit（M2）、JSONL 落盘、终端薄壳 `cmd/aria-demo`、配置分层 `internal/config`。
-未实现：`cmd/aria-web` 面板、压缩零件注册表与热切换、ASR 插头、认主（插件层协商）、打断/小轮（03 §7）。
+已实现：pkg + core（M1）、runtime 主线三包 + artifact/toolkit（M2）、JSONL 落盘、终端薄壳 `cmd/aria-demo`、Gowild 语音宿主 `cmd/aria-host`（ASR 插头 / TTS / 状态灯 / 视觉）、配置分层 `internal/config`、压缩零件装配表与热切换、长期记忆的 ARiA 侧（Hindsight 测试期后端）、provider：deepseek / openai / opencode、模型卡 `pkg/modelcard`；**配置热更新**（2026-10-28）：改配置文件自动生效，整份重新装配会话（上下文不丢），记忆服务与落盘在会话切换时换上（06 §3）。
+未实现：`cmd/aria-web` 面板、认主（插件层协商）、打断/小轮（03 §7）。
 
 **runtime 并发（2026-09-11 定稿）**：v1 一 Session 同时只跑一轮，并发新输入由会话互斥串行、轮间插话走 `Queue`（仅运行中接受，2026-09-28）——**不建 schedule/ 子包，M2 不被调度设计阻塞**。notes/concurrency-draft.md 的完整草案（actor 单写者 / 多维准入 / 后台任务 / 限流）仍是草稿，原则方向大概率保留，有真实并发场景再回来定稿（05 G1）。
 
@@ -123,7 +123,7 @@ go run ./cmd/aria-demo                         # 按 aria.toml 连真实服务�
 go run ./cmd/aria-demo --print-config          # 看生效配置（含「哪项被覆盖、基准值是多少」）
 ```
 
-交互：`[名字] 开头` 切换说话人（多人共享一个 Session）；`/reload` 重读配置文件；Ctrl+C 打断当前回答（steering）；`/quit` 退出。落盘实现 = `plugins/persist/jsonl`（格式带版本号，读路/重放随恢复需求再做）。
+交互：`[名字] 开头` 切换说话人（多人共享一个 Session）；改 `aria.toml` / override 文件自动生效（下一轮），`/reload` 手动重读；`/new` 立即开始新会话；Ctrl+C 打断当前回答（steering）；`/quit` 退出。`cmd/aria-host` 的终端命令相同。落盘实现 = `plugins/persist/jsonl`（格式带版本号，读路/重放随恢复需求再做）。
 
 配置见仓库根 [`aria.toml`](../aria.toml)（带注释样例）：生效优先级 = 启动 flag > `aria.override.toml`（网页保存目标）> `aria.toml`（人写，程序永不重写）> 默认值；分层理由与热调边界见 [06 §3](06-host-shell.md)。
 

@@ -12,7 +12,8 @@ import (
 
 // BuildFunc 是宿主的「配置 → agent.Config」装配，启动与热更新共用同一份（参照 pi 的
 // _buildRuntime）。note 描述本次装配（如 provider/模型），记入 reconfigured 事件。
-// 会话级部件（Memory / Store / NewSessionID）由宿主在启动时另行填入，热更新时被忽略。
+// Memory / Store 也由 Build 给出（宿主用 MemoryCache / StoreCache 缓存），变更在下一次会话切换时
+// 生效（Session.Reconfigure）；NewSessionID 由宿主在启动时填入。
 type BuildFunc func(cfg config.Config) (ac agent.Config, note string, err error)
 
 // Live 把配置变更应用到运行中的会话（docs/06 §3），两个宿主共用。宿主把 Apply 注册为
@@ -22,7 +23,8 @@ type BuildFunc func(cfg config.Config) (ac agent.Config, note string, err error)
 // Session.Reconfigure——会话、上下文窗口、事件订阅不动，装配换新；Provider 等昂贵部件
 // 由 Build 内部缓存（ProviderCache）。装配失败保持原配置。
 //
-// 记忆服务、落盘、监听地址、[host] 与会话标识类配置只在启动时生效，变更只记「需重启」日志。
+// 记忆服务与落盘的变更在下一次会话切换（闲置超时或 /new）时生效；监听地址、[host] 与会话标识类
+// 配置只在启动时生效，变更只记「需重启」日志。
 type Live struct {
 	Session *agent.Session
 	Build   BuildFunc
@@ -80,8 +82,6 @@ func restartOnly(prev, cur config.Config) []string {
 	}
 	add("host", prev.Host, cur.Host)
 	add("server", prev.Server, cur.Server)
-	add("record", prev.Record, cur.Record)
-	add("memory", prev.Memory, cur.Memory)
 	// [session] 里 idle_timeout_s / recall_wait_ms 热生效；会话标识、默认说话人、命名空间不热换。
 	ps, cs := prev.Session, cur.Session
 	ps.IdleTimeoutS, cs.IdleTimeoutS = 0, 0

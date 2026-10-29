@@ -45,14 +45,14 @@ pkg ← core ← runtime ← plugins / internal / cmd
 - **宿主拥有全部 IO**：引擎唯一输入口是 `Session.Input`（阻塞到本轮结算）；运行中插话用 `Queue`，空闲时返回 `ErrNoActiveRun`，宿主应退回 `Input`。一 Session 同时只跑一轮。
 - **输入必须带主人**：说话人既进消息层（`[名字]` 前缀进历史）又进 Scope（`ctx.UserID`）；Scope 缺失 fail-closed。
 - **组装层 = 骨架 + 可换零件**（`runtime/window`）：顺序与「压缩中不丢内容 / 失败退回原文」是骨架；压缩策略（provider / keeplast）是零件，经 `Session.SetCompressor` 热切换。压缩按上下文用量触发（`[compress]` 段）。
-- **会话切换**：`idle_timeout_s` 无输入后清空窗口，新会话不带入上一会话的摘要与原文；会话 ID = `<id>-<开始时刻>`。
+- **会话切换**：`idle_timeout_s` 无输入后（或 `Session.Switch`，宿主 `/new`）清空窗口，新会话不带入上一会话的摘要与原文；会话 ID = `<id>-<开始时刻>`。
 - **长期记忆**：`runtime/memory.Service` 接口（Stage/End/Start/Recall），会话首轮最多等 `recall_wait_ms` 召回；`[memory] engine=""` 表示完全不接入。
 - **错误三分法**：ToolError 是内容（喂回模型）、ProviderError 退避重试、Fatal 终止。
 
 ## 配置
 
 - 优先级：启动 flag（仅本进程）> `aria.override.toml`（机器写，gitignored）> `aria.toml`（人写，**程序永不重写**，注释安全）> 代码默认值。
-- 写回只碰 override 层且原子写。热更新三件事解耦：`config.Watch`（只报「文件可能变了」）→ `Manager.Reload()`（比对内容、语法错误保留旧值）→ `OnChange` 上的 `assemble.Live.Apply`（唯一应用点：用宿主的 `build(cfg)`——与启动同一份装配函数——整份重新装配，交给 `Session.Reconfigure`；会话、上下文窗口、事件订阅不动）。Provider 由 `assemble.ProviderCache` 按 `[provider]` 段缓存。记忆服务、落盘、`[host]` 只在启动时生效（`restartOnly` 记「需重启」）。新增配置项只要在宿主的 `build` 里读它，就自动可热改。
+- 写回只碰 override 层且原子写。热更新三件事解耦：`config.Watch`（只报「文件可能变了」）→ `Manager.Reload()`（比对内容、语法错误保留旧值）→ `OnChange` 上的 `assemble.Live.Apply`（唯一应用点：用宿主的 `build(cfg)`——与启动同一份装配函数——整份重新装配，交给 `Session.Reconfigure`；会话、上下文窗口、事件订阅不动）。Provider 由 `assemble.ProviderCache` 按 `[provider]` 段缓存。记忆服务与落盘（`MemoryCache` / `StoreCache`）的变更在下一次会话切换（闲置超时或 `/new` → `Session.Switch`）时换上；`[host]`、监听地址、会话标识只在启动时生效（`restartOnly` 记「需重启」）。新增配置项只要在宿主的 `build` 里读它，就自动可热改。
 - API key 永不落盘：配置只存环境变量名（`provider.api_key_env`，默认 `ARIA_API_KEY`），`start.sh` 会自动加载 `.env`。
 - aria-host 的装配项基准在 `aria.toml [host]`；新增 [host] 旋钮 = 在 `cmd/aria-host/main.go` 的 hostKnob 表里加一行。
 
