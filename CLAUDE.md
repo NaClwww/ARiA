@@ -45,7 +45,7 @@ pkg ← core ← runtime ← plugins / internal / cmd
 - **宿主拥有全部 IO**：引擎唯一输入口是 `Session.Input`（阻塞到本轮结算）；运行中插话用 `Queue`，空闲时返回 `ErrNoActiveRun`，宿主应退回 `Input`。一 Session 同时只跑一轮。
 - **输入必须带主人**：说话人既进消息层（`[名字]` 前缀进历史）又进 Scope（`ctx.UserID`）；Scope 缺失 fail-closed。
 - **组装层 = 骨架 + 可换零件**（`runtime/window`）：顺序与「压缩中不丢内容 / 失败退回原文」是骨架；压缩策略（provider / keeplast）是零件，经 `Session.SetCompressor` 热切换。压缩按上下文用量触发（`[compress]` 段）。
-- **会话切换**：`idle_timeout_s` 无输入后清空窗口，新会话不带入上一会话的摘要与原文；会话 ID = `<id>-<开始时刻>`。
+- **会话切换**：`idle_timeout_s` 无输入后（或 `Session.Switch`，宿主 `/new`）清空窗口，新会话不带入上一会话的摘要与原文；会话 ID = `<id>-<开始时刻>`。
 - **长期记忆**：`runtime/memory.Service` 接口（Stage/End/Start/Recall），会话首轮最多等 `recall_wait_ms` 召回；`[memory] engine=""` 表示完全不接入。
 - **错误三分法**：ToolError 是内容（喂回模型）、ProviderError 退避重试、Fatal 终止。
 
