@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
 	"sync"
 	"time"
 
@@ -42,11 +43,14 @@ type DeciderStep struct {
 	Delay time.Duration
 }
 
-// DeciderCall 记录一次调用（测试断言微批：一车装了几个条目、问了哪些问题）。
+// DeciderCall 记录一次调用（测试断言微批：一车装了几个条目、问了哪些问题、带了哪些图）。
 type DeciderCall struct {
 	State     json.RawMessage // 调用时刻编码：之后改原对象不影响记录
 	Questions []Question
+	Images    []string // 图片引用串（排序）；不记图片数据
 }
+
+var _ Decider = (*FakeDecider)(nil)
 
 func NewFakeDecider(steps ...DeciderStep) *FakeDecider {
 	cloned := make([]DeciderStep, len(steps))
@@ -90,28 +94,31 @@ func (f *FakeDecider) Left() int {
 	return len(f.steps) - f.i
 }
 
-// Calls 返回已记录调用的副本。问题集校验失败的调用不记录——真实实现不会发出这些请求。
+// Calls 返回已记录调用的副本。校验失败的调用不记录——真实实现不会发出这些请求。
 func (f *FakeDecider) Calls() []DeciderCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]DeciderCall, len(f.calls))
 	for i, c := range f.calls {
-		out[i] = DeciderCall{State: append(json.RawMessage(nil), c.State...), Questions: cloneQuestions(c.Questions)}
+		out[i] = DeciderCall{State: append(json.RawMessage(nil), c.State...), Questions: cloneQuestions(c.Questions),
+			Images: append([]string(nil), c.Images...)}
 	}
 	return out
 }
 
-func (f *FakeDecider) Decide(ctx context.Context, state any, qs []Question) (Decision, error) {
-	if err := ValidateQuestions(qs, f.Caps("")); err != nil {
+func (f *FakeDecider) Decide(ctx context.Context, in DecideInput, qs []Question) (Decision, error) {
+	raw, err := ValidateInput(in, qs, f.Caps(""))
+	if err != nil {
 		return Decision{}, err
 	}
-	raw, err := json.Marshal(state)
-	if err != nil {
-		return Decision{}, fmt.Errorf("decider: state 无法 JSON 编码: %w", err)
+	images := make([]string, 0, len(in.Images))
+	for ref := range in.Images {
+		images = append(images, ref)
 	}
+	sort.Strings(images)
 
 	f.mu.Lock()
-	f.calls = append(f.calls, DeciderCall{State: raw, Questions: cloneQuestions(qs)})
+	f.calls = append(f.calls, DeciderCall{State: raw, Questions: cloneQuestions(qs), Images: images})
 	f.n++
 	id := f.n
 	var step *DeciderStep
@@ -146,7 +153,7 @@ func (f *FakeDecider) Decide(ctx context.Context, state any, qs []Question) (Dec
 		Answers: make(map[string]Answer, len(qs)),
 		Model:   "fake",
 		ID:      fmt.Sprintf("fake-%d", id),
-		Usage:   message.Usage{In: int(math.Ceil(DefaultTokenRates.text(string(raw))))},
+		Usage:   message.Usage{In: int(math.Ceil(DefaultTokenRates.text(string(raw)))) + len(images)*DefaultTokenRates.Image},
 	}
 	for _, q := range qs {
 		var a Answer

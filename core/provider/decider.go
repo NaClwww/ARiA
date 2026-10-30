@@ -2,9 +2,13 @@ package provider
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 
 	"aria/pkg/message"
 )
@@ -20,14 +24,35 @@ import (
 //     不同模型的阈值因此可比；
 //   - score 的 Probs 按档位名作键（线上协议是下标字符串，由适配器换算），与 choice 一致。
 type Decider interface {
-	// Decide 一次回答 qs。state 必须可 JSON 编码；不可信内容只能放在 state 的字符串里，
+	// Decide 一次回答 qs。in.State 必须可 JSON 编码；不可信内容只能放在 State 的字符串里，
 	// 问题的 Instructions / Criteria 全部由调用方书写（§4.4）。
 	// 单个问题漏答或答案不合法不算错误，记在 Decision.Missing；error 只表示整次调用失败
-	// （网络与 5xx 等用 RetryableError 包裹；问题超出模型能力为 ErrUnsupportedQuestion）。
-	Decide(ctx context.Context, state any, qs []Question) (Decision, error)
+	// （网络与 5xx 等用 RetryableError 包裹；问题或输入超出模型能力为 ErrUnsupportedQuestion /
+	// ErrUnsupportedInput；输入不合法为 ErrInvalidQuestion / ErrInvalidInput）。
+	Decide(ctx context.Context, in DecideInput, qs []Question) (Decision, error)
 
 	// Caps 报告 model 的能力；model 为空指实现的默认模型。未知项为零值（= 不限 / 不知道）。
 	Caps(model string) DeciderCaps
+}
+
+// DecideInput 是一次判定的输入。
+type DecideInput struct {
+	State any
+
+	// Images 是 State 里（或问题的 Instructions / Criteria 描述里）引用的图片：引用串 → 图片。
+	// 引用串按纯文本出现在字符串中即被替换为该图片——可以是整个字符串值，也可以嵌在一段文字里
+	// （Jev 两种都认；OpenRouter 上的其他模型只认 State 顶层、整个值就是引用串的写法）。
+	// 用 NewImageRef 生成，避免误匹配；每张图都必须被引用。图片要带 Data（不抓取 URL），
+	// 格式与尺寸由适配器预处理。图片放在 State 里所有问题共用一份；放进 Instructions 则每题各发一次。
+	Images map[string]message.ImageBlock
+}
+
+// NewImageRef 生成一个图片引用串（img- + 32 位十六进制）：足够独特，不会误匹配普通文本，
+// 且只含 JSON 编码不会转义的字符。
+func NewImageRef() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return "img-" + hex.EncodeToString(b[:])
 }
 
 // QuestionKind 是问题类型。
@@ -85,6 +110,7 @@ type DeciderCaps struct {
 	MaxOptions    int            // choice 选项上限；0 = 协议上限
 	MaxLevels     int            // score 档位上限；0 = 协议上限
 	ContextWindow int            // token；0 = 未知
+	TextOnly      bool           // 不收图片；false = 收或未知（照发，端点不收时由它报错）
 }
 
 var (
@@ -92,7 +118,70 @@ var (
 	ErrInvalidQuestion = errors.New("decider: invalid question")
 	// ErrUnsupportedQuestion：问题合协议，但超出该模型的能力（DeciderCaps）。
 	ErrUnsupportedQuestion = errors.New("decider: unsupported question")
+	// ErrInvalidInput：输入不合法（State 为空或无法编码、图片引用串非法或未被引用、图片无法处理）。
+	ErrInvalidInput = errors.New("decider: invalid input")
+	// ErrUnsupportedInput：输入合法，但模型不收（如给纯文本模型发图片）。
+	ErrUnsupportedInput = errors.New("decider: unsupported input")
 )
+
+// 图片引用串的协议上限（System One API）。
+const (
+	MaxImageRefBytes      = 1024
+	MaxImageRefTotalBytes = 65536
+)
+
+// ValidateInput 校验问题集（ValidateQuestions）与输入：State 非空且可 JSON 编码；图片引用串只含
+// [A-Za-z0-9._:-]（JSON 编码不会改写它们，才能在编码后的文本里找到）、长度不超协议上限、
+// 互不包含；每张图都带 Data 且在 State 或某个问题的文字里被引用；caps.TextOnly 时不许带图。
+// 返回 State 的 JSON 编码（调用方可复用）。
+func ValidateInput(in DecideInput, qs []Question, caps DeciderCaps) (json.RawMessage, error) {
+	if err := ValidateQuestions(qs, caps); err != nil {
+		return nil, err
+	}
+	if in.State == nil {
+		return nil, fmt.Errorf("%w: state 为空", ErrInvalidInput)
+	}
+	state, err := json.Marshal(in.State)
+	if err != nil {
+		return nil, fmt.Errorf("%w: state 无法 JSON 编码: %v", ErrInvalidInput, err)
+	}
+	if len(in.Images) == 0 {
+		return state, nil
+	}
+	if caps.TextOnly {
+		return nil, fmt.Errorf("%w: 模型不收图片", ErrUnsupportedInput)
+	}
+	var text strings.Builder
+	text.Write(state)
+	for _, q := range qs {
+		text.WriteString(q.Instructions)
+		for _, c := range q.Criteria {
+			text.WriteString(c.Description)
+		}
+	}
+	all, total := text.String(), 0
+	for ref, img := range in.Images {
+		if !validImageRef(ref) {
+			return nil, fmt.Errorf("%w: 图片引用串 %q 非法（1~%d 字节，只含 [A-Za-z0-9._:-]）", ErrInvalidInput, ref, MaxImageRefBytes)
+		}
+		total += len(ref)
+		if len(img.Data) == 0 {
+			return nil, fmt.Errorf("%w: 图片 %s 没有数据（不抓取 URL）", ErrInvalidInput, ref)
+		}
+		if !strings.Contains(all, ref) {
+			return nil, fmt.Errorf("%w: 图片 %s 没有被引用", ErrInvalidInput, ref)
+		}
+		for other := range in.Images {
+			if other != ref && strings.Contains(other, ref) {
+				return nil, fmt.Errorf("%w: 图片引用串 %s 是 %s 的一部分", ErrInvalidInput, ref, other)
+			}
+		}
+	}
+	if total > MaxImageRefTotalBytes {
+		return nil, fmt.Errorf("%w: 图片引用串总长 %d 字节，超过 %d", ErrInvalidInput, total, MaxImageRefTotalBytes)
+	}
+	return state, nil
+}
 
 // ValidateQuestions 按协议与 caps 校验问题集；错误包裹 ErrInvalidQuestion 或 ErrUnsupportedQuestion。
 func ValidateQuestions(qs []Question, caps DeciderCaps) error {
@@ -297,3 +386,17 @@ func confidence(kind QuestionKind, ps []float64) float64 {
 }
 
 func clamp01(x float64) float64 { return math.Max(0, math.Min(1, x)) }
+
+// validImageRef：1~MaxImageRefBytes 字节，只含 [A-Za-z0-9._:-]。
+func validImageRef(ref string) bool {
+	if ref == "" || len(ref) > MaxImageRefBytes {
+		return false
+	}
+	for _, c := range ref {
+		ok := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("._:-", c)
+		if !ok {
+			return false
+		}
+	}
+	return true
+}

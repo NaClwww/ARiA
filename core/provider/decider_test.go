@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"aria/pkg/message"
 )
 
 func near(a, b float64) bool { return math.Abs(a-b) < 1e-9 }
@@ -145,7 +147,7 @@ func TestFakeDeciderScript(t *testing.T) {
 		"unasked":   {P: 0.5},
 	}})
 	state := map[string]any{"items": []map[string]string{{"from": "妈妈", "text": "ARiA 明天下雨吗"}}}
-	got, err := d.Decide(context.Background(), state, []Question{qAddressed, qRoute, qLevel})
+	got, err := d.Decide(context.Background(), DecideInput{State: state}, []Question{qAddressed, qRoute, qLevel})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +170,7 @@ func TestFakeDeciderScript(t *testing.T) {
 		t.Fatal("step not consumed")
 	}
 	var fatal *FatalError
-	if _, err := d.Decide(context.Background(), state, []Question{qAddressed}); !errors.As(err, &fatal) {
+	if _, err := d.Decide(context.Background(), DecideInput{State: state}, []Question{qAddressed}); !errors.As(err, &fatal) {
 		t.Fatalf("exhausted: %v", err)
 	}
 }
@@ -181,26 +183,26 @@ func TestFakeDeciderErrors(t *testing.T) {
 		DeciderStep{Delay: time.Hour},
 	)
 	qs := []Question{qAddressed}
-	if _, err := d.Decide(context.Background(), nil, qs); !IsRetryable(err) || !errors.Is(err, boom) {
+	if _, err := d.Decide(context.Background(), DecideInput{State: "s"}, qs); !IsRetryable(err) || !errors.Is(err, boom) {
 		t.Fatalf("retryable: %v", err)
 	}
-	if _, err := d.Decide(context.Background(), nil, qs); IsRetryable(err) || !errors.Is(err, boom) {
+	if _, err := d.Decide(context.Background(), DecideInput{State: "s"}, qs); IsRetryable(err) || !errors.Is(err, boom) {
 		t.Fatalf("fatal: %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
-	if _, err := d.Decide(ctx, nil, qs); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := d.Decide(ctx, DecideInput{State: "s"}, qs); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("timeout: %v", err)
 	}
 	// 问题集超出能力：不消费脚本、不记录调用
 	d = NewFakeDecider(DeciderStep{}).WithCaps(DeciderCaps{Kinds: []QuestionKind{KindNoul}})
-	if _, err := d.Decide(context.Background(), nil, []Question{qLevel}); !errors.Is(err, ErrUnsupportedQuestion) {
+	if _, err := d.Decide(context.Background(), DecideInput{State: "s"}, []Question{qLevel}); !errors.Is(err, ErrUnsupportedQuestion) {
 		t.Fatalf("caps: %v", err)
 	}
 	if d.Left() != 1 || len(d.Calls()) != 0 {
 		t.Fatal("rejected call consumed the script")
 	}
-	if _, err := d.Decide(context.Background(), make(chan int), qs); err == nil {
+	if _, err := d.Decide(context.Background(), DecideInput{State: make(chan int)}, qs); !errors.Is(err, ErrInvalidInput) {
 		t.Fatal("unencodable state accepted")
 	}
 }
@@ -225,7 +227,7 @@ func TestFakeDeciderFallbackConcurrent(t *testing.T) {
 			if i%2 == 0 {
 				text, want = "ARiA 开空调", 0.95
 			}
-			got, err := d.Decide(context.Background(), map[string]string{"text": text}, []Question{qAddressed, qRoute})
+			got, err := d.Decide(context.Background(), DecideInput{State: map[string]string{"text": text}}, []Question{qAddressed, qRoute})
 			if err != nil {
 				t.Error(err)
 				return
@@ -238,5 +240,58 @@ func TestFakeDeciderFallbackConcurrent(t *testing.T) {
 	wg.Wait()
 	if len(d.Calls()) != 8 {
 		t.Fatalf("calls %d", len(d.Calls()))
+	}
+}
+
+func TestValidateInputImages(t *testing.T) {
+	img := message.ImageBlock{Data: []byte{1}, MIME: "image/jpeg"}
+	door, poster := NewImageRef(), NewImageRef()
+	if door == poster || !strings.HasPrefix(door, "img-") || !validImageRef(door) {
+		t.Fatalf("refs %q %q", door, poster)
+	}
+	qs := []Question{qAddressed}
+	withRef := []Question{{Name: "same", Kind: KindNoul, Instructions: "`photo` 里的人和 " + poster + " 是同一个人吗"}}
+	cases := []struct {
+		name string
+		in   DecideInput
+		qs   []Question
+		caps DeciderCaps
+		want error
+	}{
+		{"text only ok", DecideInput{State: "s"}, qs, DeciderCaps{TextOnly: true}, nil},
+		{"nil state", DecideInput{}, qs, DeciderCaps{}, ErrInvalidInput},
+		{"image in state", DecideInput{State: map[string]string{"photo": door}, Images: map[string]message.ImageBlock{door: img}}, qs, DeciderCaps{}, nil},
+		{"image in instructions", DecideInput{State: map[string]string{"photo": door},
+			Images: map[string]message.ImageBlock{door: img, poster: img}}, withRef, DeciderCaps{}, nil},
+		{"embedded in text", DecideInput{State: "门口：" + door + "（刚才）", Images: map[string]message.ImageBlock{door: img}}, qs, DeciderCaps{}, nil},
+		{"unreferenced", DecideInput{State: "s", Images: map[string]message.ImageBlock{door: img}}, qs, DeciderCaps{}, ErrInvalidInput},
+		{"no data", DecideInput{State: door, Images: map[string]message.ImageBlock{door: {URL: "http://x/a.jpg"}}}, qs, DeciderCaps{}, ErrInvalidInput},
+		{"bad ref", DecideInput{State: "a b", Images: map[string]message.ImageBlock{"a b": img}}, qs, DeciderCaps{}, ErrInvalidInput},
+		{"nested refs", DecideInput{State: "cat category", Images: map[string]message.ImageBlock{"cat": img, "category": img}}, qs, DeciderCaps{}, ErrInvalidInput},
+		{"text-only model", DecideInput{State: door, Images: map[string]message.ImageBlock{door: img}}, qs, DeciderCaps{TextOnly: true}, ErrUnsupportedInput},
+		{"bad question first", DecideInput{State: "s"}, nil, DeciderCaps{}, ErrInvalidQuestion},
+	}
+	for _, c := range cases {
+		_, err := ValidateInput(c.in, c.qs, c.caps)
+		if c.want == nil && err != nil || c.want != nil && !errors.Is(err, c.want) {
+			t.Errorf("%s: err = %v, want %v", c.name, err, c.want)
+		}
+	}
+}
+
+func TestFakeDeciderRecordsImages(t *testing.T) {
+	a, b := "img-b", "img-a"
+	d := NewFakeDecider(DeciderStep{Answers: map[string]Answer{"addressed": {P: 0.5}}})
+	in := DecideInput{State: map[string]string{"x": a, "y": b},
+		Images: map[string]message.ImageBlock{a: {Data: []byte{1}}, b: {Data: []byte{2}}}}
+	got, err := d.Decide(context.Background(), in, []Question{qAddressed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := d.Calls()[0]; strings.Join(c.Images, ",") != "img-a,img-b" {
+		t.Fatalf("images %v", c.Images)
+	}
+	if got.Usage.In < 2*DefaultTokenRates.Image {
+		t.Fatalf("usage %+v", got.Usage)
 	}
 }
