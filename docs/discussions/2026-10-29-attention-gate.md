@@ -10,12 +10,13 @@
 2. 10-29 第二版：拆成「反射层（关键词）→ 门控（小模型）」两层。否决：两层就得替每种 IO 决定信号送哪一层（partial 进反射、final 进门控……），边界难处理。改为**单层**：IO 只管把感知送进来，关键词是内部特征。
 3. 10-30 第三版（本文）：参照 Jev（TypeSafe 的决策模型，[§12 参考](#12-参考)），判定拆成「**决策模型只回答事实（带概率），策略按阈值做决定**」；引入独立的**决策器契约**（不再借用 chat provider）；多来源**按截止时间微批合并调用**。
 4. 10-30 同日：判定改为**三段级联**（Jev → 拿不准的交小模型 → 兜底偏向）；**规则只拦截、只降级，不放行**——唤醒词、@、紧急词从「直接起轮的规则」降为交给判定器的特征。理由：这些规则的依据是消息内容，而内容由外人掌控（群里狂 @、消息里塞唤醒词），能绕过判定直接叫醒主 loop。
+5. 10-30 实现契约：`Decider` 契约与 `FakeDecider` 落在 `core/provider`（与 Provider 并列，仍是独立接口；runtime/attention 尚未存在，契约放 core 让插件先行）；返回值改为 `Decision`（带模型快照 / 请求 ID / usage，trace 要用）；加 `Caps`；Confidence 由规范层按 TypeSafe 公开公式统一计算、不取厂商值（跨模型阈值可比）。见 §4.1。
 
 ## 0. 已定（2026-10-29 / 30）
 
 1. **单层注意力**：IO 的唯一契约是「送感知」（`Perceive`），流式的 partial 也是感知（标为未完成）。注意力层内部：特征 → 策略 → 决策 → 投递。仿低级神经中枢：绝大多数刺激在内部被无意识地滤掉，只有显著的（名字、关键词、紧急词）引起注意——类似鸡尾酒会效应。
 2. **模型回答事实，策略做决定**：决策模型对每条感知回答一组类型化问题（是否在叫她、是否紧急……，返回概率），不输出动作；策略（确定性、可配置、可热改）把关键词、来源事实与概率组合成 `ignore / note / wake`。注意力层因此是「特征 + 策略」，模型只是特征来源之一。
-3. **决策器是独立契约**（`Decider`，§4），不是 chat provider：首批两个实现——`decisions`（Decisions API，Jev 等决策模型）与 `llm`（复用 provider 机制，普通 LLM 回答同样的问题，可本地部署）。新增实现 = plugins 加实现 + assemble 加分支。
+3. **决策器是独立契约**（`Decider`，§4，位于 `core/provider`），不是 chat provider：首批两个实现——`decisions`（Decisions API，Jev 等决策模型）与 `llm`（复用 provider 机制，普通 LLM 回答同样的问题，可本地部署）。新增实现 = plugins 加实现 + assemble 加分支。
 4. **多来源合并调用**：按截止时间微批（§5）——最急的来源决定发车时刻，其余已就绪的条目搭车；共享状态每车只发一次。
 5. 判定只做分类 / 路由：无工具、无长期状态，不做「轻量的第二大脑」（破「只有一个 loop」红线）。
 6. **事件驱动 + 低频心跳**：有新感知才判；心跳只服务主动行为。不做定时轮询。
@@ -134,32 +135,25 @@ effect = "salient"
 
 ## 4. 决策器（Decider）
 
-### 4.1 契约（`runtime/attention`，只依赖 pkg）
+### 4.1 契约（`core/provider/decider.go`，已实现）
+
+与 `Provider` 并列、互不相干（不流式、无工具、无消息历史）。代码为准，要点：
 
 ```go
-// Question 是一个类型化问题。Name 只是结果键，模型看不到——含义必须全部写在 Instructions 里。
-type Question struct {
-    Name         string
-    Kind         Kind        // Noul（是否题）| Choice（选一个）| Score（按档位打分）
-    Instructions string      // 可用 `items[2].text` 这类写法引用 state 的字段
-    Criteria     []Criterion // Choice：选项名 + 描述；Score：档位描述（从低到高，最多 10 档）
-}
-
-type Criterion struct{ Name, Description string }
-
-type Answer struct {
-    P          float64            // Noul：为真的概率
-    Choice     string             // Choice：概率最大的选项
-    Probs      map[string]float64 // Choice / Score：各选项 / 各档概率
-    Score      float64            // Score：按概率加权的档位
-    Confidence float64            // 分布的集中程度（不是正确率）；实现给不出时为 0
-}
-
 type Decider interface {
-    // Decide 一次回答一组问题。state 是可 JSON 编码的对象（§4.2）。
-    Decide(ctx context.Context, state any, qs []Question) (map[string]Answer, error)
+    Decide(ctx context.Context, state any, qs []Question) (Decision, error)
+    Caps(model string) DeciderCaps // 支持的题型、选项 / 档位上限、上下文；零值 = 未知
 }
+type Question struct { Name string; Kind QuestionKind; Instructions string; Criteria []Criterion } // noul | choice | score
+type Answer   struct { Kind QuestionKind; P float64; Choice string; Score float64; Probs map[string]float64; Confidence float64 }
+type Decision struct { Answers map[string]Answer; Missing []string; Model, ID string; Usage message.Usage }
 ```
+
+- **规范层**：所有实现都经 `ValidateQuestions(qs, caps)`（协议上限：choice 1~255 选项、score 1~10 档、noul 的 criteria 恰为 true/false；超出模型能力为 `ErrUnsupportedQuestion`）与 `NormalizeAnswer(q, raw)`（缺的选项补 0、和不为 1 时归一、拒收未知键 / 越界 / 类型不符）。
+- **Confidence 统一计算**：按 [TypeSafe 公开的定义](https://docs.typesafe.ai/confidence)由分布算——choice `(pmax−1/n)/(1−1/n)`；score `max(0, 1 − Σpᵢ|i−m| / MAD_unif)`；noul `|2p−1|`。不取厂商返回值（协议里 confidence 是可选字段，各模型给不给不一），跨模型阈值因此可比。厂商省略分布时退回其 `choice` / `score` 与自报 confidence。
+- **score 的 Probs 按档位名作键**（线上协议是下标字符串，由适配器换算），与 choice 一致；`Score` 是期望档位下标（0 ~ n−1，不是 0~1）。
+- **漏答不是错误**：单个问题漏答或答案不合法记进 `Missing`，策略按兜底处理；`error` 只表示整次调用失败（网络与 5xx 用 `RetryableError`）。
+- **`FakeDecider`**（`core/provider/fake_decider.go`）：按调用顺序消费脚本（原始答案 / Err / Delay），用完交 `WithFallback` 的回答函数（只看 state 与问题，并发测试与 `--fake` 冒烟用；冒烟的具体回答逻辑放宿主）；`WithCaps` 模拟模型能力；`Calls` 记录每车的 state 与问题。答案走同一个 `NormalizeAnswer`。
 
 形状直接取自 Decisions API（Jev 与同 API 的约 20 个决策模型），`llm` 实现照着同一形状回答，所以策略层不知道背后是哪种模型。
 
@@ -208,7 +202,7 @@ type Decider interface {
 
 | 实现 | 说明 |
 |---|---|
-| `decisions` | Decisions API（OpenRouter `/api/alpha/decisions` 或 TypeSafe 原生端点；`base_url` 可配）。按 API 命名而不是按 Jev 命名：同 API 的决策模型改 `model` 即可。插件在 `plugins/decider/decisions`。具体字段与端点在实现时按官方文档核对 |
+| `decisions` | Decisions API（OpenRouter `/api/alpha/decisions` 或 TypeSafe 原生端点；`base_url` 可配）。按 API 命名而不是按 Jev 命名：同 API 的决策模型改 `model` 即可。插件在 `plugins/provider/decider`。能力（上下文、是否收图）取 OpenRouter 模型目录（`output_modalities=decisions`）；题型支持哪张卡都不写，默认全支持，遇 400 按不可重试失败兜底。具体字段与端点在实现时按官方文档核对 |
 | `llm` | 复用 provider 机制（`[attention.provider]`，同一张 provider 装配表，可以是和主 loop 不同的 provider，含本地 Ollama）。把 state 与问题渲染成提示词，要求输出 `{问题名: 值}` 的 JSON（Noul 给 0~1 的数，Choice 给选项名，Score 给档位）。v1 用模型自报的数（校准比真概率差）；读 logprobs 需要扩展 provider 契约，留到以后。参照 LLM-as-Jev：不经微调的 4B 级模型就能当决策模型用 |
 | （测试）`fake` | 表驱动的确定性实现，测试与 `--fake` 冒烟用 |
 
@@ -379,7 +373,7 @@ api_key_env = "ARIA_ATTENTION_API_KEY"
 
 1. **`runtime/attention` 骨架**：Percept / `Perceive`、通道防抖、关键词特征（exact）、规则链、信号、投递状态机、感知缓冲 Assembler、决策事件与 trace；`Decider` 契约与 fake 实现、`Escalate`、待判队列与微批、策略（五档 + 降级）。`enabled = false`，或没有决策器时（终端 `trusted`、语音兜底 `wake` → 照常起轮），行为与现状一致。
 2. **插头迁移**：终端、语音插头改为 `Perceive`（ASR partial 也送进来）；`gowild.Input` 的投递逻辑迁成投递规则加语音 Busy 信号；灯订阅「叫她」信号。回归测试保证现有行为不变。
-3. **决策器实现**：`plugins/decider/decisions`（Jev）与 `llm`；`config` 加 `[attention]` 各段，`assemble.Decider` 装配。用终端多人模拟（`[名字]` 前缀）加 trace 调阈值、测中文。
+3. **决策器实现**：`plugins/provider/decider`（Decisions API）与 `llm`；`config` 加 `[attention]` 各段，`assemble.Decider` 装配。用终端多人模拟（`[名字]` 前缀）加 trace 调阈值、测中文。
 4. **拼音模糊匹配**。
 5. **IM**：按 IM 文档实现，接成注意力层的一个 IO（规则、问题、缓冲节、`im_*` 工具）。
 6. **心跳与主动行为**。
