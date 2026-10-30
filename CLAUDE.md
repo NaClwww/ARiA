@@ -16,7 +16,7 @@ go run ./cmd/aria-demo --print-config                # 打印生效配置（含�
 ./start.sh [flags]                                   # 真机启动 aria-host：加载 .env、adb forward 音箱端口
 ```
 
-- 测试全部确定性：`core/provider.FakeProvider` 表驱动，无网络、无磁盘。provider 的 live 测试仅在设置 `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `OPENCODE_API_KEY` 时运行，否则跳过。
+- 测试全部确定性：`core/provider.FakeProvider` / `FakeDecider` 表驱动，无网络、无磁盘。provider 的 live 测试仅在设置 `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `OPENCODE_API_KEY`（决策模型：`OPENROUTER_API_KEY` / `TYPESAFE_API_KEY`）时运行，否则跳过；live 测试花用户的钱，按需单跑（`-run Live`）。
 - 没有 Makefile 与 lint 配置；`go vet` 即可。
 
 ## 分层与依赖规则
@@ -30,7 +30,7 @@ pkg ← core ← runtime ← plugins / internal / cmd
 | `pkg/`（ctxx、message、modelcard） | ctx 类型化存取（Scope/Trace/Credentials/Budget/Options）、规范多模态消息模型、说话人前缀、模型元数据卡（models.dev） | 零依赖（只用标准库） |
 | `core/`（loop、provider、tool） | agent-loop 单线程飞轮、事件总线、Provider/Tool 契约 | 只依赖 pkg |
 | `runtime/` | context-build：`agent`（Session/会话切换/记忆调用）、`window`（每轮组装 + 压缩）、`persist`（durable 事件溯源）、`memory`（记忆服务接口与 memory_recall 工具）、`app`（宿主外设挂载容器）等 | 依赖 core+pkg；**不 import 任何具体插件包** |
-| `plugins/` | 契约的具体实现：provider（deepseek/openai/opencode）、tool/basic、persist/jsonl、memory/hindsight、voice/vision（gowild 音箱） | 实现 core/runtime 契约，不反向依赖 |
+| `plugins/` | 契约的具体实现：provider（deepseek/openai/opencode）、provider/decider（决策模型：systemone 共享层 + openrouter / typesafe）、tool/basic、persist/jsonl、memory/hindsight、voice/vision（gowild 音箱）、im/onebot（OneBot 11 客户端，未接入宿主） | 实现 core/runtime 契约，不反向依赖 |
 | `internal/config` | 分层配置（viper） | — |
 | `internal/assemble` | **配置 → 实现的唯一装配点**（Provider/Compressor/Memory/Session 参数），两个宿主共用 | 唯一允许同时认识 config 与具体插件的地方 |
 | `internal/aria-host` | aria-host 的组件（引擎组装、渲染、stdin 插头、人设） | — |

@@ -12,6 +12,7 @@
 | `Assembler.Assemble` | core/02 §4 | M1 | 恒等兜底；runtime/window 每轮组装（03 §5）在 core 槽 1 上折叠 |
 | `ToolSource.Name/Tools/Close` | 本文 §3 | M2 | §3 工具源；MCP 桥（M4）= 一种 ToolSource，实现时再细化 |
 | `ContextSource.Name/Collect/Observe` | runtime/03 §2 | M3 | §4 RAG 源；写路修订中，记忆服务改用独立接口（见 §4） |
+| `Decider.Decide(ctx, in, qs)` / `Caps(model)` | core/02 §5 | 2026-10-30 | §2 决策模型适配器（注意力层用，飞轮不调用；不计入上面的 5 接口） |
 
 **插件可见的数据类型只有三个**：`Message`（含 Block/ToolCall/ToolResult/Usage）、`Episode`（一轮完整出入）、`Unit`（窗口候选单元：Kind/Content/Importance/Ref/Meta）。Window 内部图结构（版本、COW、访问计数）runtime 私有。
 
@@ -21,6 +22,11 @@
 
 - **openai-compatible**（M1）：一个适配器覆盖 DeepSeek/GLM/Qwen/Ollama 的 OpenAI 端点；规范形互转（pkg/message ↔ OpenAI 格式）；流式 SSE 解析 → PartDelta/MessageComplete。
 - **opencode**（2026-10-28）：`plugins/provider/opencode`，OpenCode Console 的 Zen（按量付费，kind=`opencode`）与 Go（订阅制，kind=`opencode-go`）。两者都走 chat/completions（Console 在 API 风格间互译），直接复用 openai 适配器，只在 RoundTripper 层补 OpenCode 要求的请求头：自有 User-Agent 与会话头 `x-opencode-session`（取 Scope.SessionID）。key 兜底 `OPENCODE_API_KEY`。模型限额：OpenCode 的 `/v1/models` 只给 ID，改取 `pkg/modelcard`（models.dev，键 `opencode` / `opencode-go`，见 01 §3）——适配器创建时后台拉一次，`Limits` 不阻塞，拉到前/失败时为零值（该轮不按用量压缩，下一轮起生效）；`provider.context_window` / `max_output` 非零时优先，只作用于 `provider.model` 这一个模型（经 Options 用到的其他模型按各自的卡）；`Card(model)` 暴露完整模型卡。
+- **决策模型**（2026-10-30）：`plugins/provider/decider`，实现 `Decider`（02 §5）。TypeSafe 把这类模型与接口叫 System One（路径 `/v1/systemone`），OpenRouter 叫 Decisions API，Jev 与别家约 30 个决策模型用同一份格式。
+  - `systemone`：两端共用的问题编码、答案解码（score 下标换算为档位名）、POST 与错误分类（不重试）、图片预处理（PNG / JPEG 且宽高在 280~1568 px 内原样透传，否则用 `golang.org/x/image` 缩放、补白边、转 JPEG；EXIF 方向不处理）。
+  - `openrouter`：模型名带厂商前缀（默认 `typesafe/jev-1.14`）；响应体带 `id` 与 `usage.cost`；错误体 `{error:{message,metadata}}`；默认发 `provider: {zdr: true, data_collection: "deny"}`（state 里是家里人说的话，`AllowDataRetention` 关掉）；`session_id` 取 Scope；图片以 base64 放进 `assets`。Credentials 键 `openrouter`。
+  - `typesafe`：官方端点与自部署（`{base}/v1/systemone`，默认 `jev-latest`，`GET /v1/models` 只列别名、实际服务 `jev-1.14.0`）；请求 ID 在响应头 `x-typesafe-request-id`；FastAPI 风格 `{detail}` 错误体（422 拼成 `a.b.c: msg`）；长上下文须显式 `TypeSafe-Danger-Zone-Long-Context` 头；图片走 multipart + `TypeSafe-Danger-Zone-Images` 头（官方标为原型阶段）。Credentials 键 `typesafe`。
+  - 实网测试：设 `OPENROUTER_API_KEY` / `TYPESAFE_API_KEY` 时运行。尚未接配置与装配（`[attention.decider]`、`assemble.Decider` 随注意力层落地）。
 - **anthropic / gemini**（M1 后补齐）：官方 Go SDK 或自写 HTTP，同样只做哑管道翻译。
 - 硬性义务（core/02 §5）：取消时以 `MessageComplete(interrupted=true)` 返回已收内容；Usage 必须上报（Budget 扣减依赖）；限流/超时错误标记 Retryable（错误三分法）。
 - 限流包装 `LimitedProvider` 属 runtime（并发调度草稿 notes/concurrency-draft.md，有需要再定），适配器本身不管限流。
@@ -79,6 +85,7 @@ Setup: ctxx(Scope/Trace/Budget) → Providers(openai…) → ToolSources(builtin
 | `golang.org/x/time/rate` | RPM/TPM 限流 | runtime |
 | `modelcontextprotocol/go-sdk` | MCP 客户端 | plugins/tool/mcp |
 | 各 provider 官方 Go SDK（按需）或自写 HTTP | 适配 | plugins/provider |
+| `golang.org/x/image`（draw, webp） | 决策模型的图片缩放与解码；v0.36.0 是兼容 go 1.24 的最后一版 | plugins/provider/decider/systemone |
 
 原则：能标准库不引第三方；新依赖必须落在表内登记（防止依赖蔓延）。Go 1.24+。产品入口暂缓：bubbletea（CLI）、net/http+SSE（服务）不在当前依赖内，入口启用时再登记。
 

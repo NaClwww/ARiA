@@ -95,7 +95,7 @@ Session.Input ─▶ 组装层 window ─▶ core 飞轮 ─▶ 事件流 ─▶
                   └ 零件位：压缩策略（配置点菜，可热换）
 ```
 
-已实现：pkg + core（M1）、runtime 主线三包 + artifact/toolkit（M2）、JSONL 落盘、终端薄壳 `cmd/aria-demo`、Gowild 语音宿主 `cmd/aria-host`（ASR 插头 / TTS / 状态灯 / 视觉）、配置分层 `internal/config`、压缩零件装配表与热切换、长期记忆的 ARiA 侧（Hindsight 测试期后端）、provider：deepseek / openai / opencode、模型卡 `pkg/modelcard`；**配置热更新**（2026-10-28）：改配置文件自动生效，整份重新装配会话（上下文不丢），记忆服务与落盘在会话切换时换上（06 §3）。
+已实现：pkg + core（M1）、runtime 主线三包 + artifact/toolkit（M2）、JSONL 落盘、终端薄壳 `cmd/aria-demo`、Gowild 语音宿主 `cmd/aria-host`（ASR 插头 / TTS / 状态灯 / 视觉）、配置分层 `internal/config`、压缩零件装配表与热切换、长期记忆的 ARiA 侧（Hindsight 测试期后端）、provider：deepseek / openai / opencode、模型卡 `pkg/modelcard`；**配置热更新**（2026-10-28）：改配置文件自动生效，整份重新装配会话（上下文不丢），记忆服务与落盘在会话切换时换上（06 §3）；**IM**：OneBot 11 客户端 `plugins/im/onebot`（NapCat，尚未接入宿主）；**决策模型**（2026-10-30）：`Decider` 契约与 `FakeDecider`（02 §5）、适配器 `plugins/provider/decider`（OpenRouter / TypeSafe 官方，含图片输入，04 §2）——注意力层本身仍在讨论（discussions/2026-10-29-attention-gate.md），尚未接配置与宿主。
 未实现：`cmd/aria-web` 面板、认主（插件层协商）、打断/小轮（03 §7）。
 
 **runtime 并发（2026-09-11 定稿）**：v1 一 Session 同时只跑一轮，并发新输入由会话互斥串行、轮间插话走 `Queue`（仅运行中接受，2026-09-28）——**不建 schedule/ 子包，M2 不被调度设计阻塞**。notes/concurrency-draft.md 的完整草案（actor 单写者 / 多维准入 / 后台任务 / 限流）仍是草稿，原则方向大概率保留，有真实并发场景再回来定稿（05 G1）。

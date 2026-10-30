@@ -103,6 +103,24 @@ type Tool interface {
 - Provider 是哑管道，事件词汇由 loop 翻译；**部分结果语义是硬性义务**：ctx 取消时必须以 `MessageComplete(interrupted=true)` 收尾返回已收内容，不得只回 error——这是 Interrupt 可续的前提。
 - 适配器见 04-plugins；限流包装（LimitedProvider）属 runtime，core 无感知。
 
+**Decider（决策模型契约，2026-10-30）**：与 Provider 并列放在 `core/provider`，但互不相干——不流式、无工具、无消息历史，飞轮不调用它（消费者是将来的注意力层，设计见 discussions/2026-10-29-attention-gate.md）。对一份 state 一次回答一组类型化问题，返回概率而不是文本：
+
+```go
+type Decider interface {
+    Decide(ctx context.Context, in DecideInput, qs []Question) (Decision, error)
+    Caps(model string) DeciderCaps   // 题型、选项 / 档位上限、上下文、是否纯文本；零值 = 未知
+}
+type DecideInput struct { State any; Images map[string]message.ImageBlock } // State 里写图片引用串
+type Question struct { Name string; Kind QuestionKind; Instructions string; Criteria []Criterion } // noul | choice | score
+type Answer   struct { Kind QuestionKind; P float64; Choice string; Score float64; Probs map[string]float64; Confidence float64 }
+type Decision struct { Answers map[string]Answer; Missing []string; Model, ID string; Usage message.Usage }
+```
+
+- **规范层**：所有实现经 `ValidateInput` / `ValidateQuestions`（协议上限：choice 1~255 选项、score 1~10 档、noul 的 criteria 恰为 true/false；图片引用串合法、每张图都被引用）与 `NormalizeAnswer`（缺的选项补 0、归一、拒收未知键 / 越界 / 类型不符）。
+- **Confidence 统一计算**：按 TypeSafe 公开定义由分布算（choice `(pmax−1/n)/(1−1/n)`；score `max(0, 1−Σpᵢ|i−m|/MAD_unif)`；noul `|2p−1|`），不取厂商值，跨模型阈值可比。score 的 Probs 按档位名作键，`Score` 是期望档位下标（0 ~ n−1）。
+- **错误**：单个问题漏答或答案不合法不算错误，记进 `Missing`；`error` 只表示整次调用失败——`RetryableError`（网络、408/429/5xx）、`ErrInvalidQuestion` / `ErrInvalidInput`（调用方的 bug）、`ErrUnsupportedQuestion` / `ErrUnsupportedInput`（超出模型能力）。适配器不重试，由调用方按兜底处理。
+- **可测**：`FakeDecider` 表驱动（脚本 + `WithFallback` 按内容回答 + `WithCaps`），答案走同一个 `NormalizeAnswer`。
+
 ## 6. Steering 语义
 
 | 动作 | 行为 |
