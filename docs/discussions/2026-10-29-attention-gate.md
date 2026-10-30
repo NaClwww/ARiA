@@ -141,9 +141,10 @@ effect = "salient"
 
 ```go
 type Decider interface {
-    Decide(ctx context.Context, state any, qs []Question) (Decision, error)
-    Caps(model string) DeciderCaps // 支持的题型、选项 / 档位上限、上下文；零值 = 未知
+    Decide(ctx context.Context, in DecideInput, qs []Question) (Decision, error)
+    Caps(model string) DeciderCaps // 支持的题型、选项 / 档位上限、上下文、是否纯文本；零值 = 未知
 }
+type DecideInput struct { State any; Images map[string]message.ImageBlock } // 引用串 → 图片
 type Question struct { Name string; Kind QuestionKind; Instructions string; Criteria []Criterion } // noul | choice | score
 type Answer   struct { Kind QuestionKind; P float64; Choice string; Score float64; Probs map[string]float64; Confidence float64 }
 type Decision struct { Answers map[string]Answer; Missing []string; Model, ID string; Usage message.Usage }
@@ -153,6 +154,7 @@ type Decision struct { Answers map[string]Answer; Missing []string; Model, ID st
 - **Confidence 统一计算**：按 [TypeSafe 公开的定义](https://docs.typesafe.ai/confidence)由分布算——choice `(pmax−1/n)/(1−1/n)`；score `max(0, 1 − Σpᵢ|i−m| / MAD_unif)`；noul `|2p−1|`。不取厂商返回值（协议里 confidence 是可选字段，各模型给不给不一），跨模型阈值因此可比。厂商省略分布时退回其 `choice` / `score` 与自报 confidence。
 - **score 的 Probs 按档位名作键**（线上协议是下标字符串，由适配器换算），与 choice 一致；`Score` 是期望档位下标（0 ~ n−1，不是 0~1）。
 - **漏答不是错误**：单个问题漏答或答案不合法记进 `Missing`，策略按兜底处理；`error` 只表示整次调用失败（网络与 5xx 用 `RetryableError`）。
+- **图片**：`State`（或问题文字）里写引用串（`NewImageRef()` 生成），`Images` 放图片；`ValidateInput` 校验引用串字符集与长度、每张图都被引用、带数据、模型不是 `TextOnly`。适配器经 `systemone.PrepareImages` 预处理（PNG / JPEG 且宽高在 280~1568 px 内原样透传；否则用 `golang.org/x/image` CatmullRom 缩放、补白边、转 JPEG；EXIF 方向不处理），typesafe 走 multipart + `TypeSafe-Danger-Zone-Images` 头，openrouter 走 `assets` 的 base64。官方把图片标为原型阶段；实测（10-30）两张 320px 纯色图判红色 P=1.0 / 0.01，输入 952 token、端到端约 1.7s，注意力层是否用图另行决定（§4.2）。
 - **`FakeDecider`**（`core/provider/fake_decider.go`）：按调用顺序消费脚本（原始答案 / Err / Delay），用完交 `WithFallback` 的回答函数（只看 state 与问题，并发测试与 `--fake` 冒烟用；冒烟的具体回答逻辑放宿主）；`WithCaps` 模拟模型能力；`Calls` 记录每车的 state 与问题。答案走同一个 `NormalizeAnswer`。
 
 形状直接取自 Decisions API（Jev 与同 API 的约 20 个决策模型），`llm` 实现照着同一形状回答，所以策略层不知道背后是哪种模型。
@@ -174,7 +176,7 @@ type Decision struct { Answers map[string]Answer; Missing []string; Model, ID st
 
 - `recent` 取主会话窗口最近 K 轮的截断文本（`Session.History`），不额外调模型；`persona` 是人设里给注意力层的一段偏好。
 - 共享部分（`aria` / `recent` / `present` / `persona`）是 token 的大头，每车只发一次；每多一个条目只增加它自己的几十 token。
-- 图片 v1 不进 state（写成「[图片]」）；Decisions API 支持图片，需要时再开。
+- 图片 v1 不进 state（写成「[图片]」）。契约与两个适配器已支持图片（§4.1），开不开由注意力层按延迟与成本定：实测一张 320px 图约二三百 token、整车约 1.7s，超出语音 300–500ms 的预算。
 
 ### 4.3 问题集
 
@@ -202,7 +204,7 @@ type Decision struct { Answers map[string]Answer; Missing []string; Model, ID st
 
 | 实现 | 说明 |
 |---|---|
-| `decisions` | Decisions API（OpenRouter `/api/alpha/decisions` 或 TypeSafe 原生端点；`base_url` 可配）。按 API 命名而不是按 Jev 命名：同 API 的决策模型改 `model` 即可。插件在 `plugins/provider/decider`。能力（上下文、是否收图）取 OpenRouter 模型目录（`output_modalities=decisions`）；题型支持哪张卡都不写，默认全支持，遇 400 按不可重试失败兜底。具体字段与端点在实现时按官方文档核对 |
+| `decisions` | Decisions API（OpenRouter `/api/alpha/decisions` 或 TypeSafe 原生端点；`base_url` 可配）。按 API 命名而不是按 Jev 命名：同 API 的决策模型改 `model` 即可。插件在 `plugins/provider/decider`（已实现）：`systemone`（共享的问题编码 / 答案解码 / POST 与错误分类；System One 是 TypeSafe 对这类模型与接口的叫法，路径 `/v1/systemone`，别家决策模型也照这份格式）、`openrouter`（模型名带前缀、体内 id 与花费、`{error:{…}}` 错误体；默认发 `zdr` + `data_collection=deny`，state 里是家里人说的话）、`typesafe`（官方端点与自部署：请求 ID 在响应头、FastAPI 风格 `{detail}` 错误体、长上下文须显式请求头）。都不重试，可重试错误交给调用方兜底；请求头与错误提取约定参照官方 Python SDK。能力（上下文、是否收图）取 OpenRouter 模型目录（`output_modalities=decisions`）；题型支持哪张卡都不写，默认全支持，遇 400 按不可重试失败兜底。具体字段与端点在实现时按官方文档核对 |
 | `llm` | 复用 provider 机制（`[attention.provider]`，同一张 provider 装配表，可以是和主 loop 不同的 provider，含本地 Ollama）。把 state 与问题渲染成提示词，要求输出 `{问题名: 值}` 的 JSON（Noul 给 0~1 的数，Choice 给选项名，Score 给档位）。v1 用模型自报的数（校准比真概率差）；读 logprobs 需要扩展 provider 契约，留到以后。参照 LLM-as-Jev：不经微调的 4B 级模型就能当决策模型用 |
 | （测试）`fake` | 表驱动的确定性实现，测试与 `--fake` 冒烟用 |
 
@@ -373,7 +375,7 @@ api_key_env = "ARIA_ATTENTION_API_KEY"
 
 1. **`runtime/attention` 骨架**：Percept / `Perceive`、通道防抖、关键词特征（exact）、规则链、信号、投递状态机、感知缓冲 Assembler、决策事件与 trace；`Decider` 契约与 fake 实现、`Escalate`、待判队列与微批、策略（五档 + 降级）。`enabled = false`，或没有决策器时（终端 `trusted`、语音兜底 `wake` → 照常起轮），行为与现状一致。
 2. **插头迁移**：终端、语音插头改为 `Perceive`（ASR partial 也送进来）；`gowild.Input` 的投递逻辑迁成投递规则加语音 Busy 信号；灯订阅「叫她」信号。回归测试保证现有行为不变。
-3. **决策器实现**：`plugins/provider/decider`（Decisions API）与 `llm`；`config` 加 `[attention]` 各段，`assemble.Decider` 装配。用终端多人模拟（`[名字]` 前缀）加 trace 调阈值、测中文。
+3. **决策器实现**：`plugins/provider/decider/{openrouter,typesafe}`（已实现）与 `llm`；`config` 加 `[attention]` 各段，`assemble.Decider` 装配。用终端多人模拟（`[名字]` 前缀）加 trace 调阈值、测中文。
 4. **拼音模糊匹配**。
 5. **IM**：按 IM 文档实现，接成注意力层的一个 IO（规则、问题、缓冲节、`im_*` 工具）。
 6. **心跳与主动行为**。
